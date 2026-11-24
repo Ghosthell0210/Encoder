@@ -19,7 +19,11 @@ from pathlib import Path
 from hydrogram import Client
 from hydrogram.types import Message
 
-from config import TELEGRAM_MAX_UPLOAD_BYTES, BotConfig
+from config import (
+    TELEGRAM_MAX_UPLOAD_BYTES,
+    TELEGRAM_PREMIUM_MAX_UPLOAD_BYTES,
+    BotConfig,
+)
 from core.database import Database
 from core.ffmpeg_engine import (
     CompressionOptions,
@@ -39,6 +43,7 @@ from core.ui_helpers import (
     safe_caption,
 )
 from core.uploader import DirectLinkStore, download_from_url, upload_large_file
+from core.user_session import UserSessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -92,11 +97,13 @@ class QueueManager:
         config: BotConfig,
         db: Database,
         direct_store: DirectLinkStore,
+        user_session: UserSessionManager,
     ) -> None:
         self.client = client
         self.config = config
         self.db = db
         self.direct_store = direct_store
+        self.user_session = user_session
 
         self._queue: asyncio.Queue[CompressionJob] = asyncio.Queue()
         self._pending: list[CompressionJob] = []
@@ -327,10 +334,23 @@ class QueueManager:
             elapsed_total = time.time() - (job.started_at or time.time())
             reduction_pct = ((input_size - output_size) / max(input_size, 1)) * 100.0
 
-            # 4. Decisión inteligente: ≤ 1990 MiB → Telegram | > 1990 MiB → Enlace Directo
-            if output_size > TELEGRAM_MAX_UPLOAD_BYTES:
-                await self._deliver_via_link(
+            # 4. Decisión inteligente de entrega:
+            #    • ≤ 1.99 GB → Bot directo en Telegram
+            #    • 1.99 GB a 3.98 GB con cuenta Premium vinculada (/login) → Cuenta Premium
+            #    • > límite de Telegram → Enlace de descarga directa (GoFile / Buzzheavier)
+            dump_id_raw = await self.db.get_setting("dump_chat_id", str(self.config.dump_chat_id or 0))
+            dump_chat_id = int(dump_id_raw) if dump_id_raw.lstrip("-").isdigit() else 0
+            can_use_premium = (
+                output_size <= TELEGRAM_PREMIUM_MAX_UPLOAD_BYTES
+                and self.user_session.is_connected
+                and self.user_session.is_premium
+                and (dump_chat_id != 0 or job.user_id == self.config.owner_id)
+            )
+
+            if output_size <= TELEGRAM_MAX_UPLOAD_BYTES:
+                await self._deliver_via_telegram(
                     job=job,
+                    job_dir=job_dir,
                     output_path=output_path,
                     input_size=input_size,
                     output_size=output_size,
@@ -340,10 +360,23 @@ class QueueManager:
                     updater=updater,
                     cancel_kb=cancel_kb,
                 )
-            else:
-                await self._deliver_via_telegram(
+            elif can_use_premium:
+                await self._deliver_via_premium_account(
                     job=job,
                     job_dir=job_dir,
+                    output_path=output_path,
+                    input_size=input_size,
+                    output_size=output_size,
+                    out_media=out_media,
+                    reduction_pct=reduction_pct,
+                    elapsed_total=elapsed_total,
+                    dump_chat_id=dump_chat_id,
+                    updater=updater,
+                    cancel_kb=cancel_kb,
+                )
+            else:
+                await self._deliver_via_link(
+                    job=job,
                     output_path=output_path,
                     input_size=input_size,
                     output_size=output_size,
@@ -364,6 +397,91 @@ class QueueManager:
             )
         finally:
             shutil.rmtree(job_dir, ignore_errors=True)
+
+    async def _deliver_via_premium_account(
+        self,
+        job: CompressionJob,
+        job_dir: Path,
+        output_path: Path,
+        input_size: int,
+        output_size: int,
+        out_media: MediaInfo,
+        reduction_pct: float,
+        elapsed_total: float,
+        dump_chat_id: int,
+        updater: ProgressUpdater,
+        cancel_kb,
+    ) -> None:
+        assert self.user_session.client is not None
+        job.phase = "Subiendo con cuenta Premium (2–4 GB)"
+        up_start = time.monotonic()
+
+        async def _up_progress(current: int, total: int) -> None:
+            if job.cancel_event.is_set():
+                raise JobCancelledError("Subida cancelada.")
+            elapsed = max(0.5, time.monotonic() - up_start)
+            speed_bps = current / elapsed
+            pct = (current / max(total, 1)) * 100.0
+            eta = (total - current) / max(speed_bps, 1.0)
+            await updater.update(
+                f"⭐ **Subiendo video (2–4 GB) vía cuenta Telegram Premium...**\n"
+                f"`{progress_bar(pct)}`\n"
+                f"• **Subido:** `{human_bytes(current)}` / `{human_bytes(total)}`\n"
+                f"• **Velocidad:** `{human_bytes(speed_bps)}/s` · **ETA:** `{human_duration(eta)}`",
+                reply_markup=cancel_kb,
+            )
+
+        thumb_path = await self._prepare_thumbnail(
+            job.user_id, output_path, out_media.duration, job_dir
+        )
+        sign = "-" if reduction_pct >= 0 else "+"
+        caption = safe_caption(
+            f"✅ **Video comprimido (Entrega Premium >2 GB)**\n"
+            f"• **Original:** `{human_bytes(input_size)}` → **Final:** `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
+            f"• **Calidad:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}` · `{human_duration(out_media.duration)}`\n"
+            f"• **Tiempo total:** `{human_duration(elapsed_total)}`"
+        )
+
+        target_peer: int | str = dump_chat_id if dump_chat_id != 0 else "me"
+        send_as_doc = job.options.send_as_document or output_path.suffix.lower() == ".mkv"
+
+        if send_as_doc:
+            sent_msg = await self.user_session.client.send_document(
+                chat_id=target_peer,
+                document=str(output_path),
+                thumb=thumb_path,
+                caption=caption,
+                progress=_up_progress,
+            )
+        else:
+            sent_msg = await self.user_session.client.send_video(
+                chat_id=target_peer,
+                video=str(output_path),
+                duration=int(round(out_media.duration)),
+                width=out_media.width,
+                height=out_media.height,
+                thumb=thumb_path,
+                supports_streaming=True,
+                caption=caption,
+                progress=_up_progress,
+            )
+
+        if dump_chat_id != 0:
+            await self.client.copy_message(
+                chat_id=job.chat_id,
+                from_chat_id=dump_chat_id,
+                message_id=sent_msg.id,
+            )
+            with contextlib.suppress(Exception):
+                await job.status_message.delete()
+        else:
+            await updater.update(
+                f"⭐ **Video de `{human_bytes(output_size)}` enviado a tus Mensajes Guardados**\n"
+                "*(Superó los 2 GB del bot, así que se entregó directamente con tu cuenta Premium vinculada.)*",
+                force=True,
+            )
+
+        await self.db.record_job_completion(input_size, output_size, delivered_via_link=False)
 
     async def _download_source(
         self,

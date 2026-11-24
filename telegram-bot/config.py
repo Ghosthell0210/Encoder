@@ -1,6 +1,6 @@
 """Configuración central del bot de compresión de videos para Telegram.
 
-Calibrado por defecto para panel.plugged.host:
+Calibrado por defecto para panel.plugged.host (Egg Python Generic Pelican/Pterodactyl):
   - 400% CPU (4 hilos FFmpeg)
   - 10 GiB RAM asignada
   - 30 GiB Disco asignado (con reserva de seguridad de 2 GiB)
@@ -9,6 +9,7 @@ Calibrado por defecto para panel.plugged.host:
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,9 @@ load_dotenv()
 # Límite seguro de subida MTProto para bots (2000 MiB exactos en Telegram;
 # usamos 1990 MiB para evitar rechazos por redondeo de partes de 512 KiB).
 TELEGRAM_MAX_UPLOAD_BYTES: int = 1990 * 1024 * 1024
+
+# Límite seguro para cuentas Telegram Premium vinculadas vía /login (4000 MiB).
+TELEGRAM_PREMIUM_MAX_UPLOAD_BYTES: int = 3980 * 1024 * 1024
 
 
 def _env_int(name: str, default: int) -> int:
@@ -45,12 +49,48 @@ def _env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def _interactive_setup_env(base_dir: Path) -> None:
+    """Si faltan credenciales y hay consola interactiva (Pelican/Pterodactyl), las pide y guarda .env."""
+    env_path = base_dir / ".env"
+    print("\n═══ Configuración inicial de HydroCompress Bot ═══")
+    print("Faltan credenciales de Telegram. Introdúcelas ahora para crear .env automáticamente:\n")
+    api_id = input("1) API_ID (de https://my.telegram.org): ").strip()
+    api_hash = input("2) API_HASH (de https://my.telegram.org): ").strip()
+    bot_token = input("3) BOT_TOKEN (de @BotFather): ").strip()
+    owner_id = input("4) OWNER_ID (tu ID numérico de @userinfobot): ").strip()
+
+    content = "\n".join(
+        [
+            f"API_ID={api_id}",
+            f"API_HASH={api_hash}",
+            f"BOT_TOKEN={bot_token}",
+            f"OWNER_ID={owner_id}",
+            "MAX_CPU_THREADS=4",
+            "MAX_RAM_GB=10",
+            "MAX_DISK_GB=30",
+            "DISK_RESERVE_GB=2.0",
+            "MAX_CONCURRENT_JOBS=1",
+            "ACCESS_MODE=private",
+            "LARGE_FILE_UPLOADER=gofile",
+            "PROGRESS_INTERVAL_SEC=3.5",
+            "",
+        ]
+    )
+    env_path.write_text(content, encoding="utf-8")
+    load_dotenv(env_path, override=True)
+    print(f"\n✅ Archivo .env guardado en {env_path}\n")
+
+
 @dataclass(slots=True)
 class BotConfig:
     api_id: int
     api_hash: str
     bot_token: str
     owner_id: int
+
+    # Cuenta de Telegram opcional (para subir hasta 4 GB con Premium o gestionar sesión)
+    user_session_string: str = ""
+    dump_chat_id: int = 0
 
     # Presupuesto de recursos del contenedor (panel.plugged.host)
     max_cpu_threads: int = 4
@@ -62,7 +102,7 @@ class BotConfig:
     # Acceso inicial (private = solo dueño + lista blanca | public = abierto)
     default_access_mode: str = "private"
 
-    # Entrega automática cuando el archivo comprimido supera ~1.99 GB
+    # Entrega automática cuando el archivo comprimido supera el límite de Telegram
     large_file_uploader: str = "gofile"  # gofile | buzzheavier | direct_http
     gofile_token: str = ""
     public_download_base_url: str = ""
@@ -72,6 +112,7 @@ class BotConfig:
 
     # Rutas locales persistentes y temporales
     base_dir: Path = Path(__file__).resolve().parent
+    bin_dir: Path = Path("./bin")
     data_dir: Path = Path("./data")
     work_dir: Path = Path("./temp_work")
     links_dir: Path = Path("./temp_links")
@@ -83,11 +124,13 @@ class BotConfig:
     @classmethod
     def from_env(cls) -> BotConfig:
         base_dir = Path(__file__).resolve().parent
+        bin_dir = (base_dir / "bin").resolve()
         data_dir = Path(_env_str("DATA_DIR", str(base_dir / "data"))).resolve()
         work_dir = Path(_env_str("WORK_DIR", str(base_dir / "temp_work"))).resolve()
         links_dir = Path(_env_str("LINKS_DIR", str(base_dir / "temp_links"))).resolve()
         db_path = data_dir / "bot.db"
 
+        bin_dir.mkdir(parents=True, exist_ok=True)
         data_dir.mkdir(parents=True, exist_ok=True)
         work_dir.mkdir(parents=True, exist_ok=True)
         links_dir.mkdir(parents=True, exist_ok=True)
@@ -96,6 +139,13 @@ class BotConfig:
         api_hash = _env_str("API_HASH")
         bot_token = _env_str("BOT_TOKEN")
         owner_id = _env_int("OWNER_ID", 0)
+
+        if (api_id <= 0 or not api_hash or not bot_token or owner_id <= 0) and sys.stdin.isatty():
+            _interactive_setup_env(base_dir)
+            api_id = _env_int("API_ID", 0)
+            api_hash = _env_str("API_HASH")
+            bot_token = _env_str("BOT_TOKEN")
+            owner_id = _env_int("OWNER_ID", 0)
 
         missing = []
         if api_id <= 0:
@@ -110,7 +160,8 @@ class BotConfig:
         if missing:
             raise RuntimeError(
                 f"Faltan variables de entorno obligatorias: {', '.join(missing)}. "
-                "Revisa tu archivo .env o las variables en panel.plugged.host."
+                "Crea el archivo .env en el Administrador de Archivos de panel.plugged.host "
+                "(puedes generarlo desde la pestaña 'Configurar .env' antes de descargar el ZIP)."
             )
 
         uploader = _env_str("LARGE_FILE_UPLOADER", "gofile").lower()
@@ -129,6 +180,8 @@ class BotConfig:
             api_hash=api_hash,
             bot_token=bot_token,
             owner_id=owner_id,
+            user_session_string=_env_str("USER_SESSION_STRING"),
+            dump_chat_id=_env_int("DUMP_CHAT_ID", 0),
             max_cpu_threads=max_threads,
             max_ram_gb=max(1.0, _env_float("MAX_RAM_GB", 10.0)),
             max_disk_gb=max(5.0, _env_float("MAX_DISK_GB", 30.0)),
@@ -142,6 +195,7 @@ class BotConfig:
             direct_link_port=_env_int("DIRECT_LINK_PORT", 8080),
             direct_link_ttl_hours=max(1, _env_int("DIRECT_LINK_TTL_HOURS", 6)),
             base_dir=base_dir,
+            bin_dir=bin_dir,
             data_dir=data_dir,
             work_dir=work_dir,
             links_dir=links_dir,

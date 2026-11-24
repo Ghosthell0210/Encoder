@@ -1,4 +1,4 @@
-"""Panel de administración /admin, telemetría psutil y gestión de lista blanca."""
+"""Panel de administración /admin, /login de cuenta Telegram y lista blanca."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from config import BotConfig
 from core.database import Database
 from core.queue_manager import QueueManager, dir_size_bytes
 from core.ui_helpers import build_admin_keyboard, human_bytes
+from core.user_session import UserSessionManager
 
 
 def register_admin_handlers(
@@ -20,6 +21,7 @@ def register_admin_handlers(
     config: BotConfig,
     db: Database,
     queue_mgr: QueueManager,
+    user_session: UserSessionManager,
 ) -> None:
     def _is_owner(user_id: int | None) -> bool:
         return user_id == config.owner_id
@@ -29,11 +31,11 @@ def register_admin_handlers(
         access_mode = settings.get("access_mode", config.default_access_mode)
         conc = queue_mgr.concurrency_limit
         uploader = settings.get("large_file_uploader", config.large_file_uploader)
+        dump_id = settings.get("dump_chat_id", str(config.dump_chat_id or ""))
         stats = await db.get_stats()
         users = await db.list_users()
         active, pending = queue_mgr.get_queue_snapshot()
 
-        # Telemetría real del proceso y contenedor con psutil
         cpu_pct = psutil.cpu_percent(interval=0.1)
         proc = psutil.Process()
         proc_ram = proc.memory_info().rss
@@ -44,22 +46,26 @@ def register_admin_handlers(
         ram_budget_bytes = int(config.max_ram_gb * (1024**3))
         disk_budget_bytes = int(config.max_disk_gb * (1024**3))
         threads_each = queue_mgr.threads_per_job()
+        dump_label = dump_id if dump_id and dump_id != "0" else "Mensajes Guardados (dueño)"
 
         text = (
             "🛡 **Panel de Administración (panel.plugged.host)**\n\n"
-            "🖥 **Recursos del Bot (Presupuesto Máxima Potencia):**\n"
+            "🖥 **Recursos del Bot (Máxima Potencia):**\n"
             f"• **CPU:** `{cpu_pct:.1f}%` (Asignado: `{config.max_cpu_threads * 100}%` · `{threads_each}` hilos/trabajo)\n"
-            f"• **RAM Bot / Sistema:** `{human_bytes(proc_ram)}` / `{human_bytes(vm.used)}` (Límite bot: `{human_bytes(ram_budget_bytes)}`)\n"
+            f"• **RAM Bot / Sistema:** `{human_bytes(proc_ram)}` / `{human_bytes(vm.used)}` (Límite: `{human_bytes(ram_budget_bytes)}`)\n"
             f"• **Disco Temporal Bot:** `{human_bytes(bot_temp_used)}` / `{human_bytes(disk_budget_bytes)}`\n"
             f"• **Disco Libre del Host:** `{human_bytes(disk.free)}`\n\n"
-            "⚙️ **Operación:**\n"
+            "⚙️ **Operación y Cuenta Telegram:**\n"
+            f"• **Cuenta Telegram:** `{user_session.status_label()}`\n"
+            f"• **Canal puente (2–4 GB):** `{dump_label}`\n"
             f"• **Cola:** `{len(active)}/{conc}` activos · `{len(pending)}` en espera\n"
             f"• **Acceso:** `{'Solo Lista Blanca' if access_mode == 'private' else 'Público'}` (`{len(users)}` usuarios)\n"
-            f"• **Proveedor >2 GB:** `{uploader}` (Direct HTTP: `{'Activo' if queue_mgr.direct_store.enabled else 'Inactivo'}`)\n\n"
+            f"• **Proveedor >2 GB:** `{uploader}`\n\n"
             "📊 **Acumulado:**\n"
             f"• **Videos:** `{stats.total_jobs}` · **Enlaces >2 GB:** `{stats.total_link_deliveries}`\n"
             f"• **Ahorro total:** `{human_bytes(stats.total_saved_bytes)}`\n\n"
-            "**Comandos rápidos:**\n"
+            "**Comandos de dueño:**\n"
+            "`/login` · `/logout` · `/setdump <id>`\n"
             "`/adduser <id>` · `/deluser <id>` · `/users` · `/purge` · `/cancelall`"
         )
         return text, access_mode, conc, uploader
@@ -74,6 +80,58 @@ def register_admin_handlers(
             text,
             reply_markup=build_admin_keyboard(access_mode, conc, uploader),
         )
+
+    # ── Inicio de sesión de cuenta Telegram (/login, /logout, /setdump) ──────
+
+    @app.on_message(filters.private & filters.command("login"))
+    async def cmd_login(_client: Client, message: Message) -> None:
+        if not message.from_user or not _is_owner(message.from_user.id):
+            await message.reply_text("⛔ Solo el dueño puede vincular una cuenta de Telegram.")
+            return
+        await user_session.begin_login()
+        await message.reply_text(
+            "🔑 **Vincular cuenta de Telegram (MTProto)**\n\n"
+            "Usa tu `API_ID` y `API_HASH` configurados para iniciar sesión con tu cuenta:\n"
+            "• **Cuenta estándar:** límite nativo de **2 GB** (igual que el bot).\n"
+            "• **Cuenta Telegram Premium:** sube el límite nativo hasta **4 GB**.\n\n"
+            "📱 Envíame ahora tu **número de teléfono con código de país** (ejemplo: `+5215512345678`).\n"
+            "*(Tu mensaje será eliminado al instante. Escribe `/cancellogin` para cancelar.)*"
+        )
+
+    @app.on_message(filters.private & filters.command("cancellogin"))
+    async def cmd_cancellogin(_client: Client, message: Message) -> None:
+        if not message.from_user or not _is_owner(message.from_user.id):
+            return
+        await user_session.cancel_login()
+        await message.reply_text("✖ Inicio de sesión cancelado.")
+
+    @app.on_message(filters.private & filters.command("logout"))
+    async def cmd_logout(_client: Client, message: Message) -> None:
+        if not message.from_user or not _is_owner(message.from_user.id):
+            return
+        await user_session.stop()
+        await db.set_setting("user_session_string", "")
+        await message.reply_text("🔌 Cuenta de Telegram desconectada y sesión eliminada de la base de datos.")
+
+    @app.on_message(filters.private & filters.command("setdump"))
+    async def cmd_setdump(_client: Client, message: Message) -> None:
+        if not message.from_user or not _is_owner(message.from_user.id):
+            return
+        parts = message.text.split()
+        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+            await message.reply_text(
+                "Uso: `/setdump <channel_id>` (ej. `/setdump -1001234567890`).\n"
+                "Usa `/setdump 0` para desactivarlo. Añade tanto a tu cuenta como al bot como administradores en ese canal privado para entregar videos de 2–4 GB (Premium) a cualquier usuario."
+            )
+            return
+        chat_id = int(parts[1])
+        await db.set_setting("dump_chat_id", str(chat_id))
+        if chat_id == 0:
+            await message.reply_text("✅ Canal puente desactivado.")
+        else:
+            await message.reply_text(f"✅ Canal puente configurado en `{chat_id}`.")
+
+    # ── Lista blanca y mantenimiento ──────────────────────────────────────────
 
     @app.on_message(filters.private & filters.command("adduser"))
     async def cmd_adduser(_client: Client, message: Message) -> None:

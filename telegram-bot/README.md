@@ -1,42 +1,45 @@
 # HydroCompress Bot — Compresor de Videos para Telegram
 
-Bot nativo de compresión de videos para Telegram (**sin servidor web**), construido con **Python 3.11+**, **Hydrogram + TgCrypto** y **FFmpeg**, calibrado específicamente para tus recursos libres en **panel.plugged.host**:
+Bot nativo de compresión de videos para Telegram (**sin servidor web**), construido con **Python 3.11+**, **Hydrogram + TgCrypto** y **FFmpeg**, listo para el Egg **Python Generic (Pelican / Pterodactyl)** en **panel.plugged.host**:
 
-- **CPU:** 400% (4 hilos FFmpeg — conmutable entre `1 trabajo × 4 hilos` o `2 trabajos × 2 hilos` desde `/admin`)
-- **RAM:** 10 GiB asignados
-- **Disco:** 30 GiB asignados con guardia automática de espacio libre y borrado inmediato tras cada envío
-- **Límite de Telegram y >2 GB:** Envía nativamente hasta **1.99 GB (2000 MiB)** en Telegram y, si el archivo comprimido supera ese peso, genera automáticamente un **enlace de descarga directa** (GoFile con respaldo Buzzheavier o enlace temporal directo) + botón de 1 toque para re-comprimirlo a `1.90 GB` (2-Pass).
+- **Auto-instalación rootless de FFmpeg/FFprobe:** Si tu Egg `Python Generic` no trae `ffmpeg`, `bot.py` descarga automáticamente binarios estáticos Linux (con `libx264`, `libx265` y `libass`) en `./bin/` al arrancar por primera vez, sin requerir permisos root.
+- **Recursos calibrados:** `400% CPU (4 hilos)` · `10 GiB RAM` · `30 GiB Disco` con guardia automática de espacio libre y borrado inmediato tras cada envío.
+- **Límite de 2 GB, cuenta Telegram y >2 GB por enlace:**
+  - Con `API_ID` + `API_HASH` + `BOT_TOKEN` el bot ya soporta nativamente **hasta 2 GB** vía MTProto.
+  - Además puedes vincular tu cuenta de Telegram con **`/login`** dentro del propio chat (o con `python3 login_account.py`): si tu cuenta es **Telegram Premium**, desbloquea entregas nativas **hasta 4 GB**.
+  - Si un video comprimido supera el límite de Telegram, el bot genera automáticamente un **enlace de descarga directa** (GoFile con respaldo Buzzheavier) + botón de 1 toque para re-comprimirlo a `1.90 GB` (2-Pass).
 
 ---
 
-## Instalación rápida en `panel.plugged.host`
+## 1. Cómo obtener `API_ID` y `API_HASH` (para desbloquear los 2 GB)
 
-1. **Crea el servidor Python** en `panel.plugged.host` asignando tus recursos libres (`400% CPU`, `10 GiB RAM`, `30 GiB Disco`).
-2. **Sube el ZIP** desde el **Administrador de Archivos** del panel y haz clic en **Descomprimir (Unarchive)**.
-3. **Configura tus credenciales**: renombra `.env.example` a `.env` (o sube el `.env` generado al exportar) y completa:
-   - `API_ID` y `API_HASH` desde [https://my.telegram.org](https://my.telegram.org) (sección *API development tools*).
-   - `BOT_TOKEN` desde [@BotFather](https://t.me/BotFather).
-   - `OWNER_ID` (tu ID numérico) desde [@userinfobot](https://t.me/userinfobot).
-4. **Verifica FFmpeg**: si tu Egg de Python en Pterodactyl no trae `ffmpeg` preinstalado, selecciona una imagen Docker con FFmpeg (o construye usando el `Dockerfile` incluido).
-5. **Comando de arranque (Startup)**:
-   ```bash
-   bash start.sh
+1. Entra a **[https://my.telegram.org](https://my.telegram.org)** e inicia sesión con tu número de teléfono de Telegram (recibirás un código dentro de la app de Telegram).
+2. Entra a **API development tools**.
+3. Crea una app (puedes poner cualquier nombre/título, ej. `HydroCompress`, plataforma `Desktop`) y guarda:
+   - **`App api_id`** → tu `API_ID` (número).
+   - **`App api_hash`** → tu `API_HASH` (texto largo).
+4. Obtén tu **`BOT_TOKEN`** creando un bot en **[@BotFather](https://t.me/BotFather)** (`/newbot`).
+5. Obtén tu **`OWNER_ID`** numérico escribiendo a **[@userinfobot](https://t.me/userinfobot)**.
+
+---
+
+## 2. Instalación en `panel.plugged.host` (Egg Python Generic)
+
+1. Crea el servidor con el Egg **Python Generic (Pelican/Pterodactyl)** asignando **400% CPU**, **10240 MiB RAM** y **30720 MiB Disco**.
+2. En **Startup**, elige imagen **Python 3.11** (recomendada por ruedas binarias precompiladas de `tgcrypto`) y cambia **`App py file` (`PY_FILE`)** a:
+   ```text
+   bot.py
    ```
-   *(o directamente `python3 bot.py` después de `pip install -r requirements.txt`)*.
+3. Sube `hydrocompress-telegram-bot.zip` en **Archivos** y pulsa **Descomprimir**.
+4. Coloca tu `.env` (puedes generarlo en la pestaña *Configurar .env* antes de bajar el ZIP, o renombrar `.env.example` a `.env` y pegar tus 4 credenciales).
+5. Pulsa **Start**. En el primer arranque descargará `ffmpeg`/`ffprobe` estáticos en `./bin/` automáticamente y conectará tu bot.
 
 ---
 
-## Comandos principales en Telegram
+## 3. Cómo entrar con tu cuenta de Telegram (opcional / Premium 4 GB)
 
-| Comando | Descripción |
-| :--- | :--- |
-| `/start` | Guía rápida de uso |
-| `/queue` | Ver trabajos en ejecución y en espera |
-| `/setthumb` | Responder a una foto para fijarla como miniatura personalizada |
-| `/delthumb` | Eliminar miniatura personalizada |
-| `/stats` | Videos comprimidos, enlaces >2 GB generados y GB ahorrados |
-| `/admin` | Panel interactivo (solo dueño): CPU/RAM/Disco, concurrencia, modo acceso y host >2 GB |
-| `/adduser <id>` | Autorizar un usuario en la lista blanca |
-| `/deluser <id>` | Revocar acceso de un usuario |
-| `/purge` | Borrar carpetas y enlaces temporales inactivos |
-| `/cancelall` | Detener y limpiar toda la cola |
+Una vez encendido el bot, tienes dos formas:
+- **Opción A (la más fácil, directo en Telegram):** escribe **`/login`** a tu bot. Te pedirá tu número (`+...`), luego el código recibido **separado por espacios** (ej. `1 2 3 4 5`) y tu contraseña 2FA si tienes. El bot borra tus mensajes al instante y guarda la sesión en SQLite.
+- **Opción B (desde consola):** ejecuta `python3 login_account.py` y pega el `USER_SESSION_STRING` resultante en tu `.env`.
+
+*(Si tu cuenta es Premium y quieres que videos de 2–4 GB también se entreguen a otros usuarios de tu lista blanca, crea un canal privado, añade a tu cuenta y al bot como administradores y ejecuta `/setdump -100XXXXXXXXXX`.)*

@@ -1,7 +1,9 @@
 """Punto de entrada principal del Bot de Compresión de Videos para Telegram.
 
 Arquitectura 100% Telegram nativa (sin panel web), construida con Hydrogram +
-TgCrypto + FFmpeg para panel.plugged.host (400% CPU, 10 GiB RAM, 30 GiB Disco).
+TgCrypto + FFmpeg para panel.plugged.host (Egg Python Generic Pelican/Pterodactyl).
+Incluye auto-instalación rootless de FFmpeg/FFprobe y soporte opcional de cuenta
+de Telegram (/login) para subir el límite nativo hasta 4 GB con Premium.
 """
 
 from __future__ import annotations
@@ -16,8 +18,10 @@ from hydrogram import Client, idle
 
 from config import BotConfig
 from core.database import Database
+from core.ffmpeg_bootstrap import ensure_ffmpeg
 from core.queue_manager import QueueManager
 from core.uploader import DirectLinkStore
+from core.user_session import UserSessionManager
 from handlers.admin_handlers import register_admin_handlers
 from handlers.user_handlers import register_user_handlers
 
@@ -27,12 +31,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("hydrocompress")
-
-
-def _verify_ffmpeg() -> None:
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        logger.critical("FFmpeg o FFprobe no están instalados en el PATH del contenedor.")
-        sys.exit(1)
 
 
 def _check_tgcrypto() -> None:
@@ -54,10 +52,11 @@ def _clean_startup_temps(config: BotConfig) -> None:
 
 
 async def main() -> None:
-    _verify_ffmpeg()
-    _check_tgcrypto()
-
     config = BotConfig.from_env()
+
+    # Instala ffmpeg y ffprobe estáticos en ./bin sin root si el Egg no los trae
+    ensure_ffmpeg(config.bin_dir)
+    _check_tgcrypto()
     _clean_startup_temps(config)
 
     db = Database(config.db_path)
@@ -70,6 +69,15 @@ async def main() -> None:
     )
 
     direct_store = DirectLinkStore(config)
+    user_session = UserSessionManager(config)
+
+    # Restaurar cuenta de Telegram vinculada (.env o SQLite vía /login)
+    saved_session = config.user_session_string or await db.get_setting("user_session_string", "")
+    if saved_session:
+        try:
+            await user_session.start_with_session(saved_session)
+        except Exception as exc:
+            logger.warning("No se pudo iniciar la sesión de cuenta Telegram guardada: %s", exc)
 
     app = Client(
         name=str(config.data_dir / "hydrocompress"),
@@ -85,10 +93,11 @@ async def main() -> None:
         config=config,
         db=db,
         direct_store=direct_store,
+        user_session=user_session,
     )
 
-    register_admin_handlers(app, config, db, queue_mgr)
-    register_user_handlers(app, config, db, queue_mgr)
+    register_admin_handlers(app, config, db, queue_mgr, user_session)
+    register_user_handlers(app, config, db, queue_mgr, user_session)
 
     await direct_store.start()
     await app.start()
@@ -96,12 +105,13 @@ async def main() -> None:
 
     me = await app.get_me()
     logger.info(
-        "Bot iniciado como @%s (ID: %s) | Presupuesto: %s%% CPU · %.0f GiB RAM · %.0f GiB Disco",
+        "Bot iniciado como @%s (ID: %s) | Presupuesto: %s%% CPU · %.0f GiB RAM · %.0f GiB Disco | Cuenta: %s",
         me.username,
         me.id,
         config.max_cpu_threads * 100,
         config.max_ram_gb,
         config.max_disk_gb,
+        user_session.status_label(),
     )
 
     try:
@@ -109,6 +119,7 @@ async def main() -> None:
     finally:
         logger.info("Deteniendo bot y limpiando recursos...")
         await queue_mgr.stop()
+        await user_session.stop()
         await app.stop()
         await direct_store.stop()
         await db.close()

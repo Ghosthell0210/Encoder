@@ -341,6 +341,32 @@ export default function App() {
                   className="w-full px-3 py-2 text-sm font-mono bg-[#0B111E] border border-[#1F2937] rounded-md text-[#F3F4F6] placeholder-[#4B5563] focus:outline-none focus:border-[#2563EB]"
                 />
               </label>
+
+              <label className="block space-y-1.5 sm:col-span-2">
+                <span className="text-xs font-medium text-[#D1D5DB]">
+                  USER_SESSION_STRING (opcional — también puedes usar /login en Telegram)
+                </span>
+                <input
+                  type="password"
+                  value={envForm.userSessionString}
+                  onChange={(e) => updateEnv('userSessionString', e.target.value)}
+                  placeholder="Vacío si iniciarás sesión después con /login"
+                  className="w-full px-3 py-2 text-sm font-mono bg-[#0B111E] border border-[#1F2937] rounded-md text-[#F3F4F6] placeholder-[#4B5563] focus:outline-none focus:border-[#2563EB]"
+                />
+              </label>
+
+              <label className="block space-y-1.5 sm:col-span-2">
+                <span className="text-xs font-medium text-[#D1D5DB]">
+                  DUMP_CHAT_ID (opcional — canal privado puente para videos 2–4 GB con Premium)
+                </span>
+                <input
+                  type="text"
+                  value={envForm.dumpChatId}
+                  onChange={(e) => updateEnv('dumpChatId', e.target.value)}
+                  placeholder="-1001234567890"
+                  className="w-full px-3 py-2 text-sm font-mono bg-[#0B111E] border border-[#1F2937] rounded-md text-[#F3F4F6] placeholder-[#4B5563] focus:outline-none focus:border-[#2563EB]"
+                />
+              </label>
             </div>
 
             <div className="pt-4 border-t border-[#1F2937] space-y-4">
@@ -570,26 +596,43 @@ export default function App() {
           {/* Pasos de instalación */}
           <section className="bg-[#111827] border border-[#1F2937] rounded-lg p-6 space-y-5">
             <h2 className="text-sm font-semibold text-[#F3F4F6]">
-              Pasos de instalación en Pterodactyl
+              1. Obtener API_ID, API_HASH y BOT_TOKEN (para desbloquear 2 GB)
+            </h2>
+            <ol className="space-y-3 text-sm text-[#D1D5DB] list-decimal list-inside">
+              <li>
+                Entra a <code className="font-mono text-[#60A5FA]">https://my.telegram.org</code>, inicia sesión con tu número de teléfono y abre <span className="font-medium text-[#F3F4F6]">API development tools</span>.
+              </li>
+              <li>
+                Crea una aplicación (cualquier nombre, plataforma <span className="font-medium text-[#F3F4F6]">Desktop</span>) y copia <code className="font-mono text-[#60A5FA]">App api_id</code> y <code className="font-mono text-[#60A5FA]">App api_hash</code>.
+              </li>
+              <li>
+                Crea tu bot en <code className="font-mono text-[#60A5FA]">@BotFather</code> (<code className="font-mono">/newbot</code>) para el <code className="font-mono">BOT_TOKEN</code> y consulta tu <code className="font-mono">OWNER_ID</code> en <code className="font-mono text-[#60A5FA]">@userinfobot</code>.
+              </li>
+            </ol>
+          </section>
+
+          <section className="bg-[#111827] border border-[#1F2937] rounded-lg p-6 space-y-5">
+            <h2 className="text-sm font-semibold text-[#F3F4F6]">
+              2. Instalar en Egg Python Generic (Pelican / Pterodactyl)
             </h2>
 
             <ol className="space-y-4 text-sm text-[#D1D5DB] list-decimal list-inside">
               <li>
-                Descarga <code className="font-mono text-[#60A5FA]">hydrocompress-telegram-bot.zip</code> con el botón superior.
+                Crea el servidor usando el Egg <span className="font-medium text-[#F3F4F6]">Python Generic (Pelican / Pterodactyl)</span> con <span className="font-mono text-[#60A5FA]">400% CPU</span>, <span className="font-mono text-[#60A5FA]">10240 MiB RAM</span> y <span className="font-mono text-[#60A5FA]">30720 MiB Disco</span>.
               </li>
               <li>
-                En <span className="font-medium text-[#F3F4F6]">panel.plugged.host</span>, abre tu servidor Python (400% CPU, 10 GiB RAM, 30 GiB Disco), sube el ZIP en <span className="font-medium text-[#F3F4F6]">Archivos</span> y pulsa <span className="font-medium text-[#F3F4F6]">Descomprimir</span>.
+                Rellena tus credenciales en la pestaña <span className="font-medium text-[#F3F4F6]">Configurar .env</span>, marca incluir <code className="font-mono">.env</code> y descarga <code className="font-mono text-[#60A5FA]">hydrocompress-telegram-bot.zip</code>.
               </li>
               <li>
-                Renombra <code className="font-mono text-[#60A5FA]">.env.example</code> a <code className="font-mono text-[#60A5FA]">.env</code> (o usa la pestaña Configurar .env) con tus valores de <code className="font-mono">API_ID</code>, <code className="font-mono">API_HASH</code>, <code className="font-mono">BOT_TOKEN</code> y <code className="font-mono">OWNER_ID</code>.
+                Sube el ZIP en <span className="font-medium text-[#F3F4F6]">Archivos</span> de <span className="font-medium text-[#F3F4F6]">panel.plugged.host</span> y pulsa <span className="font-medium text-[#F3F4F6]">Descomprimir</span>.
               </li>
               <li>
-                En la pestaña <span className="font-medium text-[#F3F4F6]">Startup</span>, establece el comando de inicio:
+                En <span className="font-medium text-[#F3F4F6]">Startup</span>, elige imagen <span className="font-medium text-[#F3F4F6]">Python 3.11</span> y cambia <code className="font-mono text-[#60A5FA]">App py file (PY_FILE)</code> a:
                 <div className="mt-2 flex items-center justify-between gap-3 px-4 py-2.5 bg-[#0B111E] border border-[#1F2937] rounded-md font-mono text-xs text-[#F3F4F6]">
-                  <code>bash start.sh</code>
+                  <code>bot.py</code>
                   <button
                     type="button"
-                    onClick={() => handleCopy('cmd-start', 'bash start.sh')}
+                    onClick={() => handleCopy('cmd-start', 'bot.py')}
                     className="inline-flex items-center gap-1 text-[#9CA3AF] hover:text-[#F3F4F6] cursor-pointer"
                   >
                     {copiedId === 'cmd-start' ? (
@@ -602,7 +645,10 @@ export default function App() {
                 </div>
               </li>
               <li>
-                Enciende el servidor y escribe <code className="font-mono text-[#60A5FA]">/admin</code> a tu bot en Telegram para verificar CPU, RAM, Disco y gestionar tu lista blanca.
+                Pulsa <span className="font-medium text-[#F3F4F6]">Start</span>: el bot descargará automáticamente <code className="font-mono">ffmpeg</code> y <code className="font-mono">ffprobe</code> estáticos en <code className="font-mono">./bin</code> sin permisos root.
+              </li>
+              <li>
+                <span className="font-medium text-[#F3F4F6]">Entrar con tu cuenta de Telegram (opcional / Premium 4 GB):</span> escribe <code className="font-mono text-[#60A5FA]">/login</code> a tu bot en Telegram (envía teléfono, código separado por espacios y 2FA si aplica) o ejecuta <code className="font-mono">python3 login_account.py</code> en la consola.
               </li>
             </ol>
           </section>
@@ -630,7 +676,10 @@ export default function App() {
                     ['/setthumb', 'Autorizados', 'Responder a una foto para fijarla como miniatura personalizada'],
                     ['/delthumb', 'Autorizados', 'Volver a extracción automática de miniatura al 15% del video'],
                     ['/stats', 'Autorizados', 'Total de videos comprimidos, enlaces >2 GB y espacio ahorrado'],
-                    ['/admin', 'Dueño', 'CPU/RAM/Disco en vivo, lista blanca, concurrencia 1×4 / 2×2 y host >2 GB'],
+                    ['/admin', 'Dueño', 'CPU/RAM/Disco en vivo, cuenta Telegram, lista blanca y concurrencia'],
+                    ['/login', 'Dueño', 'Asistente seguro para iniciar sesión con tu cuenta Telegram (4 GB con Premium)'],
+                    ['/logout', 'Dueño', 'Desconectar y eliminar la sesión de la cuenta Telegram'],
+                    ['/setdump <id>', 'Dueño', 'Canal privado puente para entregar videos 2–4 GB (Premium) a cualquier usuario'],
                     ['/adduser <id>', 'Dueño', 'Autorizar un usuario en la lista blanca'],
                     ['/deluser <id>', 'Dueño', 'Revocar acceso de un usuario'],
                     ['/purge', 'Dueño', 'Limpiar carpetas y enlaces temporales inactivos'],

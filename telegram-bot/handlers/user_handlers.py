@@ -29,6 +29,7 @@ from core.ui_helpers import (
     human_bytes,
     human_duration,
 )
+from core.user_session import UserSessionManager
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".flv", ".ts", ".wmv"}
 URL_REGEX = re.compile(r"^https?://\S+$", re.IGNORECASE)
@@ -68,6 +69,7 @@ def register_user_handlers(
     config: BotConfig,
     db: Database,
     queue_mgr: QueueManager,
+    user_session: UserSessionManager,
 ) -> None:
     sessions: dict[str, DraftSession] = {}
     awaiting_custom_mb: dict[int, str] = {}  # user_id -> session_id
@@ -100,7 +102,12 @@ def register_user_handlers(
         if not await _check_access(message):
             return
         is_owner = message.from_user and message.from_user.id == config.owner_id
-        admin_hint = "\n• `/admin` — Panel de servidor, lista blanca y concurrencia" if is_owner else ""
+        admin_hint = (
+            "\n• `/admin` — Panel de servidor, lista blanca y concurrencia"
+            "\n• `/login` — Vincular tu cuenta de Telegram (MTProto / hasta 4 GB con Premium)"
+            if is_owner
+            else ""
+        )
         await message.reply_text(
             "🎬 **HydroCompress Bot — Compresor de Videos de Alta Potencia**\n\n"
             "**Cómo usarlo:**\n"
@@ -242,12 +249,59 @@ def register_user_handlers(
 
     # ── Recepción de texto: tamaño manual en MB o enlace directo HTTP(S) ──────
 
-    @app.on_message(filters.private & filters.text & ~filters.command(["start", "help", "id", "queue", "stats", "setthumb", "delthumb", "admin", "adduser", "deluser", "users", "purge", "cancelall"]))
+    @app.on_message(
+        filters.private
+        & filters.text
+        & ~filters.command(
+            [
+                "start",
+                "help",
+                "id",
+                "queue",
+                "stats",
+                "setthumb",
+                "delthumb",
+                "admin",
+                "login",
+                "cancellogin",
+                "logout",
+                "setdump",
+                "adduser",
+                "deluser",
+                "users",
+                "purge",
+                "cancelall",
+            ]
+        )
+    )
     async def on_text_message(_client: Client, message: Message) -> None:
         if not message.from_user or not message.text:
             return
         user_id = message.from_user.id
         text = message.text.strip()
+
+        # 0. ¿El dueño está completando el asistente seguro /login?
+        if user_id == config.owner_id and user_session.login_in_progress:
+            # Borrar inmediatamente el mensaje sensible (teléfono, código o contraseña 2FA)
+            with contextlib.suppress(Exception):
+                await message.delete()
+            stage = user_session.current_stage
+            try:
+                if stage == "phone":
+                    reply_txt = await user_session.submit_phone(text)
+                    await message.reply_text(reply_txt)
+                elif stage == "code":
+                    done, reply_txt, session_str = await user_session.submit_code(text)
+                    if done and session_str:
+                        await db.set_setting("user_session_string", session_str)
+                    await message.reply_text(reply_txt)
+                elif stage == "password":
+                    reply_txt, session_str = await user_session.submit_password(text)
+                    await db.set_setting("user_session_string", session_str)
+                    await message.reply_text(reply_txt)
+            except Exception as exc:
+                await message.reply_text(f"⚠️ {exc}")
+            return
 
         # 1. ¿El usuario estaba escribiendo un tamaño manual en MB?
         if user_id in awaiting_custom_mb:

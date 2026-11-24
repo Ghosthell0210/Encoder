@@ -2,6 +2,7 @@ import JSZip from 'jszip';
 
 import botPy from '../../telegram-bot/bot.py?raw';
 import configPy from '../../telegram-bot/config.py?raw';
+import loginAccountPy from '../../telegram-bot/login_account.py?raw';
 import requirementsTxt from '../../telegram-bot/requirements.txt?raw';
 import envExample from '../../telegram-bot/.env.example?raw';
 import dockerfile from '../../telegram-bot/Dockerfile?raw';
@@ -10,9 +11,11 @@ import readmeMd from '../../telegram-bot/README.md?raw';
 
 import coreInitPy from '../../telegram-bot/core/__init__.py?raw';
 import databasePy from '../../telegram-bot/core/database.py?raw';
+import ffmpegBootstrapPy from '../../telegram-bot/core/ffmpeg_bootstrap.py?raw';
 import mediaProbePy from '../../telegram-bot/core/media_probe.py?raw';
 import ffmpegEnginePy from '../../telegram-bot/core/ffmpeg_engine.py?raw';
 import uploaderPy from '../../telegram-bot/core/uploader.py?raw';
+import userSessionPy from '../../telegram-bot/core/user_session.py?raw';
 import uiHelpersPy from '../../telegram-bot/core/ui_helpers.py?raw';
 import queueManagerPy from '../../telegram-bot/core/queue_manager.py?raw';
 
@@ -35,6 +38,8 @@ export interface EnvFormState {
   apiHash: string;
   botToken: string;
   ownerId: string;
+  userSessionString: string;
+  dumpChatId: string;
   accessMode: 'private' | 'public';
   maxConcurrentJobs: '1' | '2';
   largeFileUploader: 'gofile' | 'buzzheavier' | 'direct_http';
@@ -50,6 +55,8 @@ export const DEFAULT_ENV_FORM: EnvFormState = {
   apiHash: '',
   botToken: '',
   ownerId: '',
+  userSessionString: '',
+  dumpChatId: '',
   accessMode: 'private',
   maxConcurrentJobs: '1',
   largeFileUploader: 'gofile',
@@ -77,14 +84,20 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'bot.py',
     'Raíz',
-    'Arranque principal Hydrogram + TgCrypto, limpieza inicial y apagado seguro',
+    'Arranque principal Hydrogram + TgCrypto, auto-instalación FFmpeg y sesión de cuenta',
     botPy,
   ),
   makeFile(
     'config.py',
     'Raíz',
-    'Variables de entorno y límites calibrados (400% CPU, 10 GiB RAM, 30 GiB Disco)',
+    'Variables de entorno, asistente interactivo y presupuesto 400% CPU / 10 GiB RAM / 30 GiB Disco',
     configPy,
+  ),
+  makeFile(
+    'login_account.py',
+    'Raíz',
+    'Script opcional de consola para iniciar sesión con tu cuenta de Telegram y generar USER_SESSION_STRING',
+    loginAccountPy,
   ),
   makeFile(
     'requirements.txt',
@@ -95,13 +108,13 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     '.env.example',
     'Raíz',
-    'Plantilla de configuración de credenciales y proveedor >2 GB',
+    'Plantilla de credenciales API_ID/API_HASH, cuenta Telegram y proveedor >2 GB',
     envExample,
   ),
   makeFile(
     'start.sh',
     'Raíz',
-    'Script de arranque automático para Pterodactyl / panel.plugged.host',
+    'Script de arranque automático para Pelican / Pterodactyl',
     startSh,
   ),
   makeFile(
@@ -113,8 +126,14 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'README.md',
     'Raíz',
-    'Guía rápida de despliegue y tabla de comandos de Telegram',
+    'Guía completa para Egg Python Generic, API_ID/API_HASH y /login',
     readmeMd,
+  ),
+  makeFile(
+    'core/ffmpeg_bootstrap.py',
+    'core/',
+    'Descarga automática sin root de ffmpeg y ffprobe estáticos para Egg Python Generic',
+    ffmpegBootstrapPy,
   ),
   makeFile(
     'core/ffmpeg_engine.py',
@@ -123,9 +142,15 @@ export const BOT_FILES: BotFileItem[] = [
     ffmpegEnginePy,
   ),
   makeFile(
+    'core/user_session.py',
+    'core/',
+    'Gestor de inicio de sesión de cuenta Telegram (/login con 2FA) y soporte Premium 4 GB',
+    userSessionPy,
+  ),
+  makeFile(
     'core/queue_manager.py',
     'core/',
-    'Cola FIFO asíncrona, guardia de disco (30 GiB) y entrega híbrida Telegram / enlace >2 GB',
+    'Cola FIFO asíncrona, guardia de disco (30 GiB) y entrega híbrida Telegram / Premium / enlace',
     queueManagerPy,
   ),
   makeFile(
@@ -143,7 +168,7 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'core/database.py',
     'core/',
-    'Persistencia SQLite asíncrona (lista blanca, miniaturas, ajustes y estadísticas)',
+    'Persistencia SQLite asíncrona (lista blanca, miniaturas, sesión y estadísticas)',
     databasePy,
   ),
   makeFile(
@@ -156,13 +181,13 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'handlers/user_handlers.py',
     'handlers/',
-    'Recepción de videos/enlaces, botones de presets, tamaño exacto, pistas y re-compresión 1.9 GB',
+    'Videos/enlaces, presets, tamaño exacto, pistas, re-compresión 1.9 GB y asistente /login',
     userHandlersPy,
   ),
   makeFile(
     'handlers/admin_handlers.py',
     'handlers/',
-    'Panel /admin con telemetría psutil, lista blanca, concurrencia 1×4 / 2×2 y purga',
+    'Panel /admin con telemetría psutil, /login, /logout, /setdump, lista blanca y purga',
     adminHandlersPy,
   ),
   makeFile('handlers/__init__.py', 'handlers/', 'Inicializador del paquete handlers', handlersInitPy),
@@ -173,19 +198,25 @@ export function buildEnvFileContent(form: EnvFormState): string {
   const apiHash = form.apiHash.trim() || 'tu_api_hash_aqui';
   const botToken = form.botToken.trim() || '123456789:tu_bot_token_aqui';
   const ownerId = form.ownerId.trim() || '123456789';
+  const userSession = form.userSessionString.trim();
+  const dumpChatId = form.dumpChatId.trim();
   const gofileToken = form.gofileToken.trim();
   const publicUrl = form.publicDownloadBaseUrl.trim().replace(/\/+$/, '');
   const port = form.directLinkPort.trim() || '8080';
   const ttl = form.directLinkTtlHours.trim() || '6';
 
   return [
-    '# Credenciales de Telegram (MTProto hasta 2 GB)',
+    '# 1. Credenciales obligatorias de Telegram (MTProto hasta 2 GB)',
     `API_ID=${apiId}`,
     `API_HASH=${apiHash}`,
     `BOT_TOKEN=${botToken}`,
     `OWNER_ID=${ownerId}`,
     '',
-    '# Recursos asignados en panel.plugged.host (Máxima potencia libre)',
+    '# 2. Cuenta de Telegram opcional (puedes dejarlo vacío y usar /login en Telegram)',
+    `USER_SESSION_STRING=${userSession}`,
+    `DUMP_CHAT_ID=${dumpChatId}`,
+    '',
+    '# 3. Recursos asignados en panel.plugged.host (Máxima potencia libre)',
     'MAX_CPU_THREADS=4',
     'MAX_RAM_GB=10',
     'MAX_DISK_GB=30',
@@ -193,7 +224,7 @@ export function buildEnvFileContent(form: EnvFormState): string {
     `MAX_CONCURRENT_JOBS=${form.maxConcurrentJobs}`,
     `ACCESS_MODE=${form.accessMode}`,
     '',
-    '# Entrega automática por enlace si el video comprimido supera 2 GB',
+    '# 4. Entrega automática por enlace si el video comprimido supera 2 GB',
     `LARGE_FILE_UPLOADER=${form.largeFileUploader}`,
     `GOFILE_TOKEN=${gofileToken}`,
     '',
