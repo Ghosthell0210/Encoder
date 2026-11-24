@@ -15,8 +15,10 @@ import databasePy from '../../telegram-bot/core/database.py?raw';
 import fastTransferPy from '../../telegram-bot/core/fast_transfer.py?raw';
 import ffmpegBootstrapPy from '../../telegram-bot/core/ffmpeg_bootstrap.py?raw';
 import gitUpdaterPy from '../../telegram-bot/core/git_updater.py?raw';
+import jobLogCapturePy from '../../telegram-bot/core/job_log_capture.py?raw';
 import loggerSetupPy from '../../telegram-bot/core/logger_setup.py?raw';
 import mediaProbePy from '../../telegram-bot/core/media_probe.py?raw';
+import mediaToolsPy from '../../telegram-bot/core/media_tools.py?raw';
 import ffmpegEnginePy from '../../telegram-bot/core/ffmpeg_engine.py?raw';
 import uploaderPy from '../../telegram-bot/core/uploader.py?raw';
 import userSessionPy from '../../telegram-bot/core/user_session.py?raw';
@@ -159,6 +161,12 @@ export const BOT_FILES: BotFileItem[] = [
     gitUpdaterPy,
   ),
   makeFile(
+    'core/job_log_capture.py',
+    'core/',
+    'Auto-Log por trabajo con ContextVar: captura avisos no fatales/errores de Python y FFmpeg y los envía al dueño',
+    jobLogCapturePy,
+  ),
+  makeFile(
     'core/logger_setup.py',
     'core/',
     'Logging rotativo en data/bot.log (5 MiB × 3) y lector rápido de errores para /logs',
@@ -167,8 +175,14 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'core/ffmpeg_engine.py',
     'core/',
-    'Motor FFmpeg H.265/H.264, 10-bit/Anime, Muestra 15s, Trim, Marca de Agua, 2-Pass y subtítulos',
+    'Motor FFmpeg AV1 (SVT-AV1 P4/P6/P8), H.265/H.264, 10-bit, Opus/AAC/Copy, FPS, Metadatos, Trim y subs',
     ffmpegEnginePy,
+  ),
+  makeFile(
+    'core/media_tools.py',
+    'core/',
+    'Herramientas rápidas FFmpeg: cuadrícula 3×3, 4 capturas HD, Remux MKV↔MP4 sin recomprimir y extraer Opus/MP3',
+    mediaToolsPy,
   ),
   makeFile(
     'core/user_session.py',
@@ -179,13 +193,13 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'core/queue_manager.py',
     'core/',
-    'Cola FIFO asíncrona, guardia de disco (30 GiB) y entrega híbrida Telegram / Premium / enlace',
+    'Cola FIFO asíncrona, caché compartido con GC periódico, herramientas, Auto-Log y telemetría /live',
     queueManagerPy,
   ),
   makeFile(
     'core/resource_monitor.py',
     'core/',
-    'Medición en vivo de RAM, CPU y disco por video (bot + FFmpeg) y cálculo de specs recomendadas',
+    'Medición en vivo de RAM, CPU y disco (os.scandir) por video + snapshot instantáneo para /live',
     resourceMonitorPy,
   ),
   makeFile(

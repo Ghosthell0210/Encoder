@@ -1,8 +1,8 @@
-"""Monitor de consumo real de RAM, CPU y disco por video (bot + procesos FFmpeg).
+"""Monitor de consumo real de RAM, CPU y disco por video + telemetría instantánea /live.
 
-Muestrea cada 1 segundo el árbol completo de procesos del contenedor (Python +
-ffmpeg/ffprobe) y el espacio en disco usado por el trabajo, para medir picos
-reales y dimensionar exactamente CPU %, RAM y disco en panel.plugged.host.
+Muestrea el árbol completo de procesos del contenedor (Python + ffmpeg/ffprobe)
+y el espacio en disco usando os.scandir rápido, en escala Pelican/Pterodactyl
+(100% = 1 vCPU).
 """
 
 from __future__ import annotations
@@ -10,7 +10,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import math
-from dataclasses import dataclass
+import os
+import shutil
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import psutil
@@ -26,19 +29,54 @@ class JobResourceMetrics:
     samples: int = 0
 
 
-def _dir_bytes(path: Path | None) -> int:
-    if path is None or not path.exists():
+@dataclass(slots=True)
+class LiveProcUsage:
+    cpu_pct: float = 0.0
+    ram_bytes: int = 0
+
+
+@dataclass(slots=True)
+class LiveSnapshot:
+    bot_tree_cpu_pct: float
+    host_cpu_pct: float
+    bot_tree_ram_bytes: int
+    host_ram_used_bytes: int
+    host_ram_total_bytes: int
+    temp_disk_bytes: int
+    cache_disk_bytes: int
+    cache_count: int
+    disk_free_bytes: int
+    uptime_sec: float
+    per_job: dict[str, LiveProcUsage] = field(default_factory=dict)
+
+
+def fast_dir_bytes(path: Path | None) -> int:
+    """Calcula el tamaño de una carpeta/archivo usando os.scandir (bajo overhead)."""
+    if path is None:
         return 0
-    if path.is_file():
-        try:
-            return path.stat().st_size
-        except OSError:
-            return 0
+    try:
+        st = path.stat()
+    except OSError:
+        return 0
+    if not os.path.isdir(path):
+        return int(st.st_size)
+
     total = 0
-    for item in path.rglob("*"):
-        if item.is_file():
-            with contextlib.suppress(OSError):
-                total += item.stat().st_size
+    stack = [str(path)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
     return total
 
 
@@ -62,6 +100,87 @@ def recommended_panel_specs(
     disk_gib_raw = (max_disk_bytes * 1.5) / (1024**3) + 2.0
     disk_gib = max(5.0, float(math.ceil(disk_gib_raw)))
     return ram_gib, cpu_pct, disk_gib
+
+
+def _sample_live_sync(
+    work_dir: Path,
+    links_dir: Path,
+    bot_start_time: float,
+    job_pids: dict[str, int],
+) -> LiveSnapshot:
+    root = psutil.Process()
+    procs: list[psutil.Process] = [root]
+    with contextlib.suppress(psutil.Error):
+        procs.extend(root.children(recursive=True))
+
+    proc_by_pid: dict[int, psutil.Process] = {p.pid: p for p in procs}
+    # Cebar contadores de CPU
+    psutil.cpu_percent(interval=None)
+    for p in procs:
+        with contextlib.suppress(psutil.Error):
+            p.cpu_percent(interval=None)
+
+    time.sleep(0.25)
+
+    host_cpu = float(psutil.cpu_percent(interval=None))
+    total_cpu = 0.0
+    total_ram = 0
+    pid_metrics: dict[int, LiveProcUsage] = {}
+
+    for pid, p in proc_by_pid.items():
+        try:
+            cpu_v = float(p.cpu_percent(interval=None))
+            ram_v = int(p.memory_info().rss)
+            total_cpu += cpu_v
+            total_ram += ram_v
+            pid_metrics[pid] = LiveProcUsage(cpu_pct=round(cpu_v, 1), ram_bytes=ram_v)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    per_job: dict[str, LiveProcUsage] = {}
+    for jid, pid in job_pids.items():
+        if pid in pid_metrics:
+            per_job[jid] = pid_metrics[pid]
+
+    vm = psutil.virtual_memory()
+    disk = shutil.disk_usage(work_dir)
+    temp_bytes = fast_dir_bytes(work_dir) + fast_dir_bytes(links_dir)
+    cache_root = work_dir / "_cache"
+    cache_bytes = fast_dir_bytes(cache_root)
+    cache_count = 0
+    if cache_root.exists():
+        with contextlib.suppress(OSError):
+            cache_count = sum(1 for _ in os.scandir(cache_root))
+
+    return LiveSnapshot(
+        bot_tree_cpu_pct=round(total_cpu, 1),
+        host_cpu_pct=round(host_cpu, 1),
+        bot_tree_ram_bytes=total_ram,
+        host_ram_used_bytes=int(vm.used),
+        host_ram_total_bytes=int(vm.total),
+        temp_disk_bytes=temp_bytes,
+        cache_disk_bytes=cache_bytes,
+        cache_count=cache_count,
+        disk_free_bytes=int(disk.free),
+        uptime_sec=max(0.0, time.time() - bot_start_time),
+        per_job=per_job,
+    )
+
+
+async def sample_live_resources(
+    work_dir: Path,
+    links_dir: Path,
+    bot_start_time: float,
+    job_pids: dict[str, int],
+) -> LiveSnapshot:
+    """Toma una fotografía no bloqueante de CPU, RAM, disco y procesos FFmpeg para /live."""
+    return await asyncio.to_thread(
+        _sample_live_sync,
+        work_dir,
+        links_dir,
+        bot_start_time,
+        dict(job_pids),
+    )
 
 
 class JobResourceMonitor:
@@ -91,7 +210,6 @@ class JobResourceMonitor:
             self._watch_dirs.append(path)
 
     def start(self) -> None:
-        # Inicializar referencia de CPU para el proceso principal
         with contextlib.suppress(psutil.Error):
             self._root_proc.cpu_percent(interval=None)
         self._task = asyncio.create_task(self._sample_loop())
@@ -110,7 +228,6 @@ class JobResourceMonitor:
             alive_pids.add(pid)
             cached = self._tracked_procs.get(pid)
             if cached is None:
-                # Primera vez que vemos este hijo (ej. ffmpeg recién lanzado): cebar cpu_percent
                 with contextlib.suppress(psutil.Error):
                     proc.cpu_percent(interval=None)
                 self._tracked_procs[pid] = proc
@@ -124,19 +241,17 @@ class JobResourceMonitor:
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 self._tracked_procs.pop(pid, None)
 
-        # Limpiar PIDs terminados
         for stale_pid in list(self._tracked_procs.keys()):
             if stale_pid not in alive_pids:
                 self._tracked_procs.pop(stale_pid, None)
 
-        # Espacio real en disco usado por las rutas de este trabajo (sin contar duplicados)
         seen_paths: set[Path] = set()
         total_disk = 0
         for p in self._watch_dirs:
             rp = p.resolve()
             if rp not in seen_paths:
                 seen_paths.add(rp)
-                total_disk += _dir_bytes(rp)
+                total_disk += fast_dir_bytes(rp)
 
         self._samples += 1
         self._sum_ram += total_ram
@@ -163,7 +278,6 @@ class JobResourceMonitor:
                 await self._task
             self._task = None
 
-        # Última lectura para capturar pico final en trabajos muy cortos
         if self._samples == 0:
             await asyncio.to_thread(self._collect_once)
 

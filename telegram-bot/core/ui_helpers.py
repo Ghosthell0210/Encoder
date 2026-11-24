@@ -105,7 +105,12 @@ def build_start_keyboard(is_owner: bool, auto_mode: bool) -> InlineKeyboardMarku
         ],
     ]
     if is_owner:
-        rows.append([InlineKeyboardButton("🛡 Panel de Administración", callback_data="home:admin")])
+        rows.append(
+            [
+                InlineKeyboardButton("📡 En Vivo", callback_data="home:live"),
+                InlineKeyboardButton("🛡 Panel Admin", callback_data="home:admin"),
+            ]
+        )
     return InlineKeyboardMarkup(rows)
 
 
@@ -126,6 +131,16 @@ def _audio_mode_label(opts: CompressionOptions) -> str:
         idx = int(opts.audio_mode.split(":", 1)[1]) + 1
         return f"Pista #{idx}"
     return "Principal (#1)"
+
+
+def _audio_codec_label(opts: CompressionOptions) -> str:
+    if opts.audio_mode == "none":
+        return "—"
+    if opts.audio_codec == "copy":
+        return "Copiar"
+    if opts.audio_codec == "libopus":
+        return f"Opus {opts.audio_bitrate_k}k"
+    return f"AAC {opts.audio_bitrate_k}k"
 
 
 def _sub_mode_label(opts: CompressionOptions) -> str:
@@ -158,14 +173,15 @@ def format_draft_summary(
     media: MediaInfo | None = None,
     source_is_url: bool = False,
 ) -> str:
-    bit_str = " · 10-bit" if (opts.bit_depth == 10 and opts.codec == "libx265") else ""
-    codec_label = f"H.265{bit_str}" if opts.codec == "libx265" else "H.264"
+    codec_label = opts.codec_display_label()
     res_label = f"{opts.max_height}p" if opts.max_height else "Original"
-    mode_val = (
-        f"2-Pass · {opts.target_mb:.0f} MB"
-        if opts.target_mb
-        else f"CRF {opts.crf} · {opts.speed}"
-    )
+    fps_label = f" · {opts.target_fps} fps" if opts.target_fps else ""
+    if opts.target_mb:
+        mode_val = f"2-Pass · {opts.target_mb:.0f} MB"
+    elif opts.codec == "libsvtav1":
+        mode_val = f"CRF {opts.crf} · Preset {opts.av1_preset}"
+    else:
+        mode_val = f"CRF {opts.crf} · {opts.speed}"
 
     size_str = human_bytes(file_size) if file_size else "Al descargar"
     dur_str = human_duration(duration) if duration else "Auto"
@@ -183,16 +199,16 @@ def format_draft_summary(
         lines.append(f"✏️ **Renombrado:** `{opts.custom_output_name[:56]}`")
     if media:
         lines.append(
-            f"🔎 **Pistas:** `{len(media.audio_tracks)}` audio · `{len(media.subtitle_tracks)}` subs · `{media.video_codec}`"
+            f"🔎 **Pistas:** `{len(media.audio_tracks)}` audio · `{len(media.subtitle_tracks)}` subs · `{media.video_codec.upper()}` (`{media.fps or '?'} fps`)"
         )
 
     lines.extend(
         [
             "",
             "⚙️ **Ajustes Activos**",
-            f"├ **Video:** `{codec_label}` · `{res_label}`",
+            f"├ **Video:** `{codec_label}` · `{res_label}{fps_label}`",
             f"├ **Modo:** `{mode_val}`",
-            f"├ **Audio:** `{_audio_mode_label(opts)}` (`{opts.audio_bitrate_k}k`)",
+            f"├ **Audio:** `{_audio_mode_label(opts)}` (`{_audio_codec_label(opts)}`)",
             f"├ **Subtítulos:** `{_sub_mode_label(opts)}`",
         ]
     )
@@ -204,6 +220,15 @@ def format_draft_summary(
         lines.append(
             f"├ **Marca:** `{opts.watermark_text}` ({_watermark_pos_label(opts.watermark_pos)})"
         )
+    if opts.strip_metadata or opts.meta_title or opts.meta_artist:
+        meta_parts: list[str] = []
+        if opts.strip_metadata:
+            meta_parts.append("Limpiar")
+        if opts.meta_title:
+            meta_parts.append(f"Título: {opts.meta_title[:20]}")
+        if opts.meta_artist:
+            meta_parts.append(f"Autor: {opts.meta_artist[:18]}")
+        lines.append(f"├ **Metadatos:** `{' · '.join(meta_parts)}`")
     lines.append(
         f"└ **Formato envío:** `{'Documento' if opts.send_as_document else 'Video reproducible'}`"
     )
@@ -215,26 +240,27 @@ def build_main_config_keyboard(session_id: str, opts: CompressionOptions) -> Inl
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("⚡ Presets", callback_data=f"cfg:{session_id}:presets"),
+                InlineKeyboardButton("⚡ Presets (AV1/H265)", callback_data=f"cfg:{session_id}:presets"),
                 InlineKeyboardButton("🎯 Tamaño (MB)", callback_data=f"cfg:{session_id}:target"),
             ],
             [
-                InlineKeyboardButton("🛠 Códec / 10-bit", callback_data=f"cfg:{session_id}:advanced"),
+                InlineKeyboardButton("🛠 Códec / FPS / 10b", callback_data=f"cfg:{session_id}:advanced"),
                 InlineKeyboardButton("🎧 Audio / Subs", callback_data=f"cfg:{session_id}:tracks"),
             ],
             [
-                InlineKeyboardButton("✂️ Trim / Marca", callback_data=f"cfg:{session_id}:extras"),
-                InlineKeyboardButton("✏️ Renombrar", callback_data=f"cfg:{session_id}:rename"),
+                InlineKeyboardButton("✂️ Trim / Marca / Meta", callback_data=f"cfg:{session_id}:extras"),
+                InlineKeyboardButton("🧰 Herramientas", callback_data=f"cfg:{session_id}:tools"),
             ],
             [
+                InlineKeyboardButton("✏️ Renombrar", callback_data=f"cfg:{session_id}:rename"),
                 InlineKeyboardButton(doc_label, callback_data=f"cfg:{session_id}:toggle_doc"),
-                InlineKeyboardButton("💾 Guardar Auto", callback_data=f"cfg:{session_id}:save_auto"),
             ],
             [
                 InlineKeyboardButton("🎞 Muestra 15s", callback_data=f"cfg:{session_id}:sample"),
-                InlineKeyboardButton("🚀 Comprimir", callback_data=f"cfg:{session_id}:start"),
+                InlineKeyboardButton("💾 Guardar Auto", callback_data=f"cfg:{session_id}:save_auto"),
             ],
             [
+                InlineKeyboardButton("🚀 Comprimir", callback_data=f"cfg:{session_id}:start"),
                 InlineKeyboardButton("✖ Descartar", callback_data=f"cfg:{session_id}:discard"),
             ],
         ]
@@ -253,24 +279,48 @@ def build_presets_keyboard(session_id: str, current_key: str) -> InlineKeyboardM
 
 
 def build_advanced_keyboard(session_id: str, opts: CompressionOptions) -> InlineKeyboardMarkup:
-    c265 = "✓ H.265 (HEVC)" if opts.codec == "libx265" else "H.265 (HEVC)"
-    c264 = "✓ H.264 (AVC)" if opts.codec == "libx264" else "H.264 (AVC)"
-    bit_label = "🎨 10-bit Activado (Main10)" if opts.bit_depth == 10 else "🎨 8-bit Estándar"
+    c265 = "✓ H.265" if opts.codec == "libx265" else "H.265"
+    c264 = "✓ H.264" if opts.codec == "libx264" else "H.264"
+    cav1 = "✓ AV1" if opts.codec == "libsvtav1" else "AV1"
+
+    if opts.codec == "libx264":
+        bit_label = "🎨 8-bit (H.264)"
+    else:
+        bit_label = "🎨 10-bit Activado" if opts.bit_depth == 10 else "🎨 8-bit Estándar"
 
     def _res_btn(label: str, val: int | None) -> InlineKeyboardButton:
         mark = "✓ " if opts.max_height == val else ""
         code = "orig" if val is None else str(val)
         return InlineKeyboardButton(f"{mark}{label}", callback_data=f"cfg:{session_id}:res:{code}")
 
-    def _spd_btn(val: str) -> InlineKeyboardButton:
-        mark = "✓ " if opts.speed == val else ""
-        return InlineKeyboardButton(f"{mark}{val}", callback_data=f"cfg:{session_id}:speed:{val}")
+    def _fps_btn(label: str, val: int | None) -> InlineKeyboardButton:
+        mark = "✓ " if opts.target_fps == val else ""
+        code = "orig" if val is None else str(val)
+        return InlineKeyboardButton(f"{mark}{label}", callback_data=f"cfg:{session_id}:fps:{code}")
+
+    if opts.codec == "libsvtav1":
+        speed_row = [
+            InlineKeyboardButton(
+                f"{'✓ ' if opts.av1_preset == p else ''}P{p}",
+                callback_data=f"cfg:{session_id}:av1p:{p}",
+            )
+            for p in (10, 8, 6, 4)
+        ]
+    else:
+        speed_row = [
+            InlineKeyboardButton(
+                f"{'✓ ' if opts.speed == val else ''}{val}",
+                callback_data=f"cfg:{session_id}:speed:{val}",
+            )
+            for val in ("ultrafast", "veryfast", "fast", "medium")
+        ]
 
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(c265, callback_data=f"cfg:{session_id}:codec:libx265"),
                 InlineKeyboardButton(c264, callback_data=f"cfg:{session_id}:codec:libx264"),
+                InlineKeyboardButton(cav1, callback_data=f"cfg:{session_id}:codec:libsvtav1"),
             ],
             [
                 InlineKeyboardButton(bit_label, callback_data=f"cfg:{session_id}:toggle_10bit"),
@@ -282,11 +332,12 @@ def build_advanced_keyboard(session_id: str, opts: CompressionOptions) -> Inline
                 _res_btn("480p", 480),
                 _res_btn("360p", 360),
             ],
+            speed_row,
             [
-                _spd_btn("ultrafast"),
-                _spd_btn("veryfast"),
-                _spd_btn("fast"),
-                _spd_btn("medium"),
+                _fps_btn("FPS Orig", None),
+                _fps_btn("24 fps", 24),
+                _fps_btn("30 fps", 30),
+                _fps_btn("60 fps", 60),
             ],
             [
                 InlineKeyboardButton("➖ CRF -2", callback_data=f"cfg:{session_id}:crf:-2"),
@@ -347,6 +398,20 @@ def build_tracks_keyboard(
                 callback_data=f"cfg:{session_id}:audio:none",
             ),
         ],
+        [
+            InlineKeyboardButton(
+                f"{'✓ ' if opts.audio_codec == 'aac' else ''}AAC",
+                callback_data=f"cfg:{session_id}:acodec:aac",
+            ),
+            InlineKeyboardButton(
+                f"{'✓ ' if opts.audio_codec == 'libopus' else ''}Opus",
+                callback_data=f"cfg:{session_id}:acodec:libopus",
+            ),
+            InlineKeyboardButton(
+                f"{'✓ ' if opts.audio_codec == 'copy' else ''}Copiar",
+                callback_data=f"cfg:{session_id}:acodec:copy",
+            ),
+        ],
     ]
 
     if media and len(media.audio_tracks) > 1:
@@ -405,10 +470,11 @@ def build_tracks_keyboard(
 
     rows.append(
         [
-            InlineKeyboardButton("64k", callback_data=f"cfg:{session_id}:abr:64"),
-            InlineKeyboardButton("96k", callback_data=f"cfg:{session_id}:abr:96"),
-            InlineKeyboardButton("128k", callback_data=f"cfg:{session_id}:abr:128"),
-            InlineKeyboardButton("192k", callback_data=f"cfg:{session_id}:abr:192"),
+            InlineKeyboardButton(
+                f"{'✓ ' if opts.audio_bitrate_k == br else ''}{br}k",
+                callback_data=f"cfg:{session_id}:abr:{br}",
+            )
+            for br in (48, 64, 96, 128, 192)
         ]
     )
     rows.append([InlineKeyboardButton("⬅ Volver", callback_data=f"cfg:{session_id}:main")])
@@ -419,6 +485,8 @@ def build_extras_keyboard(session_id: str, opts: CompressionOptions) -> InlineKe
     def _pos_btn(pos: str, label: str) -> InlineKeyboardButton:
         mark = "✓ " if opts.watermark_pos == pos else ""
         return InlineKeyboardButton(f"{mark}{label}", callback_data=f"cfg:{session_id}:wmpos:{pos}")
+
+    strip_lbl = "🧼 Limpiar Meta: ON" if opts.strip_metadata else "🧼 Limpiar Meta: OFF"
 
     return InlineKeyboardMarkup(
         [
@@ -435,6 +503,36 @@ def build_extras_keyboard(session_id: str, opts: CompressionOptions) -> InlineKe
                 _pos_btn("tr", "↗ Arr-Der"),
                 _pos_btn("bl", "↙ Abj-Izq"),
                 _pos_btn("br", "↘ Abj-Der"),
+            ],
+            [
+                InlineKeyboardButton("📝 Título Meta", callback_data=f"cfg:{session_id}:set_meta_title"),
+                InlineKeyboardButton("👤 Autor Meta", callback_data=f"cfg:{session_id}:set_meta_artist"),
+            ],
+            [
+                InlineKeyboardButton(strip_lbl, callback_data=f"cfg:{session_id}:toggle_strip_meta"),
+            ],
+            [InlineKeyboardButton("⬅ Volver", callback_data=f"cfg:{session_id}:main")],
+        ]
+    )
+
+
+def build_tools_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔎 MediaInfo Técnico", callback_data=f"cfg:{session_id}:tool:mediainfo"),
+            ],
+            [
+                InlineKeyboardButton("🖼 Cuadrícula 3×3", callback_data=f"cfg:{session_id}:tool:screenshots_grid"),
+                InlineKeyboardButton("📸 4 Capturas HD", callback_data=f"cfg:{session_id}:tool:screenshots_hd"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Remux a MP4", callback_data=f"cfg:{session_id}:tool:remux_mp4"),
+                InlineKeyboardButton("🔄 Remux a MKV", callback_data=f"cfg:{session_id}:tool:remux_mkv"),
+            ],
+            [
+                InlineKeyboardButton("🎵 Extraer Opus", callback_data=f"cfg:{session_id}:tool:extract_opus"),
+                InlineKeyboardButton("🎵 Extraer MP3", callback_data=f"cfg:{session_id}:tool:extract_mp3"),
             ],
             [InlineKeyboardButton("⬅ Volver", callback_data=f"cfg:{session_id}:main")],
         ]
@@ -479,9 +577,13 @@ def build_admin_keyboard(
         "buzzheavier": "Buzzheavier",
         "direct_http": "Directo",
     }
-    alert_btn = "🔔 Alertas: ON" if error_alerts else "🔕 Alertas: OFF"
+    alert_btn = "🔔 Auto-Log: ON" if error_alerts else "🔕 Auto-Log: OFF"
     return InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton("📡 En Vivo (/live)", callback_data="adm:live"),
+                InlineKeyboardButton("📈 Consumo (/usage)", callback_data="adm:usage"),
+            ],
             [
                 InlineKeyboardButton(mode_btn, callback_data="adm:toggle_access"),
                 InlineKeyboardButton(conc_btn, callback_data="adm:toggle_conc"),
@@ -494,22 +596,32 @@ def build_admin_keyboard(
                 InlineKeyboardButton(alert_btn, callback_data="adm:toggle_alerts"),
             ],
             [
-                InlineKeyboardButton("📈 Consumo / RAM", callback_data="adm:usage"),
                 InlineKeyboardButton("📄 Ver Logs", callback_data="adm:logs"),
-            ],
-            [
                 InlineKeyboardButton("⬇ Bajar bot.log", callback_data="adm:logfile"),
+            ],
+            [
                 InlineKeyboardButton("👥 Usuarios", callback_data="adm:users"),
-            ],
-            [
                 InlineKeyboardButton("🧹 Purgar Temp", callback_data="adm:purge"),
-                InlineKeyboardButton("🛑 Cancelar Cola", callback_data="adm:cancelall"),
             ],
             [
-                InlineKeyboardButton("🔄 Actualizar Panel", callback_data="adm:refresh"),
+                InlineKeyboardButton("🛑 Cancelar Cola", callback_data="adm:cancelall"),
+                InlineKeyboardButton("🔄 Actualizar", callback_data="adm:refresh"),
             ],
         ]
     )
+
+
+def build_live_keyboard(has_active_jobs: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton("🔄 Actualizar", callback_data="live:refresh"),
+            InlineKeyboardButton("📈 Historial /usage", callback_data="adm:usage"),
+        ]
+    ]
+    if has_active_jobs:
+        rows.append([InlineKeyboardButton("🛑 Cancelar Cola", callback_data="live:cancelall")])
+    rows.append([InlineKeyboardButton("🛡 Panel Admin", callback_data="home:admin")])
+    return InlineKeyboardMarkup(rows)
 
 
 def safe_caption(text: str, limit: int = 1020) -> str:

@@ -420,7 +420,6 @@ async def _fast_upload_big_file(
                                 "Una conexión de subida falló 3 veces seguidas (%s); retirando ese worker.",
                                 exc,
                             )
-                            part_queue.task_done()
                             return
                     else:
                         raise exc

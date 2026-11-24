@@ -1,5 +1,6 @@
 """Manejadores de usuario: inicio interactivo, guía organizada, recepción de videos/enlaces,
-menús inline, Modo Lotes (/auto), Muestra 15s, subtítulos externos, 10-bit, Trim y Marca."""
+menús inline (AV1/H.265/H.264, FPS, Opus, Metadatos, Herramientas rápidas), Modo Lotes (/auto),
+Muestra 15s, subtítulos externos, /mediainfo y /ss."""
 
 from __future__ import annotations
 
@@ -12,13 +13,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hydrogram import Client, filters
-from hydrogram.types import CallbackQuery, Message
+from hydrogram.types import CallbackQuery, Message, User
 
 from config import BotConfig
 from core.database import Database
 from core.ffmpeg_engine import CompressionOptions, parse_timestamp
 from core.media_probe import MediaInfo
-from core.queue_manager import CompressionJob, QueueManager
+from core.queue_manager import ActionKind, ActiveSessionInfo, CompressionJob, QueueManager
 from core.ui_helpers import (
     DIVIDER,
     build_advanced_keyboard,
@@ -29,6 +30,7 @@ from core.ui_helpers import (
     build_presets_keyboard,
     build_start_keyboard,
     build_target_size_keyboard,
+    build_tools_keyboard,
     build_tracks_keyboard,
     format_draft_summary,
     human_bytes,
@@ -39,12 +41,22 @@ from core.user_session import UserSessionManager
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".flv", ".ts", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 URL_REGEX = re.compile(r"^https?://\S+$", re.IGNORECASE)
+VALID_TOOL_KINDS: set[str] = {
+    "mediainfo",
+    "screenshots_grid",
+    "screenshots_hd",
+    "remux_mp4",
+    "remux_mkv",
+    "extract_opus",
+    "extract_mp3",
+}
 
 
 @dataclass(slots=True)
 class DraftSession:
     session_id: str
     user_id: int
+    user_label: str
     chat_id: int
     config_message: Message
     filename: str
@@ -57,6 +69,15 @@ class DraftSession:
     source_url: str | None = None
     media: MediaInfo | None = None
     created_at: float = field(default_factory=time.time)
+
+
+def _format_user_label(user: User | None) -> str:
+    if not user:
+        return "Usuario"
+    if user.username:
+        return f"@{user.username}"
+    full = " ".join(p for p in (user.first_name, user.last_name) if p).strip()
+    return full[:28] or f"ID {user.id}"
 
 
 def _is_video_document(message: Message) -> bool:
@@ -78,12 +99,40 @@ def _is_subtitle_document(message: Message) -> bool:
     return Path(name).suffix in SUBTITLE_EXTENSIONS
 
 
+def _extract_video_meta(message: Message) -> tuple[str, int | None, float | None, int | None, int | None] | None:
+    if message.video:
+        v = message.video
+        return (
+            v.file_name or f"video_{message.id}.mp4",
+            v.file_size,
+            float(v.duration) if v.duration else None,
+            v.width,
+            v.height,
+        )
+    if message.document and _is_video_document(message):
+        d = message.document
+        return (
+            d.file_name or f"video_{message.id}.mkv",
+            d.file_size,
+            None,
+            None,
+            None,
+        )
+    return None
+
+
 def _format_saved_preset_line(opts: CompressionOptions) -> str:
-    bit = " 10-bit" if (opts.bit_depth == 10 and opts.codec == "libx265") else ""
-    codec = f"H.265{bit}" if opts.codec == "libx265" else "H.264"
+    codec = opts.codec_display_label()
     res = f"{opts.max_height}p" if opts.max_height else "Orig"
-    mode = f"2-Pass {opts.target_mb:.0f} MB" if opts.target_mb else f"CRF {opts.crf} ({opts.speed})"
-    return f"`{codec}` · `{res}` · `{mode}` · `{opts.audio_bitrate_k}k`"
+    fps = f" {opts.target_fps}fps" if opts.target_fps else ""
+    if opts.target_mb:
+        mode = f"2-Pass {opts.target_mb:.0f} MB"
+    elif opts.codec == "libsvtav1":
+        mode = f"CRF {opts.crf}"
+    else:
+        mode = f"CRF {opts.crf} ({opts.speed})"
+    acodec = "Copy" if opts.audio_codec == "copy" else ("Opus" if opts.audio_codec == "libopus" else "AAC")
+    return f"`{codec}` · `{res}{fps}` · `{mode}` · `{acodec} {opts.audio_bitrate_k}k`"
 
 
 def register_user_handlers(
@@ -94,7 +143,7 @@ def register_user_handlers(
     user_session: UserSessionManager,
 ) -> None:
     sessions: dict[str, DraftSession] = {}
-    # user_id -> (session_id, mode) donde mode ∈ {"custom_mb", "rename", "trim", "watermark", "attach_sub"}
+    # user_id -> (session_id, mode)
     awaiting_input: dict[int, tuple[str, str]] = {}
 
     def _cleanup_old_sessions() -> None:
@@ -103,6 +152,21 @@ def register_user_handlers(
         for sid in expired:
             sessions.pop(sid, None)
             queue_mgr.release_session_cache(sid)
+
+    def _export_open_sessions() -> list[ActiveSessionInfo]:
+        _cleanup_old_sessions()
+        return [
+            ActiveSessionInfo(
+                session_id=s.session_id,
+                user_id=s.user_id,
+                user_label=s.user_label,
+                filename=s.filename,
+                created_at=s.created_at,
+            )
+            for s in sessions.values()
+        ]
+
+    queue_mgr.set_sessions_provider(_export_open_sessions)
 
     async def _check_access(message: Message) -> bool:
         user = message.from_user
@@ -139,7 +203,7 @@ def register_user_handlers(
         text = (
             "🎬 **HydroCompress Bot**\n"
             f"`{DIVIDER}`\n"
-            "Envíame cualquier **video**, **archivo** (hasta 2 GB) o **enlace directo `http(s)://`** para comprimirlo.\n\n"
+            "Envíame cualquier **video**, **archivo** (hasta 2 GB) o **enlace directo `http(s)://`** para comprimirlo en **AV1 / H.265 / H.264** o usar herramientas rápidas.\n\n"
             "⚙️ **Tu Perfil**\n"
             f"├ **Modo:** `{auto_tag}`\n"
             f"├ **Ajuste base:** {_format_saved_preset_line(opts)}\n"
@@ -154,9 +218,11 @@ def register_user_handlers(
             "📖 **Guía de Comandos**",
             f"`{DIVIDER}`",
             "",
-            "🎬 **Compresión y Lotes**",
+            "🎬 **Compresión y Herramientas**",
             "├ `/start` — Menú principal interactivo",
             "├ `/auto` — Activar/desactivar **Modo Lotes** automático",
+            "├ `/mediainfo` — Ficha técnica completa (responde a un video)",
+            "├ `/ss` — Cuadrícula 3×3 de capturas (responde a un video)",
             "├ `/queue` — Ver cola y trabajos activos",
             "└ `/stats` — Total comprimido y espacio ahorrado",
             "",
@@ -172,7 +238,8 @@ def register_user_handlers(
                 [
                     "",
                     "🛡 **Administración (Dueño)**",
-                    "├ `/admin` — Panel del servidor y recursos",
+                    "├ `/live` — Ver quién usa el bot, CPU y RAM en vivo",
+                    "├ `/admin` — Panel del servidor, Auto-Log y recursos",
                     "├ `/usage [reset]` — Consumo real de RAM, CPU y disco por video",
                     "├ `/logs [n|errors|file]` — Ver o bajar `bot.log`",
                     "├ `/update` — Actualizar desde GitHub y reiniciar",
@@ -184,7 +251,7 @@ def register_user_handlers(
         lines.extend(
             [
                 "",
-                "💡 *En cada video puedes elegir **Anime 10-bit**, probar una **Muestra 15s**, adjuntar `.srt/.ass`, recortar (**Trim**) o fijar un **Tamaño exacto en MB**.*",
+                "💡 *En cada video tienes **AV1 (Rápido / Equilibrado / Máx)**, **Audio Opus**, **FPS**, **Metadatos**, **Remux MKV↔MP4**, **Extraer Audio**, **Screenshots** y **Muestra 15s** con caché compartido.*",
             ]
         )
         return "\n".join(lines)
@@ -203,7 +270,10 @@ def register_user_handlers(
             for idx, j in enumerate(active):
                 branch = "└" if idx == len(active) - 1 else "├"
                 elapsed = human_duration(time.time() - (j.started_at or j.created_at))
-                lines.append(f"{branch} `{j.job_id}` · `{j.filename[:34]}` ({j.phase}, {elapsed})")
+                pct = f" {j.progress_pct:.0f}%" if j.progress_pct > 0 else ""
+                lines.append(
+                    f"{branch} `{j.job_id}` · `{j.action_badge}` · `{j.filename[:30]}` ({j.phase}{pct}, {elapsed})"
+                )
         else:
             lines.append("\n• Sin trabajos activos en este momento.")
 
@@ -213,7 +283,7 @@ def register_user_handlers(
             shown = pending[:10]
             for idx, j in enumerate(shown, start=1):
                 branch = "└" if idx == len(shown) else "├"
-                lines.append(f"{branch} `{idx}.` `{j.job_id}` · `{j.filename[:36]}`")
+                lines.append(f"{branch} `{idx}.` `{j.job_id}` · `{j.action_badge}` · `{j.filename[:32]}`")
         return "\n".join(lines)
 
     async def _render_stats_text() -> str:
@@ -232,6 +302,7 @@ def register_user_handlers(
     async def _enqueue_auto_job(
         message: Message,
         user_id: int,
+        user_label: str,
         filename: str,
         file_size: int | None,
         opts: CompressionOptions,
@@ -246,6 +317,7 @@ def register_user_handlers(
         job = CompressionJob(
             job_id=job_id,
             user_id=user_id,
+            user_label=user_label,
             chat_id=message.chat.id,
             status_message=status_msg,
             filename=filename,
@@ -266,7 +338,7 @@ def register_user_handlers(
                 reply_markup=build_job_cancel_keyboard(job_id),
             )
 
-    # ── Comandos informativos y de perfil ─────────────────────────────────────
+    # ── Comandos informativos, perfil y accesos rápidos (/mediainfo, /ss) ────
 
     @app.on_message(filters.private & filters.command("start"))
     async def cmd_start(_client: Client, message: Message) -> None:
@@ -295,6 +367,70 @@ def register_user_handlers(
         if not message.from_user:
             return
         await message.reply_text(f"🆔 **Tu ID de Telegram:** `{message.from_user.id}`")
+
+    @app.on_message(filters.private & filters.command("mediainfo"))
+    async def cmd_mediainfo(_client: Client, message: Message) -> None:
+        if not await _check_access(message):
+            return
+        reply = message.reply_to_message
+        meta = _extract_video_meta(reply) if reply else None
+        if not reply or not meta:
+            await message.reply_text(
+                "🔎 Responde con `/mediainfo` a cualquier **video o archivo de video** para ver su ficha técnica completa."
+            )
+            return
+        filename, file_size, _, _, _ = meta
+        job_id = secrets.token_hex(4)
+        status = await message.reply_text(
+            f"🔎 **MediaInfo · En cola**\n`{DIVIDER}`\n├ **Archivo:** `{filename[:56]}`\n└ **Trabajo:** `{job_id}`",
+            reply_markup=build_job_cancel_keyboard(job_id),
+            quote=True,
+        )
+        job = CompressionJob(
+            job_id=job_id,
+            user_id=message.from_user.id,
+            user_label=_format_user_label(message.from_user),
+            chat_id=message.chat.id,
+            status_message=status,
+            filename=filename,
+            options=CompressionOptions(),
+            source_message=reply,
+            expected_size=file_size or (200 * 1024 * 1024),
+            action_kind="mediainfo",
+        )
+        await queue_mgr.enqueue(job)
+
+    @app.on_message(filters.private & filters.command("ss"))
+    async def cmd_screenshots(_client: Client, message: Message) -> None:
+        if not await _check_access(message):
+            return
+        reply = message.reply_to_message
+        meta = _extract_video_meta(reply) if reply else None
+        if not reply or not meta:
+            await message.reply_text(
+                "🖼 Responde con `/ss` a cualquier **video o archivo de video** para generar su cuadrícula 3×3 de capturas."
+            )
+            return
+        filename, file_size, _, _, _ = meta
+        job_id = secrets.token_hex(4)
+        status = await message.reply_text(
+            f"🖼 **Cuadrícula 3×3 · En cola**\n`{DIVIDER}`\n├ **Archivo:** `{filename[:56]}`\n└ **Trabajo:** `{job_id}`",
+            reply_markup=build_job_cancel_keyboard(job_id),
+            quote=True,
+        )
+        job = CompressionJob(
+            job_id=job_id,
+            user_id=message.from_user.id,
+            user_label=_format_user_label(message.from_user),
+            chat_id=message.chat.id,
+            status_message=status,
+            filename=filename,
+            options=CompressionOptions(),
+            source_message=reply,
+            expected_size=file_size or (200 * 1024 * 1024),
+            action_kind="screenshots_grid",
+        )
+        await queue_mgr.enqueue(job)
 
     @app.on_message(filters.private & filters.command("auto"))
     async def cmd_auto(_client: Client, message: Message) -> None:
@@ -337,7 +473,7 @@ def register_user_handlers(
         await db.set_watermark(message.from_user.id, wm_text)
         await message.reply_text(
             f"✅ **Marca de agua guardada:** `{wm_text}`\n"
-            "*(Puedes cambiar la esquina en `✂️ Trim / Marca` al configurar un video.)*"
+            "*(Puedes cambiar la esquina en `✂️ Trim / Marca / Meta` al configurar un video.)*"
         )
 
     @app.on_message(filters.private & filters.command("delwatermark"))
@@ -446,6 +582,7 @@ def register_user_handlers(
         if not message.from_user:
             return
         user_id = message.from_user.id
+        user_label = _format_user_label(message.from_user)
 
         # 0. ¿Estaba esperando un archivo de subtítulo externo (.srt / .ass / .vtt)?
         pending_state = awaiting_input.get(user_id)
@@ -472,33 +609,21 @@ def register_user_handlers(
             )
             return
 
-        if message.document and not _is_video_document(message):
+        meta = _extract_video_meta(message)
+        if not meta:
             return
         if not await _check_access(message):
             return
 
         _cleanup_old_sessions()
         opts, auto_mode = await _load_user_options(user_id)
-
-        if message.video:
-            v = message.video
-            filename = v.file_name or f"video_{message.id}.mp4"
-            file_size = v.file_size
-            duration = float(v.duration) if v.duration else None
-            width = v.width
-            height = v.height
-        else:
-            d = message.document
-            filename = d.file_name or f"video_{message.id}.mkv"
-            file_size = d.file_size
-            duration = None
-            width = None
-            height = None
+        filename, file_size, duration, width, height = meta
 
         if auto_mode:
             await _enqueue_auto_job(
                 message=message,
                 user_id=user_id,
+                user_label=user_label,
                 filename=filename,
                 file_size=file_size,
                 opts=opts,
@@ -523,6 +648,7 @@ def register_user_handlers(
         sessions[sid] = DraftSession(
             session_id=sid,
             user_id=user_id,
+            user_label=user_label,
             chat_id=message.chat.id,
             config_message=cfg_msg,
             filename=filename,
@@ -545,12 +671,15 @@ def register_user_handlers(
                 "help",
                 "id",
                 "auto",
+                "mediainfo",
+                "ss",
                 "setwatermark",
                 "delwatermark",
                 "queue",
                 "stats",
                 "setthumb",
                 "delthumb",
+                "live",
                 "admin",
                 "usage",
                 "logs",
@@ -571,6 +700,7 @@ def register_user_handlers(
         if not message.from_user or not message.text:
             return
         user_id = message.from_user.id
+        user_label = _format_user_label(message.from_user)
         text = message.text.strip()
 
         # 0. Asistente seguro /login
@@ -670,6 +800,20 @@ def register_user_handlers(
                 await _refresh_session_message(session, view="extras")
                 return
 
+            if mode == "meta_title":
+                session.options.meta_title = "" if text.lower() in {"-", "borrar", "ninguno"} else text[:96]
+                with contextlib.suppress(Exception):
+                    await message.delete()
+                await _refresh_session_message(session, view="extras")
+                return
+
+            if mode == "meta_artist":
+                session.options.meta_artist = "" if text.lower() in {"-", "borrar", "ninguno"} else text[:96]
+                with contextlib.suppress(Exception):
+                    await message.delete()
+                await _refresh_session_message(session, view="extras")
+                return
+
         # 2. Enlace directo HTTP(S)
         if URL_REGEX.match(text):
             if not await _check_access(message):
@@ -686,6 +830,7 @@ def register_user_handlers(
                 await _enqueue_auto_job(
                     message=message,
                     user_id=user_id,
+                    user_label=user_label,
                     filename=raw_name,
                     file_size=None,
                     opts=opts,
@@ -711,6 +856,7 @@ def register_user_handlers(
             sessions[sid] = DraftSession(
                 session_id=sid,
                 user_id=user_id,
+                user_label=user_label,
                 chat_id=message.chat.id,
                 config_message=cfg_msg,
                 filename=raw_name,
@@ -743,6 +889,8 @@ def register_user_handlers(
             kb = build_tracks_keyboard(session.session_id, session.options, session.media)
         elif view == "extras":
             kb = build_extras_keyboard(session.session_id, session.options)
+        elif view == "tools":
+            kb = build_tools_keyboard(session.session_id)
         else:
             kb = build_main_config_keyboard(session.session_id, session.options)
 
@@ -772,7 +920,7 @@ def register_user_handlers(
             await query.answer()
             return
 
-        if action in {"main", "presets", "advanced", "target", "tracks", "extras"}:
+        if action in {"main", "presets", "advanced", "target", "tracks", "extras", "tools"}:
             await query.answer()
             await _refresh_session_message(session, view=action)
             return
@@ -784,28 +932,46 @@ def register_user_handlers(
             return
 
         if action == "codec" and len(parts) >= 4:
-            if parts[3] in {"libx265", "libx264"}:
+            if parts[3] in {"libx265", "libx264", "libsvtav1"}:
+                prev_codec = session.options.codec
                 session.options.codec = parts[3]  # type: ignore[assignment]
                 if parts[3] == "libx264":
                     session.options.bit_depth = 8
-            await query.answer(f"Códec: {parts[3]}")
+                    if prev_codec == "libsvtav1":
+                        session.options.crf = 24
+                elif parts[3] == "libsvtav1":
+                    session.options.bit_depth = 10
+                    if prev_codec != "libsvtav1":
+                        session.options.crf = 30
+                elif parts[3] == "libx265" and prev_codec == "libsvtav1":
+                    session.options.crf = 26
+            await query.answer(f"Códec: {session.options.codec_display_label()}")
             await _refresh_session_message(session, view="advanced")
             return
 
         if action == "toggle_10bit":
+            if session.options.codec == "libx264":
+                session.options.bit_depth = 8
+                await query.answer("H.264 usa 8-bit. Elige H.265 o AV1 para 10-bit.", show_alert=True)
+                return
             if session.options.bit_depth == 10:
                 session.options.bit_depth = 8
                 await query.answer("Profundidad: 8-bit")
             else:
                 session.options.bit_depth = 10
-                session.options.codec = "libx265"
-                await query.answer("Profundidad: 10-bit (H.265 Main10)")
+                await query.answer("Profundidad: 10-bit")
             await _refresh_session_message(session, view="advanced")
             return
 
         if action == "res" and len(parts) >= 4:
             session.options.max_height = None if parts[3] == "orig" else int(parts[3])
             await query.answer(f"Resolución: {parts[3]}")
+            await _refresh_session_message(session, view="advanced")
+            return
+
+        if action == "fps" and len(parts) >= 4:
+            session.options.target_fps = None if parts[3] == "orig" else int(parts[3])
+            await query.answer(f"FPS: {parts[3]}")
             await _refresh_session_message(session, view="advanced")
             return
 
@@ -816,9 +982,17 @@ def register_user_handlers(
             await _refresh_session_message(session, view="advanced")
             return
 
+        if action == "av1p" and len(parts) >= 4:
+            with contextlib.suppress(ValueError):
+                session.options.av1_preset = max(0, min(13, int(parts[3])))
+            await query.answer(f"SVT-AV1 Preset: P{session.options.av1_preset}")
+            await _refresh_session_message(session, view="advanced")
+            return
+
         if action == "crf" and len(parts) >= 4:
             delta = int(parts[3])
-            session.options.crf = max(16, min(38, session.options.crf + delta))
+            max_crf = 50 if session.options.codec == "libsvtav1" else 38
+            session.options.crf = max(16, min(max_crf, session.options.crf + delta))
             session.options.target_mb = None
             await query.answer(f"CRF: {session.options.crf}")
             await _refresh_session_message(session, view="advanced")
@@ -902,10 +1076,35 @@ def register_user_handlers(
             await _refresh_session_message(session, view="extras")
             return
 
+        if action == "set_meta_title":
+            awaiting_input[session.user_id] = (sid, "meta_title")
+            await query.answer("Escribe el Título de metadatos o '-' para borrarlo.", show_alert=True)
+            return
+
+        if action == "set_meta_artist":
+            awaiting_input[session.user_id] = (sid, "meta_artist")
+            await query.answer("Escribe el Autor/Canal de metadatos o '-' para borrarlo.", show_alert=True)
+            return
+
+        if action == "toggle_strip_meta":
+            session.options.strip_metadata = not session.options.strip_metadata
+            await query.answer(
+                f"Limpiar metadatos: {'ON' if session.options.strip_metadata else 'OFF'}"
+            )
+            await _refresh_session_message(session, view="extras")
+            return
+
         if action == "audio" and len(parts) >= 4:
             val = ":".join(parts[3:])
             session.options.audio_mode = val
             await query.answer("Audio actualizado")
+            await _refresh_session_message(session, view="tracks")
+            return
+
+        if action == "acodec" and len(parts) >= 4:
+            if parts[3] in {"aac", "libopus", "copy"}:
+                session.options.audio_codec = parts[3]  # type: ignore[assignment]
+            await query.answer(f"Códec audio: {parts[3]}")
             await _refresh_session_message(session, view="tracks")
             return
 
@@ -945,6 +1144,60 @@ def register_user_handlers(
             )
             return
 
+        if action == "tool" and len(parts) >= 4 and parts[3] in VALID_TOOL_KINDS:
+            tool_kind: ActionKind = parts[3]  # type: ignore[assignment]
+            job_id = secrets.token_hex(4)
+            cached_note = (
+                "⚡ *Video en caché: sin re-descargar*"
+                if queue_mgr.has_cached_source(session.session_id)
+                else "💾 *Se guardará en caché temporal para no re-descargarlo si luego comprimes*"
+            )
+            tool_titles = {
+                "mediainfo": "🔎 MediaInfo Técnico",
+                "screenshots_grid": "🖼 Cuadrícula 3×3",
+                "screenshots_hd": "📸 4 Capturas HD",
+                "remux_mp4": "🔄 Remux a MP4",
+                "remux_mkv": "🔄 Remux a MKV",
+                "extract_opus": "🎵 Extraer Audio Opus",
+                "extract_mp3": "🎵 Extraer Audio MP3",
+            }
+            tool_status = await session.config_message.reply_text(
+                f"{tool_titles[tool_kind]} · **En cola**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{session.filename[:56]}`\n"
+                f"└ **Trabajo:** `{job_id}`\n\n"
+                f"{cached_note}",
+                reply_markup=build_job_cancel_keyboard(job_id),
+            )
+
+            async def _on_probed(probed: MediaInfo) -> None:
+                if sid in sessions:
+                    sessions[sid].media = probed
+                    sessions[sid].duration = probed.duration
+                    sessions[sid].width = probed.width
+                    sessions[sid].height = probed.height
+                    await _refresh_session_message(sessions[sid], view="tools")
+
+            job = CompressionJob(
+                job_id=job_id,
+                user_id=session.user_id,
+                user_label=session.user_label,
+                chat_id=session.chat_id,
+                status_message=tool_status,
+                filename=session.filename,
+                options=session.options.clone(),
+                source_message=session.source_message,
+                source_url=session.source_url,
+                expected_size=session.file_size or (500 * 1024 * 1024),
+                session_id=session.session_id,
+                keep_cached_source=True,
+                action_kind=tool_kind,
+                on_media_probed=_on_probed,
+            )
+            pos = await queue_mgr.enqueue(job)
+            await query.answer(f"{tool_titles[tool_kind]} encolado (#{pos})")
+            return
+
         if action == "sample":
             sample_opts = session.options.clone()
             sample_opts.sample_duration = 15.0
@@ -966,6 +1219,7 @@ def register_user_handlers(
             job = CompressionJob(
                 job_id=job_id,
                 user_id=session.user_id,
+                user_label=session.user_label,
                 chat_id=session.chat_id,
                 status_message=sample_status,
                 filename=session.filename,
@@ -998,6 +1252,7 @@ def register_user_handlers(
             job = CompressionJob(
                 job_id=job_id,
                 user_id=session.user_id,
+                user_label=session.user_label,
                 chat_id=session.chat_id,
                 status_message=session.config_message,
                 filename=session.filename,
@@ -1015,7 +1270,7 @@ def register_user_handlers(
                 f"⏳ **En Cola · Posición #{pos}**\n"
                 f"`{DIVIDER}`\n"
                 f"├ **Archivo:** `{session.filename[:56]}`\n"
-                f"├ **Hilos:** `{queue_mgr.threads_per_job()}` (`{queue_mgr.concurrency_limit}` en paralelo)\n"
+                f"├ **Códec:** `{session.options.codec_display_label()}` · `{queue_mgr.threads_per_job()}` hilos\n"
                 f"└ **Trabajo:** `{job_id}`{cache_line}",
                 reply_markup=build_job_cancel_keyboard(job_id),
             )
@@ -1064,6 +1319,7 @@ def register_user_handlers(
         job = CompressionJob(
             job_id=job_id,
             user_id=src.user_id,
+            user_label=src.user_label or _format_user_label(query.from_user),
             chat_id=src.chat_id,
             status_message=status_msg,
             filename=src.filename,

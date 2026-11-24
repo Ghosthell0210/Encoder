@@ -25,6 +25,8 @@ from config import BotConfig
 from core.console_commands import console_command_loop
 from core.database import Database
 from core.ffmpeg_bootstrap import ensure_ffmpeg
+from core.ffmpeg_engine import is_encoder_available
+from core.job_log_capture import install_job_log_handler
 from core.logger_setup import setup_logging
 from core.queue_manager import QueueManager
 from core.uploader import DirectLinkStore
@@ -43,6 +45,8 @@ USER_BOT_COMMANDS: list[BotCommand] = [
     BotCommand("start", "Inicio rápido y menú principal"),
     BotCommand("help", "Guía de uso y lista de comandos"),
     BotCommand("auto", "Activar o desactivar Modo Lotes automático"),
+    BotCommand("mediainfo", "Ficha técnica MediaInfo (responde a un video)"),
+    BotCommand("ss", "Cuadrícula 3×3 de capturas (responde a un video)"),
     BotCommand("queue", "Ver cola de compresión y trabajos activos"),
     BotCommand("stats", "Ver videos comprimidos y espacio ahorrado"),
     BotCommand("setthumb", "Fijar miniatura (responde a una foto)"),
@@ -54,6 +58,7 @@ USER_BOT_COMMANDS: list[BotCommand] = [
 
 OWNER_BOT_COMMANDS: list[BotCommand] = [
     *USER_BOT_COMMANDS,
+    BotCommand("live", "Ver usuarios activos, CPU y RAM en tiempo real"),
     BotCommand("admin", "Panel del servidor, recursos y alertas"),
     BotCommand("usage", "Consumo real de RAM, CPU y disco por video"),
     BotCommand("logs", "Ver últimos errores o descargar bot.log"),
@@ -108,10 +113,13 @@ def _clean_startup_temps(config: BotConfig) -> None:
 async def main() -> None:
     config = BotConfig.from_env()
     log_file = setup_logging(config.data_dir / "bot.log")
-    logger.info("Registro rotativo activo en: %s", log_file)
+    install_job_log_handler()
+    logger.info("Registro rotativo y Auto-Log por trabajo activos en: %s", log_file)
 
     # Instala ffmpeg y ffprobe estáticos en ./bin sin root si el Egg no los trae
     ensure_ffmpeg(config.bin_dir)
+    av1_ok = await is_encoder_available("libsvtav1")
+    logger.info("Soporte AV1 (libsvtav1): %s", "DISPONIBLE" if av1_ok else "NO encontrado en este FFmpeg")
     _check_tgcrypto()
     _clean_startup_temps(config)
 

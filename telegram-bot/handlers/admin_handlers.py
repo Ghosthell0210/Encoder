@@ -1,12 +1,12 @@
-"""Panel de administración /admin, /logs, /login de cuenta Telegram y lista blanca."""
+"""Panel de administración /admin, monitor en vivo /live, /usage, /logs, /login y lista blanca."""
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
-import shutil
+import time
 from pathlib import Path
 
-import psutil
 from hydrogram import Client, filters
 from hydrogram.types import CallbackQuery, Message
 
@@ -14,9 +14,15 @@ from config import BotConfig
 from core.database import Database
 from core.git_updater import pull_from_github, restart_process
 from core.logger_setup import read_last_log_lines
-from core.queue_manager import QueueManager, dir_size_bytes
-from core.resource_monitor import recommended_panel_specs
-from core.ui_helpers import DIVIDER, build_admin_keyboard, human_bytes
+from core.queue_manager import QueueManager
+from core.resource_monitor import recommended_panel_specs, sample_live_resources
+from core.ui_helpers import (
+    DIVIDER,
+    build_admin_keyboard,
+    build_live_keyboard,
+    human_bytes,
+    human_duration,
+)
 from core.user_session import UserSessionManager
 
 
@@ -49,12 +55,12 @@ def register_admin_handlers(
         users = await db.list_users()
         active, pending = queue_mgr.get_queue_snapshot()
 
-        cpu_pct = psutil.cpu_percent(interval=0.1)
-        proc = psutil.Process()
-        proc_ram = proc.memory_info().rss
-        vm = psutil.virtual_memory()
-        disk = shutil.disk_usage(config.work_dir)
-        bot_temp_used = dir_size_bytes(config.work_dir) + dir_size_bytes(config.links_dir)
+        snap = await sample_live_resources(
+            work_dir=config.work_dir,
+            links_dir=config.links_dir,
+            bot_start_time=queue_mgr.bot_started_at,
+            job_pids=queue_mgr.get_active_job_pids(),
+        )
 
         ram_budget_bytes = int(config.max_ram_gb * (1024**3))
         disk_budget_bytes = int(config.max_disk_gb * (1024**3))
@@ -65,21 +71,97 @@ def register_admin_handlers(
         text = (
             "🛡 **Panel de Administración**\n"
             f"`{DIVIDER}`\n\n"
-            "🖥 **Recursos del Servidor**\n"
-            f"├ **CPU:** `{cpu_pct:.1f}%` · `{threads_each}` hilos/trabajo (`{config.max_cpu_threads * 100}%` máx)\n"
-            f"├ **RAM:** `{human_bytes(proc_ram)}` bot · `{human_bytes(vm.used)}` host (`{human_bytes(ram_budget_bytes)}`)\n"
-            f"└ **Disco:** `{human_bytes(bot_temp_used)}` / `{human_bytes(disk_budget_bytes)}` · Libre `{human_bytes(disk.free)}`\n\n"
+            "🖥 **Recursos del Contenedor**\n"
+            f"├ **CPU (Bot+FFmpeg):** `{snap.bot_tree_cpu_pct:.0f}%` / `{config.max_cpu_threads * 100}%` · `{threads_each}` hilos/job\n"
+            f"├ **RAM (Bot+FFmpeg):** `{human_bytes(snap.bot_tree_ram_bytes)}` / `{human_bytes(ram_budget_bytes)}`\n"
+            f"├ **Disco:** `{human_bytes(snap.temp_disk_bytes)}` / `{human_bytes(disk_budget_bytes)}` · Libre `{human_bytes(snap.disk_free_bytes)}`\n"
+            f"└ **Activo:** `{human_duration(snap.uptime_sec)}` · **Caché:** `{snap.cache_count}` (`{human_bytes(snap.cache_disk_bytes)}`)\n\n"
             "⚙️ **Operación**\n"
             f"├ **Cola:** `{len(active)}/{conc}` activos · `{len(pending)}` en espera\n"
             f"├ **Acceso:** `{'Lista Blanca' if access_mode == 'private' else 'Público'}` (`{len(users)}` usuarios)\n"
             f"├ **Host >2 GB:** `{uploader}` · **Canal puente:** `{dump_label}`\n"
             f"├ **Cuenta:** `{user_session.status_label()}`\n"
-            f"└ **Logs:** `{log_size}` · **Alertas:** `{'ON' if error_alerts else 'OFF'}`\n\n"
+            f"└ **Logs:** `{log_size}` · **Auto-Log:** `{'ON' if error_alerts else 'OFF'}`\n\n"
             "📊 **Acumulado**\n"
             f"├ **Videos:** `{stats.total_jobs}` · **Enlaces >2 GB:** `{stats.total_link_deliveries}`\n"
             f"└ **Ahorro total:** `{human_bytes(stats.total_saved_bytes)}`"
         )
         return text, access_mode, conc, uploader, error_alerts
+
+    async def _render_live_text() -> tuple[str, bool]:
+        active, pending = queue_mgr.get_queue_snapshot()
+        open_sessions = queue_mgr.get_active_sessions_snapshot()
+        snap = await sample_live_resources(
+            work_dir=config.work_dir,
+            links_dir=config.links_dir,
+            bot_start_time=queue_mgr.bot_started_at,
+            job_pids=queue_mgr.get_active_job_pids(),
+        )
+
+        ram_budget = int(config.max_ram_gb * (1024**3))
+        max_cpu = config.max_cpu_threads * 100
+        conc = queue_mgr.concurrency_limit
+
+        lines: list[str] = [
+            "📡 **Monitor en Vivo**",
+            f"`{DIVIDER}`",
+            "",
+            "🖥 **Recursos Ahora Mismo**",
+            f"├ **CPU Bot+FFmpeg:** `{snap.bot_tree_cpu_pct:.0f}%` / `{max_cpu}%` *(Host `{snap.host_cpu_pct:.0f}%`)*",
+            f"├ **RAM Bot+FFmpeg:** `{human_bytes(snap.bot_tree_ram_bytes)}` / `{human_bytes(ram_budget)}`",
+            f"├ **Disco Temp:** `{human_bytes(snap.temp_disk_bytes)}` · **Caché:** `{snap.cache_count}` (`{human_bytes(snap.cache_disk_bytes)}`)",
+            f"└ **Libre:** `{human_bytes(snap.disk_free_bytes)}` · **Uptime:** `{human_duration(snap.uptime_sec)}`",
+            "",
+            f"👥 **Trabajos en Ejecución ({len(active)}/{conc})**",
+        ]
+
+        now = time.time()
+        if active:
+            for idx, job in enumerate(active):
+                branch = "└" if idx == len(active) - 1 else "├"
+                user_tag = job.user_label or f"ID {job.user_id}"
+                elapsed = human_duration(now - (job.started_at or job.created_at))
+                pct_str = f" {job.progress_pct:.0f}%" if job.progress_pct > 0 else ""
+                det_str = f" · {job.progress_detail}" if job.progress_detail else ""
+                proc_u = snap.per_job.get(job.job_id)
+                proc_str = (
+                    f"\n   ⚡ FFmpeg: CPU `{proc_u.cpu_pct:.0f}%` · RAM `{human_bytes(proc_u.ram_bytes)}`"
+                    if proc_u
+                    else ""
+                )
+                lines.append(
+                    f"{branch} **{user_tag}** (`{job.user_id}`)\n"
+                    f"   📄 `{job.filename[:38]}`\n"
+                    f"   ⚙️ `{job.action_badge}` · `{job.phase}{pct_str}`{det_str} (`{elapsed}`){proc_str}"
+                )
+        else:
+            lines.append("└ *En reposo — nadie está ejecutando un trabajo ahora.*")
+
+        if pending:
+            lines.append("")
+            lines.append(f"⏳ **En Cola ({len(pending)})**")
+            shown_p = pending[:6]
+            for idx, job in enumerate(shown_p):
+                branch = "└" if idx == len(shown_p) - 1 else "├"
+                user_tag = job.user_label or f"ID {job.user_id}"
+                lines.append(
+                    f"{branch} `{idx + 1}.` **{user_tag}** (`{job.user_id}`) · `{job.action_badge}` · `{job.filename[:30]}`"
+                )
+
+        if open_sessions:
+            lines.append("")
+            lines.append(f"🎛 **Configurando Panel ({len(open_sessions)})**")
+            shown_s = open_sessions[:6]
+            for idx, sess in enumerate(shown_s):
+                branch = "└" if idx == len(shown_s) - 1 else "├"
+                age = human_duration(now - sess.created_at)
+                lines.append(
+                    f"{branch} **{sess.user_label}** (`{sess.user_id}`) · `{sess.filename[:30]}` *(hace {age})*"
+                )
+
+        return "\n".join(lines), bool(active or pending)
+
+    # ── /admin y /live ────────────────────────────────────────────────────────
 
     @app.on_message(filters.private & filters.command("admin"))
     async def cmd_admin(_client: Client, message: Message) -> None:
@@ -92,18 +174,47 @@ def register_admin_handlers(
             reply_markup=build_admin_keyboard(access_mode, conc, uploader, error_alerts=error_alerts),
         )
 
-    @app.on_callback_query(filters.regex(r"^home:admin$"))
-    async def cb_open_admin(_client: Client, query: CallbackQuery) -> None:
+    @app.on_message(filters.private & filters.command("live"))
+    async def cmd_live(_client: Client, message: Message) -> None:
+        if not message.from_user or not _is_owner(message.from_user.id):
+            await message.reply_text("⛔ Comando exclusivo del administrador.")
+            return
+        text, has_jobs = await _render_live_text()
+        await message.reply_text(text, reply_markup=build_live_keyboard(has_jobs))
+
+    @app.on_callback_query(filters.regex(r"^home:(admin|live)$"))
+    async def cb_open_owner_views(_client: Client, query: CallbackQuery) -> None:
         if not _is_owner(query.from_user.id):
             await query.answer("Solo el administrador puede abrir este panel.", show_alert=True)
             return
+        target = query.data.split(":", 1)[1]
         await query.answer()
+        if target == "live":
+            text, has_jobs = await _render_live_text()
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(text, reply_markup=build_live_keyboard(has_jobs))
+            return
         text, access_mode, conc, uploader, error_alerts = await _render_admin_text()
         with contextlib.suppress(Exception):
             await query.message.edit_text(
                 text,
                 reply_markup=build_admin_keyboard(access_mode, conc, uploader, error_alerts=error_alerts),
             )
+
+    @app.on_callback_query(filters.regex(r"^live:(refresh|cancelall)$"))
+    async def cb_live(_client: Client, query: CallbackQuery) -> None:
+        if not _is_owner(query.from_user.id):
+            await query.answer("Solo el administrador puede usar este monitor.", show_alert=True)
+            return
+        action = query.data.split(":", 1)[1]
+        if action == "cancelall":
+            count = await queue_mgr.cancel_all()
+            await query.answer(f"Cancelados {count} trabajos", show_alert=True)
+        else:
+            await query.answer("Monitor actualizado")
+        text, has_jobs = await _render_live_text()
+        with contextlib.suppress(Exception):
+            await query.message.edit_text(text, reply_markup=build_live_keyboard(has_jobs))
 
     # ── Consumo real de RAM, CPU y disco por video (/usage [reset]) ───────────
 
@@ -301,7 +412,7 @@ def register_admin_handlers(
     async def cmd_purge(_client: Client, message: Message) -> None:
         if not message.from_user or not _is_owner(message.from_user.id):
             return
-        removed = queue_mgr.purge_inactive_temp()
+        removed = await asyncio.to_thread(queue_mgr.purge_inactive_temp)
         await message.reply_text(f"🧹 **Limpieza completada:** `{removed}` temporales eliminados.")
 
     @app.on_message(filters.private & filters.command("cancelall"))
@@ -361,7 +472,14 @@ def register_admin_handlers(
             cur = await db.get_setting("error_alerts", "1")
             nxt = "0" if cur == "1" else "1"
             await db.set_setting("error_alerts", nxt)
-            await query.answer(f"Alertas: {'ON' if nxt == '1' else 'OFF'}")
+            await query.answer(f"Auto-Log: {'ON' if nxt == '1' else 'OFF'}")
+
+        elif action == "live":
+            await query.answer()
+            text, has_jobs = await _render_live_text()
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(text, reply_markup=build_live_keyboard(has_jobs))
+            return
 
         elif action == "usage":
             await query.answer("Cargando reporte de consumo...")
@@ -386,7 +504,7 @@ def register_admin_handlers(
             return
 
         elif action == "purge":
-            removed = queue_mgr.purge_inactive_temp()
+            removed = await asyncio.to_thread(queue_mgr.purge_inactive_temp)
             await query.answer(f"Limpiados {removed} temporales", show_alert=True)
 
         elif action == "cancelall":

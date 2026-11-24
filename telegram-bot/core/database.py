@@ -86,6 +86,9 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL;")
         await self._conn.execute("PRAGMA synchronous=NORMAL;")
+        await self._conn.execute("PRAGMA temp_store=MEMORY;")
+        await self._conn.execute("PRAGMA busy_timeout=5000;")
+        await self._conn.execute("PRAGMA cache_size=-4000;")
 
         await self._conn.executescript(
             """

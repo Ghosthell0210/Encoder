@@ -1,23 +1,28 @@
-"""Gestor de cola FIFO asíncrona, guardia de disco (30 GiB) y entrega híbrida.
+"""Gestor de cola FIFO asíncrona, guardia de disco, herramientas FFmpeg,
+caché de sesión, telemetría /live y Auto-Log automático de incidencias.
 
-Si el archivo comprimido pesa ≤ 1990 MiB → sube nativamente a Telegram con Hydrogram.
-Si pesa > 1990 MiB → sube por streaming al proveedor de enlaces y ofrece re-compresión
-en 1 toque a 1900 MB (2-Pass) para que quepa en Telegram.
+Si el archivo resultante pesa ≤ 1990 MiB → sube nativamente a Telegram con Hydrogram.
+Si pesa 2–4 GB y hay cuenta Premium vinculada → sube vía cuenta Premium.
+Si pesa > 1990 MiB sin Premium → sube por streaming al proveedor de enlaces y ofrece
+re-compresión en 1 toque a 1900 MB (2-Pass).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import logging
 import secrets
 import shutil
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Literal
 
 from hydrogram import Client
-from hydrogram.types import Message
+from hydrogram.types import InputMediaPhoto, Message
 
 from config import (
     TELEGRAM_MAX_UPLOAD_BYTES,
@@ -25,6 +30,7 @@ from config import (
     BotConfig,
 )
 from core.database import Database
+from core.fast_transfer import fast_download_media, fast_send_video_or_doc
 from core.ffmpeg_engine import (
     CompressionOptions,
     EncodeProgress,
@@ -32,9 +38,19 @@ from core.ffmpeg_engine import (
     compress_video,
     extract_thumbnail,
 )
-from core.fast_transfer import fast_download_media, fast_send_video_or_doc
-from core.media_probe import MediaInfo, probe_media
-from core.resource_monitor import JobResourceMetrics, JobResourceMonitor
+from core.job_log_capture import JobIssueCollector, start_job_capture, stop_job_capture
+from core.media_probe import MediaInfo, format_mediainfo_report, probe_media
+from core.media_tools import (
+    extract_audio,
+    generate_hd_screenshots,
+    generate_screenshot_grid,
+    remux_video,
+)
+from core.resource_monitor import (
+    JobResourceMetrics,
+    JobResourceMonitor,
+    fast_dir_bytes,
+)
 from core.ui_helpers import (
     DIVIDER,
     ProgressUpdater,
@@ -50,6 +66,17 @@ from core.user_session import UserSessionManager
 
 logger = logging.getLogger(__name__)
 
+ActionKind = Literal[
+    "compress",
+    "mediainfo",
+    "screenshots_grid",
+    "screenshots_hd",
+    "remux_mp4",
+    "remux_mkv",
+    "extract_opus",
+    "extract_mp3",
+]
+
 
 @dataclass(slots=True)
 class RecompressSource:
@@ -61,7 +88,17 @@ class RecompressSource:
     source_url: str | None
     filename: str
     base_options: CompressionOptions
+    user_label: str = ""
     created_at: float = field(default_factory=time.time)
+
+
+@dataclass(slots=True)
+class ActiveSessionInfo:
+    session_id: str
+    user_id: int
+    user_label: str
+    filename: str
+    created_at: float
 
 
 @dataclass(slots=True)
@@ -77,22 +114,37 @@ class CompressionJob:
     expected_size: int = 0
     session_id: str | None = None
     keep_cached_source: bool = False
+    user_label: str = ""
+    action_kind: ActionKind = "compress"
+    on_media_probed: Callable[[MediaInfo], Awaitable[None]] | None = None
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     phase: str = "En cola"
+    progress_pct: float = 0.0
+    progress_detail: str = ""
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     active_proc: asyncio.subprocess.Process | None = None
 
+    @property
+    def action_badge(self) -> str:
+        mapping = {
+            "mediainfo": "MediaInfo",
+            "screenshots_grid": "Cuadrícula 3×3",
+            "screenshots_hd": "4 Capturas HD",
+            "remux_mp4": "Remux MP4",
+            "remux_mkv": "Remux MKV",
+            "extract_opus": "Audio Opus",
+            "extract_mp3": "Audio MP3",
+        }
+        if self.action_kind in mapping:
+            return mapping[self.action_kind]
+        if self.options.sample_duration:
+            return f"Muestra 15s · {self.options.codec_display_label()}"
+        return self.options.codec_display_label()
+
 
 def dir_size_bytes(path: Path) -> int:
-    total = 0
-    if not path.exists():
-        return 0
-    for item in path.rglob("*"):
-        if item.is_file():
-            with contextlib.suppress(OSError):
-                total += item.stat().st_size
-    return total
+    return fast_dir_bytes(path)
 
 
 class QueueManager:
@@ -110,27 +162,55 @@ class QueueManager:
         self.direct_store = direct_store
         self.user_session = user_session
 
+        self.bot_started_at: float = time.time()
         self._queue: asyncio.Queue[CompressionJob] = asyncio.Queue()
         self._pending: list[CompressionJob] = []
         self._active: dict[str, CompressionJob] = {}
         self._all_jobs: dict[str, CompressionJob] = {}
         self._recompress_sources: dict[str, RecompressSource] = {}
         self._session_cache: dict[str, Path] = {}
+        self._session_cache_ts: dict[str, float] = {}
         self._cache_locks: dict[str, asyncio.Lock] = {}
+        self._sessions_provider: Callable[[], list[ActiveSessionInfo]] | None = None
 
         self._workers: list[asyncio.Task[None]] = []
+        self._maint_task: asyncio.Task[None] | None = None
         self._running = False
         self._concurrency_limit = config.max_concurrent_jobs
-        self._active_sem_lock = asyncio.Lock()
         self._active_cond = asyncio.Condition()
+
+    def set_sessions_provider(
+        self,
+        provider: Callable[[], list[ActiveSessionInfo]],
+    ) -> None:
+        self._sessions_provider = provider
+
+    def get_active_sessions_snapshot(self) -> list[ActiveSessionInfo]:
+        if self._sessions_provider is None:
+            return []
+        try:
+            return self._sessions_provider()
+        except Exception:
+            return []
+
+    def get_active_job_pids(self) -> dict[str, int]:
+        pids: dict[str, int] = {}
+        for jid, job in self._active.items():
+            proc = job.active_proc
+            if proc is not None and proc.returncode is None and proc.pid:
+                pids[jid] = proc.pid
+        return pids
 
     async def start(self) -> None:
         self._running = True
-        saved_conc = int(await self.db.get_setting("max_concurrent_jobs", str(self.config.max_concurrent_jobs)))
+        self.bot_started_at = time.time()
+        saved_conc = int(
+            await self.db.get_setting("max_concurrent_jobs", str(self.config.max_concurrent_jobs))
+        )
         self._concurrency_limit = max(1, min(2, saved_conc))
-        # Creamos 2 corrutinas trabajadoras controladas por condición de concurrencia dinámica
         for idx in range(2):
             self._workers.append(asyncio.create_task(self._worker_loop(idx + 1)))
+        self._maint_task = asyncio.create_task(self._maintenance_loop())
         logger.info(
             "Cola iniciada (concurrencia=%s, hilos totales=%s).",
             self._concurrency_limit,
@@ -140,11 +220,44 @@ class QueueManager:
     async def stop(self) -> None:
         self._running = False
         await self.cancel_all()
+        if self._maint_task is not None:
+            self._maint_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._maint_task
+            self._maint_task = None
         for task in self._workers:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         self._workers.clear()
+
+    async def _maintenance_loop(self) -> None:
+        """Limpieza periódica en segundo plano: cachés expirados (>1h) y GC ligero en reposo."""
+        while self._running:
+            try:
+                await asyncio.sleep(600)
+                now = time.time()
+                open_sids = {s.session_id for s in self.get_active_sessions_snapshot()}
+                expired_sids = [
+                    sid
+                    for sid, ts in list(self._session_cache_ts.items())
+                    if (now - ts > 3600) and (sid not in open_sids) and not self._session_in_use(sid)
+                ]
+                for sid in expired_sids:
+                    await asyncio.to_thread(self.release_session_cache, sid)
+                if expired_sids:
+                    logger.info("Mantenimiento: liberados %d cachés de sesión expirados.", len(expired_sids))
+
+                # Limpiar tokens de re-compresión > 24h
+                for tok in [k for k, v in list(self._recompress_sources.items()) if now - v.created_at > 86400]:
+                    self._recompress_sources.pop(tok, None)
+
+                if not self._active and not self._pending:
+                    gc.collect()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.warning("Error menor en tarea de mantenimiento", exc_info=True)
 
     async def set_concurrency(self, limit: int) -> None:
         limit = max(1, min(2, limit))
@@ -158,11 +271,9 @@ class QueueManager:
         return self._concurrency_limit
 
     def threads_per_job(self) -> int:
-        # 400% CPU: 1 trabajo -> 4 hilos | 2 trabajos -> 2 hilos c/u
         return max(1, self.config.max_cpu_threads // self._concurrency_limit)
 
     def get_recompress_source(self, token: str) -> RecompressSource | None:
-        # Limpiar entradas con más de 24h
         now = time.time()
         expired = [k for k, v in self._recompress_sources.items() if now - v.created_at > 86400]
         for k in expired:
@@ -187,26 +298,34 @@ class QueueManager:
         return self.has_cached_source(session_id) or self._session_in_use(session_id)
 
     def release_session_cache(self, session_id: str | None, exclude_job_id: str | None = None) -> None:
-        """Elimina la copia temporal en caché de una sesión si ningún otro trabajo la usa."""
         if not session_id:
             return
         if self._session_in_use(session_id, exclude_job_id=exclude_job_id):
             return
         self._session_cache.pop(session_id, None)
+        self._session_cache_ts.pop(session_id, None)
         self._cache_locks.pop(session_id, None)
         cache_dir = self.config.work_dir / "_cache" / session_id
         shutil.rmtree(cache_dir, ignore_errors=True)
 
-    def check_disk_budget(self, incoming_bytes: int, already_cached: bool = False) -> tuple[bool, str]:
-        """Verifica espacio libre real del sistema y presupuesto de 30 GiB del contenedor."""
+    def check_disk_budget(
+        self,
+        incoming_bytes: int,
+        already_cached: bool = False,
+        light_tool: bool = False,
+    ) -> tuple[bool, str]:
+        """Verifica espacio libre real del sistema y presupuesto de disco del contenedor."""
         usage = shutil.disk_usage(self.config.work_dir)
         reserve_bytes = int(self.config.disk_reserve_gb * (1024**3))
         max_bot_bytes = int(self.config.max_disk_gb * (1024**3))
-        used_by_bot = dir_size_bytes(self.config.work_dir) + dir_size_bytes(self.config.links_dir)
+        used_by_bot = fast_dir_bytes(self.config.work_dir) + fast_dir_bytes(self.config.links_dir)
 
-        # Si el original ya está en caché local solo necesitamos espacio para la salida (~1.1x)
-        factor = 1.15 if already_cached else 2.2
-        estimated_need = max(int(incoming_bytes * factor), 300 * 1024 * 1024)
+        if light_tool:
+            factor = 0.2 if already_cached else 1.15
+        else:
+            factor = 1.15 if already_cached else 2.2
+
+        estimated_need = max(int(incoming_bytes * factor), 150 * 1024 * 1024)
         available_in_budget = max_bot_bytes - used_by_bot - reserve_bytes
         available_os = usage.free - reserve_bytes
         effective_free = min(available_in_budget, available_os)
@@ -258,7 +377,6 @@ class QueueManager:
         return count
 
     def purge_inactive_temp(self) -> int:
-        """Elimina subcarpetas temporales huérfanas que no correspondan a trabajos activos."""
         active_ids = set(self._active.keys())
         active_sessions = {j.session_id for j in self._all_jobs.values() if j.session_id}
         removed = 0
@@ -269,6 +387,7 @@ class QueueManager:
                         if sdir.name not in active_sessions:
                             shutil.rmtree(sdir, ignore_errors=True)
                             self._session_cache.pop(sdir.name, None)
+                            self._session_cache_ts.pop(sdir.name, None)
                             self._cache_locks.pop(sdir.name, None)
                             removed += 1
                     continue
@@ -309,26 +428,91 @@ class QueueManager:
                     self._active_cond.notify_all()
                 self._queue.task_done()
 
+    async def _send_auto_log_to_owner(
+        self,
+        job: CompressionJob,
+        collector: JobIssueCollector,
+        outcome: str,
+        fatal_error: str = "",
+    ) -> None:
+        """Envía automáticamente al dueño cualquier error o aviso no fatal capturado en el trabajo."""
+        if not collector.has_issues and not fatal_error:
+            return
+        if fatal_error and collector.error_count == 0:
+            collector.add("ERROR", "queue_manager", fatal_error)
+
+        if await self.db.get_setting("error_alerts", "1") != "1":
+            return
+
+        metadata = {
+            "Estado": outcome,
+            "Usuario": f"{job.user_label or job.user_id} ({job.user_id})",
+            "Acción": job.action_badge,
+            "Archivo": job.filename[:100],
+            "Última fase": job.phase,
+            "Duración": human_duration(time.time() - (job.started_at or job.created_at)),
+        }
+        job_logs_dir = self.config.data_dir / "job_logs"
+        report_path = await asyncio.to_thread(collector.save_report, job_logs_dir, metadata, 30)
+
+        icon = "❌" if outcome == "Fallido" else "⚠️"
+        header = (
+            f"{icon} **Auto-Log · `{job.job_id}` ({outcome})**\n"
+            f"`{DIVIDER}`\n"
+            f"├ **Usuario:** `{job.user_label or job.user_id}` (`{job.user_id}`)\n"
+            f"├ **Archivo:** `{job.filename[:52]}`\n"
+            f"├ **Acción / Fase:** `{job.action_badge}` · `{job.phase}`\n"
+            f"└ **Incidencias:** `{collector.error_count}` errores · `{collector.warning_count}` avisos"
+        )
+
+        snippet = "\n".join(collector.entries[-10:])
+        with contextlib.suppress(Exception):
+            if len(collector.entries) <= 8 and len(snippet) <= 850:
+                safe_snip = snippet.replace("```", "'''")
+                await self.client.send_message(
+                    self.config.owner_id,
+                    f"{header}\n\n```\n{safe_snip}\n```",
+                )
+            else:
+                await self.client.send_document(
+                    chat_id=self.config.owner_id,
+                    document=str(report_path),
+                    caption=safe_caption(header, 1000),
+                )
+
     async def _process_job(self, job: CompressionJob, worker_num: int) -> None:
         job.started_at = time.time()
         job_dir = self.config.work_dir / job.job_id
         job_dir.mkdir(parents=True, exist_ok=True)
         updater = ProgressUpdater(job.status_message, interval_sec=self.config.progress_interval_sec)
         cancel_kb = build_job_cancel_keyboard(job.job_id)
+
+        collector, log_token = start_job_capture(job.job_id)
         monitor = JobResourceMonitor(watch_dirs=[job_dir], interval_sec=1.0)
         monitor.start()
         metrics: JobResourceMetrics | None = None
+        outcome = "Completado"
+        fatal_error = ""
+        input_size = 0
+
+        def _reg_proc(proc: asyncio.subprocess.Process | None) -> None:
+            job.active_proc = proc
 
         try:
-            # 0. Guardia de disco antes de descargar
+            # 0. Guardia de disco no bloqueante
             already_cached = self.has_cached_source(job.session_id)
-            ok_disk, disk_msg = self.check_disk_budget(job.expected_size, already_cached=already_cached)
+            light_tool = job.action_kind in {"mediainfo", "screenshots_grid", "screenshots_hd", "extract_opus", "extract_mp3"}
+            ok_disk, disk_msg = await asyncio.to_thread(
+                self.check_disk_budget, job.expected_size, already_cached, light_tool
+            )
             if not ok_disk:
+                outcome = "Sin espacio"
                 await updater.update(f"⚠️ **Espacio insuficiente en disco**\n{disk_msg}", force=True)
                 return
 
-            # 1. Descarga de origen (Telegram MTProto o enlace HTTP directo)
+            # 1. Descarga de origen (o reutilización desde caché local)
             job.phase = "Descargando"
+            job.progress_pct = 0.0
             input_path = await self._download_source(job, job_dir, updater, cancel_kb)
             monitor.add_watch_path(input_path.parent)
 
@@ -339,6 +523,7 @@ class QueueManager:
 
             # 2. Inspección completa con ffprobe
             job.phase = "Analizando"
+            job.progress_pct = 0.0
             await updater.update(
                 f"🔍 **Analizando Video**\n"
                 f"`{DIVIDER}`\n"
@@ -348,8 +533,191 @@ class QueueManager:
                 force=True,
             )
             media: MediaInfo = await probe_media(input_path)
+            if job.on_media_probed is not None:
+                with contextlib.suppress(Exception):
+                    await job.on_media_probed(media)
 
-            # 2b. Descargar subtítulo externo (.srt / .ass) si fue adjuntado
+            # ── Despacho de Herramientas Rápidas ──────────────────────────────
+            if job.action_kind == "mediainfo":
+                metrics = await monitor.stop()
+                card_md, plain_txt = format_mediainfo_report(media, human_bytes, human_duration, DIVIDER)
+                if len(card_md) > 3800 or len(media.audio_tracks) > 8 or len(media.subtitle_tracks) > 8:
+                    txt_path = job_dir / f"{media.path.stem[:60]}_mediainfo.txt"
+                    txt_path.write_text(plain_txt, encoding="utf-8")
+                    await updater.update(card_md[:3800], force=True)
+                    await self.client.send_document(
+                        chat_id=job.chat_id,
+                        document=str(txt_path),
+                        caption=f"📄 MediaInfo completo de `{media.path.name[:64]}`",
+                    )
+                else:
+                    await updater.update(card_md, force=True)
+                outcome = "Completado con avisos" if collector.has_issues else "Completado"
+                return
+
+            if job.action_kind == "screenshots_grid":
+                job.phase = "Generando cuadrícula 3×3"
+                await updater.update(
+                    f"🖼 **Generando Cuadrícula 3×3**\n"
+                    f"`{DIVIDER}`\n"
+                    f"└ Extrayendo 9 fotogramas con marcas de tiempo...",
+                    reply_markup=cancel_kb,
+                    force=True,
+                )
+                grid_path = await generate_screenshot_grid(
+                    media=media,
+                    out_dir=job_dir / "ss",
+                    cancel_event=job.cancel_event,
+                    register_proc=_reg_proc,
+                )
+                metrics = await monitor.stop()
+                elapsed = time.time() - (job.started_at or time.time())
+                await self.client.send_photo(
+                    chat_id=job.chat_id,
+                    photo=str(grid_path),
+                    caption=safe_caption(
+                        f"🖼 **Cuadrícula 3×3**\n"
+                        f"`{DIVIDER}`\n"
+                        f"├ **Archivo:** `{media.path.name[:60]}`\n"
+                        f"├ **Video:** `{media.width}×{media.height}` · `{media.video_codec.upper()}` · `{human_duration(media.duration)}`\n"
+                        f"└ **Tiempo:** `{human_duration(elapsed)}`"
+                    ),
+                )
+                with contextlib.suppress(Exception):
+                    await job.status_message.delete()
+                outcome = "Completado con avisos" if collector.has_issues else "Completado"
+                return
+
+            if job.action_kind == "screenshots_hd":
+                job.phase = "Extrayendo 4 capturas HD"
+                await updater.update(
+                    f"📸 **Extrayendo 4 Capturas HD**\n"
+                    f"`{DIVIDER}`\n"
+                    f"└ Capturando fotogramas en calidad original...",
+                    reply_markup=cancel_kb,
+                    force=True,
+                )
+                shots = await generate_hd_screenshots(
+                    media=media,
+                    out_dir=job_dir / "ss_hd",
+                    cancel_event=job.cancel_event,
+                    register_proc=_reg_proc,
+                    count=4,
+                )
+                metrics = await monitor.stop()
+                media_group = [
+                    InputMediaPhoto(
+                        media=str(path),
+                        caption=(f"📸 `{media.path.name[:52]}` · Capturas HD ({ts})" if idx == 0 else ""),
+                    )
+                    for idx, (path, ts) in enumerate(shots)
+                ]
+                await self.client.send_media_group(chat_id=job.chat_id, media=media_group)
+                with contextlib.suppress(Exception):
+                    await job.status_message.delete()
+                outcome = "Completado con avisos" if collector.has_issues else "Completado"
+                return
+
+            if job.action_kind in {"extract_opus", "extract_mp3"}:
+                fmt: Literal["opus", "mp3"] = "opus" if job.action_kind == "extract_opus" else "mp3"
+                job.phase = f"Extrayendo audio ({fmt.upper()})"
+                await updater.update(
+                    f"🎵 **Extrayendo Audio ({fmt.upper()})**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Archivo:** `{media.path.name[:56]}`\n"
+                    f"└ **Bitrate:** `{job.options.audio_bitrate_k}k`",
+                    reply_markup=cancel_kb,
+                    force=True,
+                )
+                audio_path = await extract_audio(
+                    media=media,
+                    out_dir=job_dir / "audio",
+                    audio_format=fmt,
+                    cancel_event=job.cancel_event,
+                    register_proc=_reg_proc,
+                    audio_mode=job.options.audio_mode,
+                    bitrate_k=job.options.audio_bitrate_k,
+                    custom_name=job.options.custom_output_name,
+                )
+                metrics = await monitor.stop()
+                elapsed = time.time() - (job.started_at or time.time())
+                audio_size = audio_path.stat().st_size
+                await self.client.send_audio(
+                    chat_id=job.chat_id,
+                    audio=str(audio_path),
+                    duration=int(round(media.duration)),
+                    title=audio_path.stem[:64],
+                    file_name=audio_path.name,
+                )
+                with contextlib.suppress(Exception):
+                    await job.status_message.delete()
+                await self.client.send_message(
+                    job.chat_id,
+                    f"🎵 **Audio Extraído ({fmt.upper()})**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Archivo:** `{audio_path.name[:68]}`\n"
+                    f"├ **Peso:** `{human_bytes(audio_size)}` · **Duración:** `{human_duration(media.duration)}`\n"
+                    f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%`\n"
+                    f"└ **Tiempo:** `{human_duration(elapsed)}`",
+                )
+                outcome = "Completado con avisos" if collector.has_issues else "Completado"
+                return
+
+            if job.action_kind in {"remux_mp4", "remux_mkv"}:
+                target_fmt: Literal["mp4", "mkv"] = "mp4" if job.action_kind == "remux_mp4" else "mkv"
+                job.phase = f"Remux a {target_fmt.upper()}"
+                await updater.update(
+                    f"🔄 **Remux Rápido a {target_fmt.upper()}**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Archivo:** `{media.path.name[:56]}`\n"
+                    f"└ Copiando flujo sin recomprimir video...",
+                    reply_markup=cancel_kb,
+                    force=True,
+                )
+                output_path, remux_note = await remux_video(
+                    media=media,
+                    out_dir=job_dir / "remux",
+                    target_format=target_fmt,
+                    cancel_event=job.cancel_event,
+                    register_proc=_reg_proc,
+                    custom_name=job.options.custom_output_name,
+                    strip_metadata=job.options.strip_metadata,
+                    meta_title=job.options.meta_title,
+                    meta_artist=job.options.meta_artist,
+                )
+                output_size = output_path.stat().st_size
+                out_media = await probe_media(output_path)
+                elapsed_total = time.time() - (job.started_at or time.time())
+                metrics = await monitor.stop()
+
+                remux_summary = (
+                    f"🔄 **Remux Completado ({target_fmt.upper()})**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Archivo:** `{output_path.name[:72]}`\n"
+                    f"├ **Peso:** `{human_bytes(output_size)}` · **Video:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}`\n"
+                    f"├ **Detalle:** `{remux_note}`\n"
+                    f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
+                    f"└ **Tiempo total:** `{human_duration(elapsed_total)}`"
+                )
+                await self._deliver_output(
+                    job=job,
+                    job_dir=job_dir,
+                    output_path=output_path,
+                    input_size=input_size,
+                    output_size=output_size,
+                    out_media=out_media,
+                    reduction_pct=0.0,
+                    elapsed_total=elapsed_total,
+                    updater=updater,
+                    cancel_kb=cancel_kb,
+                    metrics=metrics,
+                    custom_summary=remux_summary,
+                    record_stats=False,
+                )
+                outcome = "Completado con avisos" if collector.has_issues else "Completado"
+                return
+
+            # ── Flujo de Compresión (AV1 / H.265 / H.264 / Sample 15s) ───────
             external_sub_path: Path | None = None
             if job.options.external_sub_file_id:
                 sub_ext = Path(job.options.external_sub_name or "sub.srt").suffix.lower()
@@ -363,7 +731,6 @@ class QueueManager:
                 if dl_sub and Path(dl_sub).exists():
                     external_sub_path = Path(dl_sub)
 
-            # Duración efectiva del clip (muestra 15s, recorte Trim o video completo)
             if job.options.sample_duration and job.options.sample_duration > 0:
                 effective_dur = min(job.options.sample_duration, media.duration)
             elif job.options.trim_start is not None or job.options.trim_end is not None:
@@ -373,12 +740,14 @@ class QueueManager:
             else:
                 effective_dur = media.duration
 
-            # 3. Compresión FFmpeg aprovechando los hilos configurados
             threads = self.threads_per_job()
-            job.phase = "Muestra 15s" if job.options.sample_duration else "Comprimiendo"
+            job.phase = "Muestra 15s" if job.options.sample_duration else "Codificando"
+            job.progress_pct = 0.0
             encode_start = time.monotonic()
 
             async def _on_encode_progress(prog: EncodeProgress) -> None:
+                job.progress_pct = prog.percent
+                job.progress_detail = f"{prog.speed} · {prog.fps:.1f} fps"
                 elapsed = max(1.0, time.monotonic() - encode_start)
                 eta = (elapsed / max(prog.percent, 0.5)) * (100.0 - prog.percent) if prog.percent > 1 else 0
                 text = (
@@ -390,9 +759,6 @@ class QueueManager:
                     f"└ **Trabajo:** `{job.job_id}` · `{threads} hilos` (W#{worker_num})"
                 )
                 await updater.update(text, reply_markup=cancel_kb)
-
-            def _reg_proc(proc: asyncio.subprocess.Process | None) -> None:
-                job.active_proc = proc
 
             output_path = await compress_video(
                 media=media,
@@ -422,14 +788,13 @@ class QueueManager:
                 human_bytes(metrics.peak_disk_bytes),
             )
 
-            bit_tag = " 10-bit" if (job.options.bit_depth == 10 and job.options.codec == "libx265") else ""
-
+            codec_tag = job.options.codec_display_label()
             if not job.options.sample_duration:
                 try:
                     await self.db.record_job_metrics(
                         job_id=job.job_id,
                         filename=output_path.name,
-                        codec=f"{out_media.video_codec.upper()}{bit_tag}",
+                        codec=codec_tag,
                         resolution=f"{out_media.width}x{out_media.height}",
                         input_bytes=input_size,
                         output_bytes=output_size,
@@ -444,7 +809,6 @@ class QueueManager:
                 except Exception:
                     logger.warning("No se pudieron guardar las métricas del trabajo %s", job.job_id, exc_info=True)
 
-            # 3b. Si es Muestra rápida de 15s, enviar con proyección de tamaño final y sin sumar a estadísticas
             if job.options.sample_duration:
                 est_full_bytes = output_size * (media.duration / max(out_media.duration, 1.0))
                 sample_summary = (
@@ -452,7 +816,7 @@ class QueueManager:
                     f"`{DIVIDER}`\n"
                     f"├ **Peso muestra:** `{human_bytes(output_size)}`\n"
                     f"├ **Estimado completo:** `~{human_bytes(est_full_bytes)}` (orig: `{human_bytes(input_size)}`)\n"
-                    f"├ **Calidad:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}{bit_tag}` · CRF `{job.options.crf}`\n"
+                    f"├ **Calidad:** `{out_media.width}×{out_media.height}` · `{codec_tag}` · CRF `{job.options.crf}`\n"
                     f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
                     f"└ **Tiempo:** `{human_duration(elapsed_total)}`\n\n"
                     "*(Tu panel de configuración sigue abierto arriba.)*"
@@ -472,66 +836,32 @@ class QueueManager:
                     record_stats=False,
                     metrics=metrics,
                 )
+                outcome = "Completado con avisos" if collector.has_issues else "Completado"
                 return
 
-            # 4. Decisión inteligente de entrega:
-            dump_id_raw = await self.db.get_setting("dump_chat_id", str(self.config.dump_chat_id or 0))
-            dump_chat_id = int(dump_id_raw) if dump_id_raw.lstrip("-").isdigit() else 0
-            can_use_premium = (
-                output_size <= TELEGRAM_PREMIUM_MAX_UPLOAD_BYTES
-                and self.user_session.is_connected
-                and self.user_session.is_premium
-                and (dump_chat_id != 0 or job.user_id == self.config.owner_id)
+            await self._deliver_output(
+                job=job,
+                job_dir=job_dir,
+                output_path=output_path,
+                input_size=input_size,
+                output_size=output_size,
+                out_media=out_media,
+                reduction_pct=reduction_pct,
+                elapsed_total=elapsed_total,
+                updater=updater,
+                cancel_kb=cancel_kb,
+                metrics=metrics,
             )
-
-            if output_size <= TELEGRAM_MAX_UPLOAD_BYTES:
-                await self._deliver_via_telegram(
-                    job=job,
-                    job_dir=job_dir,
-                    output_path=output_path,
-                    input_size=input_size,
-                    output_size=output_size,
-                    out_media=out_media,
-                    reduction_pct=reduction_pct,
-                    elapsed_total=elapsed_total,
-                    updater=updater,
-                    cancel_kb=cancel_kb,
-                    metrics=metrics,
-                )
-            elif can_use_premium:
-                await self._deliver_via_premium_account(
-                    job=job,
-                    job_dir=job_dir,
-                    output_path=output_path,
-                    input_size=input_size,
-                    output_size=output_size,
-                    out_media=out_media,
-                    reduction_pct=reduction_pct,
-                    elapsed_total=elapsed_total,
-                    dump_chat_id=dump_chat_id,
-                    updater=updater,
-                    cancel_kb=cancel_kb,
-                    metrics=metrics,
-                )
-            else:
-                await self._deliver_via_link(
-                    job=job,
-                    output_path=output_path,
-                    input_size=input_size,
-                    output_size=output_size,
-                    out_media=out_media,
-                    reduction_pct=reduction_pct,
-                    elapsed_total=elapsed_total,
-                    updater=updater,
-                    cancel_kb=cancel_kb,
-                    metrics=metrics,
-                )
+            outcome = "Completado con avisos" if collector.has_issues else "Completado"
 
         except JobCancelledError:
+            outcome = "Cancelado"
             await updater.update(f"🛑 **Trabajo `{job.job_id}` cancelado.** Archivos temporales limpiados.", force=True)
         except Exception as exc:
+            outcome = "Fallido"
+            fatal_error = f"{type(exc).__name__}: {exc}"
             logger.exception("Error procesando trabajo %s (fase=%s, archivo=%s)", job.job_id, job.phase, job.filename)
-            logs_hint = "\n\n💡 *Usa `/logs` para revisar `data/bot.log`.*" if job.user_id == self.config.owner_id else ""
+            logs_hint = "\n\n💡 *El Auto-Log se guardó y envió al dueño; también puedes usar `/logs`.*" if job.user_id == self.config.owner_id else ""
             await updater.update(
                 f"❌ **Error en Trabajo `{job.job_id}`**\n"
                 f"`{DIVIDER}`\n"
@@ -539,26 +869,90 @@ class QueueManager:
                 f"└ **Detalle:** `{str(exc)[:550]}`{logs_hint}",
                 force=True,
             )
-            if job.user_id != self.config.owner_id:
-                with contextlib.suppress(Exception):
-                    if await self.db.get_setting("error_alerts", "1") == "1":
-                        await self.client.send_message(
-                            self.config.owner_id,
-                            f"🚨 **Alerta de Error · `{job.job_id}`**\n"
-                            f"`{DIVIDER}`\n"
-                            f"├ **Usuario:** `{job.user_id}`\n"
-                            f"├ **Fase:** `{job.phase}`\n"
-                            f"├ **Archivo:** `{job.filename[:56]}`\n"
-                            f"└ **Detalle:** `{str(exc)[:380]}`\n\n"
-                            "Usa `/logs errors` o `/logs file` para ver el registro.",
-                        )
         finally:
             if metrics is None:
                 with contextlib.suppress(Exception):
                     await monitor.stop()
-            shutil.rmtree(job_dir, ignore_errors=True)
+            stop_job_capture(job.job_id, log_token)
+            if outcome != "Cancelado":
+                await self._send_auto_log_to_owner(job, collector, outcome, fatal_error)
+            await asyncio.to_thread(shutil.rmtree, job_dir, True)
             if job.session_id and not job.keep_cached_source:
-                self.release_session_cache(job.session_id, exclude_job_id=job.job_id)
+                await asyncio.to_thread(self.release_session_cache, job.session_id, job.job_id)
+            if input_size >= 200 * 1024 * 1024 or job.options.codec == "libsvtav1":
+                gc.collect()
+
+    async def _deliver_output(
+        self,
+        job: CompressionJob,
+        job_dir: Path,
+        output_path: Path,
+        input_size: int,
+        output_size: int,
+        out_media: MediaInfo,
+        reduction_pct: float,
+        elapsed_total: float,
+        updater: ProgressUpdater,
+        cancel_kb: Any,
+        metrics: JobResourceMetrics | None = None,
+        custom_summary: str | None = None,
+        record_stats: bool = True,
+    ) -> None:
+        dump_id_raw = await self.db.get_setting("dump_chat_id", str(self.config.dump_chat_id or 0))
+        dump_chat_id = int(dump_id_raw) if dump_id_raw.lstrip("-").isdigit() else 0
+        can_use_premium = (
+            output_size <= TELEGRAM_PREMIUM_MAX_UPLOAD_BYTES
+            and self.user_session.is_connected
+            and self.user_session.is_premium
+            and (dump_chat_id != 0 or job.user_id == self.config.owner_id)
+        )
+
+        if output_size <= TELEGRAM_MAX_UPLOAD_BYTES:
+            await self._deliver_via_telegram(
+                job=job,
+                job_dir=job_dir,
+                output_path=output_path,
+                input_size=input_size,
+                output_size=output_size,
+                out_media=out_media,
+                reduction_pct=reduction_pct,
+                elapsed_total=elapsed_total,
+                updater=updater,
+                cancel_kb=cancel_kb,
+                custom_caption=custom_summary,
+                record_stats=record_stats,
+                metrics=metrics,
+            )
+        elif can_use_premium:
+            await self._deliver_via_premium_account(
+                job=job,
+                job_dir=job_dir,
+                output_path=output_path,
+                input_size=input_size,
+                output_size=output_size,
+                out_media=out_media,
+                reduction_pct=reduction_pct,
+                elapsed_total=elapsed_total,
+                dump_chat_id=dump_chat_id,
+                updater=updater,
+                cancel_kb=cancel_kb,
+                custom_caption=custom_summary,
+                record_stats=record_stats,
+                metrics=metrics,
+            )
+        else:
+            await self._deliver_via_link(
+                job=job,
+                output_path=output_path,
+                input_size=input_size,
+                output_size=output_size,
+                out_media=out_media,
+                reduction_pct=reduction_pct,
+                elapsed_total=elapsed_total,
+                updater=updater,
+                cancel_kb=cancel_kb,
+                metrics=metrics,
+            )
 
     async def _deliver_via_premium_account(
         self,
@@ -572,11 +966,14 @@ class QueueManager:
         elapsed_total: float,
         dump_chat_id: int,
         updater: ProgressUpdater,
-        cancel_kb,
+        cancel_kb: Any,
+        custom_caption: str | None = None,
+        record_stats: bool = True,
         metrics: JobResourceMetrics | None = None,
     ) -> None:
         assert self.user_session.client is not None
-        job.phase = "Subiendo con cuenta Premium (2–4 GB)"
+        job.phase = "Subiendo (Premium)"
+        job.progress_pct = 0.0
         up_start = time.monotonic()
 
         async def _up_progress(current: int, total: int) -> None:
@@ -585,6 +982,8 @@ class QueueManager:
             elapsed = max(0.5, time.monotonic() - up_start)
             speed_bps = current / elapsed
             pct = (current / max(total, 1)) * 100.0
+            job.progress_pct = pct
+            job.progress_detail = f"{human_bytes(speed_bps)}/s"
             eta = (total - current) / max(speed_bps, 1.0)
             await updater.update(
                 f"⭐ **Subiendo (Premium 2–4 GB)**\n"
@@ -602,22 +1001,24 @@ class QueueManager:
             if job.source_message and job.source_message.caption
             else ""
         )
-        sign = "-" if reduction_pct >= 0 else "+"
-        bit_tag = " 10-bit" if (job.options.bit_depth == 10 and job.options.codec == "libx265") else ""
-        usage_line = (
-            f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
-            if metrics is not None
-            else ""
-        )
-        summary_msg = (
-            f"✅ **Compresión Completada (Premium)**\n"
-            f"`{DIVIDER}`\n"
-            f"├ **Archivo:** `{output_path.name[:72]}`\n"
-            f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
-            f"├ **Video:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}{bit_tag}` · `{human_duration(out_media.duration)}`\n"
-            f"{usage_line}"
-            f"└ **Tiempo total:** `{human_duration(elapsed_total)}`"
-        )
+        if custom_caption is not None:
+            summary_msg = custom_caption
+        else:
+            sign = "-" if reduction_pct >= 0 else "+"
+            usage_line = (
+                f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
+                if metrics is not None
+                else ""
+            )
+            summary_msg = (
+                f"✅ **Compresión Completada (Premium)**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{output_path.name[:72]}`\n"
+                f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
+                f"├ **Video:** `{out_media.width}×{out_media.height}` · `{job.options.codec_display_label()}` · `{human_duration(out_media.duration)}`\n"
+                f"{usage_line}"
+                f"└ **Tiempo total:** `{human_duration(elapsed_total)}`"
+            )
 
         target_peer: int | str = dump_chat_id if dump_chat_id != 0 else "me"
         send_as_doc = job.options.send_as_document or output_path.suffix.lower() == ".mkv"
@@ -652,27 +1053,28 @@ class QueueManager:
                 force=True,
             )
 
-        await self.db.record_job_completion(input_size, output_size, delivered_via_link=False)
+        if record_stats:
+            await self.db.record_job_completion(input_size, output_size, delivered_via_link=False)
 
     async def _download_source(
         self,
         job: CompressionJob,
         job_dir: Path,
         updater: ProgressUpdater,
-        cancel_kb,
+        cancel_kb: Any,
     ) -> Path:
-        # Si existe una sesión compartida (Muestra 15s → Comprimir), reutilizar descarga en caché
         if job.session_id:
             lock = self._cache_locks.setdefault(job.session_id, asyncio.Lock())
             async with lock:
                 cached = self._session_cache.get(job.session_id)
                 if cached is not None and cached.exists() and cached.stat().st_size > 0:
+                    self._session_cache_ts[job.session_id] = time.time()
                     logger.info("Reutilizando video desde caché de sesión %s: %s", job.session_id, cached.name)
                     await updater.update(
                         f"⚡ **Video Listo en Caché Local**\n"
                         f"`{DIVIDER}`\n"
                         f"├ **Archivo:** `{cached.name[:56]}`\n"
-                        f"└ Sin re-descargar · pasando directo a compresión...",
+                        f"└ Sin re-descargar · iniciando `{job.action_badge}`...",
                         reply_markup=cancel_kb,
                         force=True,
                     )
@@ -682,6 +1084,7 @@ class QueueManager:
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 downloaded = await self._perform_download(job, cache_dir, updater, cancel_kb)
                 self._session_cache[job.session_id] = downloaded
+                self._session_cache_ts[job.session_id] = time.time()
                 return downloaded
 
         return await self._perform_download(job, job_dir / "in", updater, cancel_kb)
@@ -691,7 +1094,7 @@ class QueueManager:
         job: CompressionJob,
         dest_dir: Path,
         updater: ProgressUpdater,
-        cancel_kb,
+        cancel_kb: Any,
     ) -> Path:
         dl_start = time.monotonic()
 
@@ -701,6 +1104,8 @@ class QueueManager:
             elapsed = max(0.5, time.monotonic() - dl_start)
             speed_bps = current / elapsed
             pct = (current / total * 100.0) if total > 0 else 0.0
+            job.progress_pct = pct
+            job.progress_detail = f"{human_bytes(speed_bps)}/s"
             eta = ((total - current) / max(speed_bps, 1.0)) if total > current else 0.0
             bar_str = progress_bar(pct) if total > 0 else f"Descargados {human_bytes(current)}"
             await updater.update(
@@ -746,8 +1151,8 @@ class QueueManager:
                 dl = await self.client.download_media(custom_thumb_id, file_name=str(custom_path))
                 if dl and Path(dl).exists():
                     return str(dl)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("No se pudo descargar la miniatura personalizada: %s", exc)
 
         auto_thumb = await extract_thumbnail(video_path, job_dir / "auto_thumb.jpg", duration)
         return str(auto_thumb) if auto_thumb else None
@@ -763,12 +1168,13 @@ class QueueManager:
         reduction_pct: float,
         elapsed_total: float,
         updater: ProgressUpdater,
-        cancel_kb,
+        cancel_kb: Any,
         custom_caption: str | None = None,
         record_stats: bool = True,
         metrics: JobResourceMetrics | None = None,
     ) -> None:
         job.phase = "Subiendo a Telegram"
+        job.progress_pct = 0.0
         up_start = time.monotonic()
 
         async def _up_progress(current: int, total: int) -> None:
@@ -777,6 +1183,8 @@ class QueueManager:
             elapsed = max(0.5, time.monotonic() - up_start)
             speed_bps = current / elapsed
             pct = (current / max(total, 1)) * 100.0
+            job.progress_pct = pct
+            job.progress_detail = f"{human_bytes(speed_bps)}/s"
             eta = (total - current) / max(speed_bps, 1.0)
             await updater.update(
                 f"⬆️ **Subiendo a Telegram**\n"
@@ -790,7 +1198,6 @@ class QueueManager:
             job.user_id, output_path, out_media.duration, job_dir
         )
 
-        # El video se envía limpio con su nombre original y su pie original (si tenía)
         video_caption = (
             ""
             if job.options.sample_duration
@@ -801,12 +1208,10 @@ class QueueManager:
             )
         )
 
-        # La notificación con estadísticas va en un mensaje separado justo debajo del video
         if custom_caption is not None:
             summary_msg = custom_caption
         else:
             sign = "-" if reduction_pct >= 0 else "+"
-            bit_tag = " 10-bit" if (job.options.bit_depth == 10 and job.options.codec == "libx265") else ""
             usage_line = (
                 f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
                 if metrics is not None
@@ -817,7 +1222,7 @@ class QueueManager:
                 f"`{DIVIDER}`\n"
                 f"├ **Archivo:** `{output_path.name[:72]}`\n"
                 f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
-                f"├ **Video:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}{bit_tag}` · `{human_duration(out_media.duration)}`\n"
+                f"├ **Video:** `{out_media.width}×{out_media.height}` · `{job.options.codec_display_label()}` · `{human_duration(out_media.duration)}`\n"
                 f"{usage_line}"
                 f"└ **Tiempo total:** `{human_duration(elapsed_total)}`"
             )
@@ -855,10 +1260,11 @@ class QueueManager:
         reduction_pct: float,
         elapsed_total: float,
         updater: ProgressUpdater,
-        cancel_kb,
+        cancel_kb: Any,
         metrics: JobResourceMetrics | None = None,
     ) -> None:
-        job.phase = "Generando enlace (>2 GB)"
+        job.phase = "Subiendo enlace (>2 GB)"
+        job.progress_pct = 0.0
         preferred = await self.db.get_setting("large_file_uploader", self.config.large_file_uploader)
         up_start = time.monotonic()
 
@@ -875,6 +1281,8 @@ class QueueManager:
             elapsed = max(0.5, time.monotonic() - up_start)
             speed_bps = current / elapsed
             pct = (current / max(total, 1)) * 100.0
+            job.progress_pct = pct
+            job.progress_detail = f"{human_bytes(speed_bps)}/s"
             eta = (total - current) / max(speed_bps, 1.0)
             await updater.update(
                 f"☁️ **Subiendo Enlace Directo (>2 GB)**\n"
@@ -906,6 +1314,7 @@ class QueueManager:
             source_url=job.source_url,
             filename=job.filename,
             base_options=recomp_opts,
+            user_label=job.user_label,
         )
 
         sign = "-" if reduction_pct >= 0 else "+"
@@ -919,7 +1328,7 @@ class QueueManager:
             f"`{DIVIDER}`\n"
             f"├ **Archivo:** `{output_path.name[:64]}`\n"
             f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
-            f"├ **Video:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}` · `{human_duration(out_media.duration)}`\n"
+            f"├ **Video:** `{out_media.width}×{out_media.height}` · `{job.options.codec_display_label()}` · `{human_duration(out_media.duration)}`\n"
             f"├ **Proveedor:** `{result.provider}`\n"
             f"{usage_line}"
             f"└ **Tiempo total:** `{human_duration(elapsed_total)}`\n\n"
