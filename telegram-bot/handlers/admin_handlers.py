@@ -15,15 +15,14 @@ from core.database import Database
 from core.git_updater import pull_from_github, restart_process
 from core.logger_setup import read_last_log_lines
 from core.queue_manager import QueueManager, dir_size_bytes
-from core.ui_helpers import build_admin_keyboard, human_bytes
+from core.ui_helpers import DIVIDER, build_admin_keyboard, human_bytes
 from core.user_session import UserSessionManager
 
 
 def _format_log_block(title: str, content: str) -> str:
-    # Limitar a ~3700 chars para respetar el máximo de 4096 de Telegram
     body = content[-3600:] if len(content) > 3600 else content
     body = body.replace("```", "'''")
-    return f"📄 **{title}**\n```\n{body}\n```"
+    return f"📄 **{title}**\n`{DIVIDER}`\n```\n{body}\n```"
 
 
 def register_admin_handlers(
@@ -59,29 +58,25 @@ def register_admin_handlers(
         ram_budget_bytes = int(config.max_ram_gb * (1024**3))
         disk_budget_bytes = int(config.max_disk_gb * (1024**3))
         threads_each = queue_mgr.threads_per_job()
-        dump_label = dump_id if dump_id and dump_id != "0" else "Mensajes Guardados (dueño)"
+        dump_label = dump_id if dump_id and dump_id != "0" else "Mensajes Guardados"
         log_size = human_bytes(log_file.stat().st_size) if log_file.exists() else "0 B"
 
         text = (
-            "🛡 **Panel de Administración (panel.plugged.host)**\n\n"
-            "🖥 **Recursos del Bot (Máxima Potencia):**\n"
-            f"• **CPU:** `{cpu_pct:.1f}%` (Asignado: `{config.max_cpu_threads * 100}%` · `{threads_each}` hilos/trabajo)\n"
-            f"• **RAM Bot / Sistema:** `{human_bytes(proc_ram)}` / `{human_bytes(vm.used)}` (Límite: `{human_bytes(ram_budget_bytes)}`)\n"
-            f"• **Disco Temporal Bot:** `{human_bytes(bot_temp_used)}` / `{human_bytes(disk_budget_bytes)}`\n"
-            f"• **Disco Libre del Host:** `{human_bytes(disk.free)}`\n\n"
-            "⚙️ **Operación y Cuenta Telegram:**\n"
-            f"• **Cuenta Telegram:** `{user_session.status_label()}`\n"
-            f"• **Canal puente (2–4 GB):** `{dump_label}`\n"
-            f"• **Cola:** `{len(active)}/{conc}` activos · `{len(pending)}` en espera\n"
-            f"• **Acceso:** `{'Solo Lista Blanca' if access_mode == 'private' else 'Público'}` (`{len(users)}` usuarios)\n"
-            f"• **Proveedor >2 GB:** `{uploader}`\n"
-            f"• **Log (`data/bot.log`):** `{log_size}` · **Alertas:** `{'ON' if error_alerts else 'OFF'}`\n\n"
-            "📊 **Acumulado:**\n"
-            f"• **Videos:** `{stats.total_jobs}` · **Enlaces >2 GB:** `{stats.total_link_deliveries}`\n"
-            f"• **Ahorro total:** `{human_bytes(stats.total_saved_bytes)}`\n\n"
-            "**Comandos de dueño:**\n"
-            "`/logs [n|errors|file]` · `/update` · `/login` · `/logout` · `/setdump <id>`\n"
-            "`/adduser <id>` · `/deluser <id>` · `/users` · `/purge` · `/cancelall`"
+            "🛡 **Panel de Administración**\n"
+            f"`{DIVIDER}`\n\n"
+            "🖥 **Recursos del Servidor**\n"
+            f"├ **CPU:** `{cpu_pct:.1f}%` · `{threads_each}` hilos/trabajo (`{config.max_cpu_threads * 100}%` máx)\n"
+            f"├ **RAM:** `{human_bytes(proc_ram)}` bot · `{human_bytes(vm.used)}` host (`{human_bytes(ram_budget_bytes)}`)\n"
+            f"└ **Disco:** `{human_bytes(bot_temp_used)}` / `{human_bytes(disk_budget_bytes)}` · Libre `{human_bytes(disk.free)}`\n\n"
+            "⚙️ **Operación**\n"
+            f"├ **Cola:** `{len(active)}/{conc}` activos · `{len(pending)}` en espera\n"
+            f"├ **Acceso:** `{'Lista Blanca' if access_mode == 'private' else 'Público'}` (`{len(users)}` usuarios)\n"
+            f"├ **Host >2 GB:** `{uploader}` · **Canal puente:** `{dump_label}`\n"
+            f"├ **Cuenta:** `{user_session.status_label()}`\n"
+            f"└ **Logs:** `{log_size}` · **Alertas:** `{'ON' if error_alerts else 'OFF'}`\n\n"
+            "📊 **Acumulado**\n"
+            f"├ **Videos:** `{stats.total_jobs}` · **Enlaces >2 GB:** `{stats.total_link_deliveries}`\n"
+            f"└ **Ahorro total:** `{human_bytes(stats.total_saved_bytes)}`"
         )
         return text, access_mode, conc, uploader, error_alerts
 
@@ -95,6 +90,19 @@ def register_admin_handlers(
             text,
             reply_markup=build_admin_keyboard(access_mode, conc, uploader, error_alerts=error_alerts),
         )
+
+    @app.on_callback_query(filters.regex(r"^home:admin$"))
+    async def cb_open_admin(_client: Client, query: CallbackQuery) -> None:
+        if not _is_owner(query.from_user.id):
+            await query.answer("Solo el administrador puede abrir este panel.", show_alert=True)
+            return
+        await query.answer()
+        text, access_mode, conc, uploader, error_alerts = await _render_admin_text()
+        with contextlib.suppress(Exception):
+            await query.message.edit_text(
+                text,
+                reply_markup=build_admin_keyboard(access_mode, conc, uploader, error_alerts=error_alerts),
+            )
 
     # ── Visor y descarga de logs (/logs [n|errors|file]) ──────────────────────
 
@@ -113,13 +121,13 @@ def register_admin_handlers(
                 return
             await message.reply_document(
                 document=str(log_file),
-                caption=f"📄 Registro completo del bot (`{human_bytes(log_file.stat().st_size)}`)",
+                caption=f"📄 `bot.log` (`{human_bytes(log_file.stat().st_size)}`)",
             )
             return
 
         if arg in {"errors", "error", "err"}:
             content = read_last_log_lines(log_file, lines=40, errors_only=True)
-            await message.reply_text(_format_log_block("Últimos errores y avisos (bot.log)", content))
+            await message.reply_text(_format_log_block("Últimos errores y avisos", content))
             return
 
         num_lines = 35
@@ -138,12 +146,12 @@ def register_admin_handlers(
             return
         await user_session.begin_login()
         await message.reply_text(
-            "🔑 **Vincular cuenta de Telegram (MTProto)**\n\n"
-            "Usa tu `API_ID` y `API_HASH` configurados para iniciar sesión con tu cuenta:\n"
-            "• **Cuenta estándar:** límite nativo de **2 GB** (igual que el bot).\n"
-            "• **Cuenta Telegram Premium:** sube el límite nativo hasta **4 GB**.\n\n"
-            "📱 Envíame ahora tu **número de teléfono con código de país** (ejemplo: `+5215512345678`).\n"
-            "*(Tu mensaje será eliminado al instante. Escribe `/cancellogin` para cancelar.)*"
+            "🔑 **Vincular Cuenta de Telegram**\n"
+            f"`{DIVIDER}`\n"
+            "├ **Estándar:** hasta 2 GB (igual que el bot)\n"
+            "└ **Telegram Premium:** hasta 4 GB nativos\n\n"
+            "📱 Envía tu **número con código de país** (ej: `+5215512345678`).\n"
+            "*(Tu mensaje se borrará al instante. Usa `/cancellogin` para cancelar.)*"
         )
 
     @app.on_message(filters.private & filters.command("cancellogin"))
@@ -159,7 +167,7 @@ def register_admin_handlers(
             return
         await user_session.stop()
         await db.set_setting("user_session_string", "")
-        await message.reply_text("🔌 Cuenta de Telegram desconectada y sesión eliminada de la base de datos.")
+        await message.reply_text("🔌 Cuenta de Telegram desconectada y sesión eliminada.")
 
     @app.on_message(filters.private & filters.command("setdump"))
     async def cmd_setdump(_client: Client, message: Message) -> None:
@@ -169,7 +177,7 @@ def register_admin_handlers(
         if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
             await message.reply_text(
                 "Uso: `/setdump <channel_id>` (ej. `/setdump -1001234567890`).\n"
-                "Usa `/setdump 0` para desactivarlo. Añade tanto a tu cuenta como al bot como administradores en ese canal privado para entregar videos de 2–4 GB (Premium) a cualquier usuario."
+                "Usa `/setdump 0` para desactivarlo."
             )
             return
         chat_id = int(parts[1])
@@ -191,7 +199,7 @@ def register_admin_handlers(
             return
         target_id = int(parts[1])
         await db.add_user(target_id, added_by=message.from_user.id)
-        await message.reply_text(f"✅ Usuario `{target_id}` añadido a la lista blanca.")
+        await message.reply_text(f"✅ Usuario `{target_id}` autorizado en la lista blanca.")
 
     @app.on_message(filters.private & filters.command("deluser"))
     async def cmd_deluser(_client: Client, message: Message) -> None:
@@ -216,11 +224,12 @@ def register_admin_handlers(
         if not message.from_user or not _is_owner(message.from_user.id):
             return
         users = await db.list_users()
-        lines = [f"👥 **Lista Blanca ({len(users)} usuarios):**", ""]
-        for u in users:
-            role = " (Dueño)" if u.user_id == config.owner_id else ""
+        lines = [f"👥 **Lista Blanca ({len(users)})**", f"`{DIVIDER}`"]
+        for idx, u in enumerate(users):
+            branch = "└" if idx == len(users) - 1 else "├"
+            role = " · Dueño" if u.user_id == config.owner_id else ""
             uname = f" @{u.username}" if u.username else ""
-            lines.append(f"• `{u.user_id}`{uname}{role}")
+            lines.append(f"{branch} `{u.user_id}`{uname}{role}")
         await message.reply_text("\n".join(lines))
 
     @app.on_message(filters.private & filters.command("purge"))
@@ -228,7 +237,7 @@ def register_admin_handlers(
         if not message.from_user or not _is_owner(message.from_user.id):
             return
         removed = queue_mgr.purge_inactive_temp()
-        await message.reply_text(f"🧹 Limpieza completada: `{removed}` carpetas/enlaces temporales eliminados.")
+        await message.reply_text(f"🧹 **Limpieza completada:** `{removed}` temporales eliminados.")
 
     @app.on_message(filters.private & filters.command("cancelall"))
     async def cmd_cancelall(_client: Client, message: Message) -> None:
@@ -266,12 +275,12 @@ def register_admin_handlers(
             cur = await db.get_setting("access_mode", config.default_access_mode)
             nxt = "public" if cur == "private" else "private"
             await db.set_setting("access_mode", nxt)
-            await query.answer(f"Modo cambiado a: {nxt}")
+            await query.answer(f"Acceso: {nxt}")
 
         elif action == "toggle_conc":
             nxt = 2 if queue_mgr.concurrency_limit == 1 else 1
             await queue_mgr.set_concurrency(nxt)
-            await query.answer(f"Concurrencia: {nxt} trabajo(s) × {queue_mgr.threads_per_job()} hilos")
+            await query.answer(f"Concurrencia: {nxt} × {queue_mgr.threads_per_job()} hilos")
 
         elif action == "cycle_uploader":
             order = ["gofile", "buzzheavier"]
@@ -281,13 +290,13 @@ def register_admin_handlers(
             idx = (order.index(cur) + 1) % len(order) if cur in order else 0
             nxt = order[idx]
             await db.set_setting("large_file_uploader", nxt)
-            await query.answer(f"Proveedor >2 GB: {nxt}")
+            await query.answer(f"Host >2 GB: {nxt}")
 
         elif action == "toggle_alerts":
             cur = await db.get_setting("error_alerts", "1")
             nxt = "0" if cur == "1" else "1"
             await db.set_setting("error_alerts", nxt)
-            await query.answer(f"Alertas de error: {'ON' if nxt == '1' else 'OFF'}")
+            await query.answer(f"Alertas: {'ON' if nxt == '1' else 'OFF'}")
 
         elif action == "logs":
             await query.answer("Cargando logs...")
@@ -302,7 +311,7 @@ def register_admin_handlers(
             await query.answer("Enviando bot.log...")
             await query.message.reply_document(
                 document=str(log_file),
-                caption=f"📄 Registro completo (`{human_bytes(log_file.stat().st_size)}`)",
+                caption=f"📄 `bot.log` (`{human_bytes(log_file.stat().st_size)}`)",
             )
             return
 

@@ -1,5 +1,5 @@
-"""Manejadores de usuario: recepción de videos/enlaces, menús inline, Modo Lotes (/auto),
-Muestra 15s, subtítulos externos (.srt/.ass), 10-bit, Trim, Marca de Agua y Renombrado."""
+"""Manejadores de usuario: inicio interactivo, guía organizada, recepción de videos/enlaces,
+menús inline, Modo Lotes (/auto), Muestra 15s, subtítulos externos, 10-bit, Trim y Marca."""
 
 from __future__ import annotations
 
@@ -20,11 +20,14 @@ from core.ffmpeg_engine import CompressionOptions, parse_timestamp
 from core.media_probe import MediaInfo
 from core.queue_manager import CompressionJob, QueueManager
 from core.ui_helpers import (
+    DIVIDER,
     build_advanced_keyboard,
+    build_back_home_keyboard,
     build_extras_keyboard,
     build_job_cancel_keyboard,
     build_main_config_keyboard,
     build_presets_keyboard,
+    build_start_keyboard,
     build_target_size_keyboard,
     build_tracks_keyboard,
     format_draft_summary,
@@ -78,9 +81,9 @@ def _is_subtitle_document(message: Message) -> bool:
 def _format_saved_preset_line(opts: CompressionOptions) -> str:
     bit = " 10-bit" if (opts.bit_depth == 10 and opts.codec == "libx265") else ""
     codec = f"H.265{bit}" if opts.codec == "libx265" else "H.264"
-    res = f"{opts.max_height}p" if opts.max_height else "Original"
+    res = f"{opts.max_height}p" if opts.max_height else "Orig"
     mode = f"2-Pass {opts.target_mb:.0f} MB" if opts.target_mb else f"CRF {opts.crf} ({opts.speed})"
-    return f"`{codec}` · `{res}` · `{mode}` · Audio `{opts.audio_bitrate_k}k`"
+    return f"`{codec}` · `{res}` · `{mode}` · `{opts.audio_bitrate_k}k`"
 
 
 def register_user_handlers(
@@ -99,6 +102,7 @@ def register_user_handlers(
         expired = [sid for sid, s in sessions.items() if now - s.created_at > 3600]
         for sid in expired:
             sessions.pop(sid, None)
+            queue_mgr.release_session_cache(sid)
 
     async def _check_access(message: Message) -> bool:
         user = message.from_user
@@ -108,10 +112,11 @@ def register_user_handlers(
             await db.ensure_user_profile(user.id, user.username or "")
             return True
         await message.reply_text(
-            "🔒 **Acceso restringido**\n\n"
-            f"Este bot está en modo lista blanca.\n"
-            f"Tu ID de usuario es: `{user.id}`\n"
-            "Compártelo con el administrador para recibir autorización."
+            "🔒 **Acceso Restringido**\n"
+            f"`{DIVIDER}`\n"
+            "Este bot funciona en modo lista blanca.\n"
+            f"└ **Tu ID:** `{user.id}`\n\n"
+            "Compártelo con el administrador para recibir acceso."
         )
         return False
 
@@ -127,6 +132,102 @@ def register_user_handlers(
         auto_mode = bool(user_rec.auto_mode) if user_rec else False
         return opts, auto_mode
 
+    async def _render_home_text(user_id: int) -> tuple[str, bool]:
+        opts, auto_mode = await _load_user_options(user_id)
+        active, pending = queue_mgr.get_queue_snapshot()
+        auto_tag = "ACTIVADO" if auto_mode else "Manual"
+        text = (
+            "🎬 **HydroCompress Bot**\n"
+            f"`{DIVIDER}`\n"
+            "Envíame cualquier **video**, **archivo** (hasta 2 GB) o **enlace directo `http(s)://`** para comprimirlo.\n\n"
+            "⚙️ **Tu Perfil**\n"
+            f"├ **Modo:** `{auto_tag}`\n"
+            f"├ **Ajuste base:** {_format_saved_preset_line(opts)}\n"
+            f"├ **Marca de agua:** `{opts.watermark_text or 'Ninguna'}`\n"
+            f"└ **Cola actual:** `{len(active)}/{queue_mgr.concurrency_limit}` activos · `{len(pending)}` en espera\n\n"
+            "💡 *Usa el menú `/` abajo o los botones rápidos.*"
+        )
+        return text, auto_mode
+
+    def _render_help_text(is_owner: bool) -> str:
+        lines = [
+            "📖 **Guía de Comandos**",
+            f"`{DIVIDER}`",
+            "",
+            "🎬 **Compresión y Lotes**",
+            "├ `/start` — Menú principal interactivo",
+            "├ `/auto` — Activar/desactivar **Modo Lotes** automático",
+            "├ `/queue` — Ver cola y trabajos activos",
+            "└ `/stats` — Total comprimido y espacio ahorrado",
+            "",
+            "🎨 **Personalización**",
+            "├ `/setthumb` — Fijar miniatura (responde a una foto)",
+            "├ `/delthumb` — Volver a miniatura automática",
+            "├ `/setwatermark <txt>` — Fijar marca de agua",
+            "├ `/delwatermark` — Quitar marca de agua",
+            "└ `/id` — Mostrar tu ID numérico",
+        ]
+        if is_owner:
+            lines.extend(
+                [
+                    "",
+                    "🛡 **Administración (Dueño)**",
+                    "├ `/admin` — Panel del servidor y recursos",
+                    "├ `/logs [n|errors|file]` — Ver o bajar `bot.log`",
+                    "├ `/update` — Actualizar desde GitHub y reiniciar",
+                    "├ `/users` · `/adduser <id>` · `/deluser <id>`",
+                    "├ `/purge` · `/cancelall` — Limpiar / detener cola",
+                    "└ `/login` · `/logout` · `/setdump <id>`",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "💡 *En cada video puedes elegir **Anime 10-bit**, probar una **Muestra 15s**, adjuntar `.srt/.ass`, recortar (**Trim**) o fijar un **Tamaño exacto en MB**.*",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _render_queue_text() -> str:
+        active, pending = queue_mgr.get_queue_snapshot()
+        lines = [
+            "📋 **Estado de la Cola**",
+            f"`{DIVIDER}`",
+            f"├ **Capacidad:** `{len(active)}/{queue_mgr.concurrency_limit}` activos · `{queue_mgr.threads_per_job()}` hilos/trabajo",
+            f"└ **En espera:** `{len(pending)}`",
+        ]
+        if active:
+            lines.append("")
+            lines.append("⚙️ **En ejecución**")
+            for idx, j in enumerate(active):
+                branch = "└" if idx == len(active) - 1 else "├"
+                elapsed = human_duration(time.time() - (j.started_at or j.created_at))
+                lines.append(f"{branch} `{j.job_id}` · `{j.filename[:34]}` ({j.phase}, {elapsed})")
+        else:
+            lines.append("\n• Sin trabajos activos en este momento.")
+
+        if pending:
+            lines.append("")
+            lines.append(f"⏳ **Siguiente en cola ({len(pending)})**")
+            shown = pending[:10]
+            for idx, j in enumerate(shown, start=1):
+                branch = "└" if idx == len(shown) else "├"
+                lines.append(f"{branch} `{idx}.` `{j.job_id}` · `{j.filename[:36]}`")
+        return "\n".join(lines)
+
+    async def _render_stats_text() -> str:
+        st = await db.get_stats()
+        pct = (st.total_saved_bytes / max(st.total_input_bytes, 1)) * 100.0
+        return (
+            "📊 **Estadísticas Globales**\n"
+            f"`{DIVIDER}`\n"
+            f"├ **Videos comprimidos:** `{st.total_jobs}`\n"
+            f"├ **Entregas >2 GB (enlace):** `{st.total_link_deliveries}`\n"
+            f"├ **Entrada procesada:** `{human_bytes(st.total_input_bytes)}`\n"
+            f"├ **Salida generada:** `{human_bytes(st.total_output_bytes)}`\n"
+            f"└ **Espacio ahorrado:** `{human_bytes(st.total_saved_bytes)}` (`-{pct:.1f}%`)"
+        )
+
     async def _enqueue_auto_job(
         message: Message,
         user_id: int,
@@ -138,7 +239,7 @@ def register_user_handlers(
     ) -> None:
         job_id = secrets.token_hex(4)
         status_msg = await message.reply_text(
-            f"⚡ **Modo Auto — Encolando trabajo `{job_id}`...**",
+            f"⚡ **Modo Lotes** · Encolando `{job_id}`...",
             quote=True,
         )
         job = CompressionJob(
@@ -155,52 +256,44 @@ def register_user_handlers(
         pos = await queue_mgr.enqueue(job)
         with contextlib.suppress(Exception):
             await status_msg.edit_text(
-                f"⚡ **Modo Auto — En cola (posición #{pos})**\n"
-                f"• **Trabajo:** `{job_id}`\n"
-                f"• **Archivo:** `{filename[:60]}`\n"
-                f"• **Ajuste:** {_format_saved_preset_line(opts)}\n"
-                f"• **Hilos asignados:** `{queue_mgr.threads_per_job()}` (`{queue_mgr.concurrency_limit}` en paralelo)\n"
-                "*(Usa `/auto` para volver al menú manual)*",
+                f"⚡ **Modo Lotes · En cola (#{pos})**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{filename[:56]}`\n"
+                f"├ **Ajuste:** {_format_saved_preset_line(opts)}\n"
+                f"└ **Trabajo:** `{job_id}` · `{queue_mgr.threads_per_job()}` hilos\n\n"
+                "*(Usa `/auto` para volver al modo manual)*",
                 reply_markup=build_job_cancel_keyboard(job_id),
             )
 
     # ── Comandos informativos y de perfil ─────────────────────────────────────
 
-    @app.on_message(filters.private & filters.command(["start", "help"]))
+    @app.on_message(filters.private & filters.command("start"))
     async def cmd_start(_client: Client, message: Message) -> None:
         if not await _check_access(message):
             return
-        is_owner = message.from_user and message.from_user.id == config.owner_id
-        admin_hint = (
-            "\n• `/admin` — Panel de servidor, lista blanca, alertas y concurrencia"
-            "\n• `/logs [n|errors|file]` — Ver o descargar `bot.log` con errores"
-            "\n• `/update` — Actualizar el bot desde GitHub y reiniciar"
-            "\n• `/login` — Vincular tu cuenta de Telegram (4 GB con Premium)"
-            if is_owner
-            else ""
-        )
+        user_id = message.from_user.id
+        is_owner = user_id == config.owner_id
+        text, auto_mode = await _render_home_text(user_id)
         await message.reply_text(
-            "🎬 **HydroCompress Bot — Compresor de Videos de Alta Potencia**\n\n"
-            "**Cómo usarlo:**\n"
-            "1. Envíame o reenvíame cualquier **video** o **archivo de video** (MP4, MKV, MOV, AVI, WEBM hasta 2 GB).\n"
-            "2. También puedes enviarme un **enlace directo `http(s)://`** de un video (incluso mayor a 2 GB).\n"
-            "3. Elige un preset (incluye **Anime 10-bit**), ajusta códec/CRF/10-bit/pistas, adjunta subtítulos `.srt`/`.ass`, recorta (**Trim**), añade **Marca de Agua**, prueba una **Muestra 15s** o fija un **tamaño exacto en MB (2-Pass)**.\n"
-            "4. Si el resultado pesa **≤ 2 GB** lo recibes directo en Telegram; si supera **2 GB**, se entrega por Premium (4 GB) o **enlace directo**.\n\n"
-            "**Comandos disponibles:**\n"
-            "• `/auto` — Activar/desactivar **Modo Lotes** (encola videos automáticamente con tu ajuste guardado)\n"
-            "• `/queue` — Ver trabajos activos y en cola\n"
-            "• `/setthumb` / `/delthumb` — Miniatura personalizada (responde a una foto)\n"
-            "• `/setwatermark <texto>` / `/delwatermark` — Marca de agua fija en tus videos\n"
-            "• `/stats` — Ver total de videos y espacio ahorrado\n"
-            "• `/id` — Mostrar tu ID de Telegram"
-            f"{admin_hint}"
+            text,
+            reply_markup=build_start_keyboard(is_owner=is_owner, auto_mode=auto_mode),
+        )
+
+    @app.on_message(filters.private & filters.command("help"))
+    async def cmd_help(_client: Client, message: Message) -> None:
+        if not await _check_access(message):
+            return
+        is_owner = bool(message.from_user and message.from_user.id == config.owner_id)
+        await message.reply_text(
+            _render_help_text(is_owner),
+            reply_markup=build_back_home_keyboard(),
         )
 
     @app.on_message(filters.private & filters.command("id"))
     async def cmd_id(_client: Client, message: Message) -> None:
         if not message.from_user:
             return
-        await message.reply_text(f"🆔 Tu Telegram ID es: `{message.from_user.id}`")
+        await message.reply_text(f"🆔 **Tu ID de Telegram:** `{message.from_user.id}`")
 
     @app.on_message(filters.private & filters.command("auto"))
     async def cmd_auto(_client: Client, message: Message) -> None:
@@ -212,16 +305,18 @@ def register_user_handlers(
         await db.set_auto_mode(user_id, new_state)
         if new_state:
             await message.reply_text(
-                "⚡ **Modo Lotes (/auto) ACTIVADO**\n\n"
-                "Ahora puedes reenviarme 5, 10 o 20 videos seguidos y todos entrarán directo a la cola sin pedir confirmación.\n"
-                f"• **Ajuste activo:** {_format_saved_preset_line(opts)}\n"
-                f"• **Marca de agua:** `{opts.watermark_text or 'Ninguna'}`\n\n"
-                "💡 *Para cambiar tu ajuste favorito, desactiva `/auto`, configura un video y pulsa `💾 Guardar Auto`.*"
+                "⚡ **Modo Lotes ACTIVADO**\n"
+                f"`{DIVIDER}`\n"
+                "Reenvíame varios videos seguidos y entrarán directo a la cola sin pedir confirmación.\n"
+                f"├ **Ajuste:** {_format_saved_preset_line(opts)}\n"
+                f"└ **Marca de agua:** `{opts.watermark_text or 'Ninguna'}`\n\n"
+                "💡 *Para cambiar tu ajuste favorito, apaga `/auto`, configura un video y pulsa `💾 Guardar Auto`.*"
             )
         else:
             await message.reply_text(
-                "🎛 **Modo Lotes (/auto) DESACTIVADO**\n"
-                "Cada video volverá a mostrar el panel de configuración manual."
+                "🎛 **Modo Lotes DESACTIVADO**\n"
+                f"`{DIVIDER}`\n"
+                "Cada video volverá a abrir el panel de configuración manual."
             )
 
     @app.on_message(filters.private & filters.command("setwatermark"))
@@ -231,15 +326,17 @@ def register_user_handlers(
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
             await message.reply_text(
-                "🏷 Uso: `/setwatermark @TuCanal`\n"
-                "Se añadirá una marca de agua discreta a tus próximos videos. Usa `/delwatermark` para quitarla."
+                "🏷 **Marca de Agua**\n"
+                f"`{DIVIDER}`\n"
+                "Uso: `/setwatermark @TuCanal`\n"
+                "Usa `/delwatermark` para quitarla."
             )
             return
         wm_text = parts[1].strip()[:48]
         await db.set_watermark(message.from_user.id, wm_text)
         await message.reply_text(
-            f"✅ Marca de agua guardada: `{wm_text}`\n"
-            "*(Puedes elegir la esquina desde `✂️ Trim y Marca` al configurar un video.)*"
+            f"✅ **Marca de agua guardada:** `{wm_text}`\n"
+            "*(Puedes cambiar la esquina en `✂️ Trim / Marca` al configurar un video.)*"
         )
 
     @app.on_message(filters.private & filters.command("delwatermark"))
@@ -256,58 +353,90 @@ def register_user_handlers(
         reply = message.reply_to_message
         if not reply or not reply.photo:
             await message.reply_text(
-                "🖼 Responde con `/setthumb` a una **foto** para usarla como miniatura en tus videos comprimidos."
+                "🖼 Responde con `/setthumb` a una **foto** para fijarla como tu miniatura personalizada."
             )
             return
         await db.set_custom_thumb(message.from_user.id, reply.photo.file_id)
-        await message.reply_text("✅ Miniatura personalizada guardada. Se aplicará a tus próximos videos.")
+        await message.reply_text("✅ Miniatura personalizada guardada para tus próximos videos.")
 
     @app.on_message(filters.private & filters.command("delthumb"))
     async def cmd_delthumb(_client: Client, message: Message) -> None:
         if not await _check_access(message):
             return
         await db.set_custom_thumb(message.from_user.id, None)
-        await message.reply_text("🗑 Miniatura personalizada eliminada. Se extraerá automáticamente de cada video.")
+        await message.reply_text("🗑 Miniatura personalizada eliminada (volverá a generarse automáticamente).")
 
     @app.on_message(filters.private & filters.command("queue"))
     async def cmd_queue(_client: Client, message: Message) -> None:
         if not await _check_access(message):
             return
-        active, pending = queue_mgr.get_queue_snapshot()
-        lines = [
-            f"📋 **Estado de la Cola** (`{len(active)}/{queue_mgr.concurrency_limit}` activos · `{queue_mgr.threads_per_job()}` hilos/trabajo)",
-            "",
-        ]
-        if active:
-            lines.append("**En ejecución:**")
-            for j in active:
-                elapsed = human_duration(time.time() - (j.started_at or j.created_at))
-                lines.append(f"• `{j.job_id}` — `{j.filename[:36]}` ({j.phase}, {elapsed})")
-        else:
-            lines.append("• No hay trabajos comprimiendo ahora mismo.")
-
-        if pending:
-            lines.append("")
-            lines.append(f"**En espera ({len(pending)}):**")
-            for idx, j in enumerate(pending[:10], start=1):
-                lines.append(f"{idx}. `{j.job_id}` — `{j.filename[:36]}`")
-
-        await message.reply_text("\n".join(lines))
+        await message.reply_text(_render_queue_text())
 
     @app.on_message(filters.private & filters.command("stats"))
     async def cmd_stats(_client: Client, message: Message) -> None:
         if not await _check_access(message):
             return
-        st = await db.get_stats()
-        pct = (st.total_saved_bytes / max(st.total_input_bytes, 1)) * 100.0
-        await message.reply_text(
-            "📊 **Estadísticas Globales del Bot**\n\n"
-            f"• **Videos comprimidos:** `{st.total_jobs}`\n"
-            f"• **Entregas por enlace (>2 GB):** `{st.total_link_deliveries}`\n"
-            f"• **Peso original procesado:** `{human_bytes(st.total_input_bytes)}`\n"
-            f"• **Peso final generado:** `{human_bytes(st.total_output_bytes)}`\n"
-            f"• **Espacio total ahorrado:** `{human_bytes(st.total_saved_bytes)}` (`{pct:.1f}%`)"
-        )
+        await message.reply_text(await _render_stats_text())
+
+    # ── Callbacks del Menú Principal (/start) ─────────────────────────────────
+
+    @app.on_callback_query(filters.regex(r"^home:(main|queue|stats|help|toggle_auto)$"))
+    async def cb_home(_client: Client, query: CallbackQuery) -> None:
+        user_id = query.from_user.id
+        if not await db.is_authorized(user_id, config.owner_id):
+            await query.answer("Acceso restringido.", show_alert=True)
+            return
+
+        action = query.data.split(":", 1)[1]
+        is_owner = user_id == config.owner_id
+
+        if action == "toggle_auto":
+            _, cur = await _load_user_options(user_id)
+            await db.set_auto_mode(user_id, not cur)
+            await query.answer(f"Modo Lotes: {'ON' if not cur else 'OFF'}")
+            text, auto_mode = await _render_home_text(user_id)
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(
+                    text,
+                    reply_markup=build_start_keyboard(is_owner=is_owner, auto_mode=auto_mode),
+                )
+            return
+
+        if action == "main":
+            await query.answer()
+            text, auto_mode = await _render_home_text(user_id)
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(
+                    text,
+                    reply_markup=build_start_keyboard(is_owner=is_owner, auto_mode=auto_mode),
+                )
+            return
+
+        if action == "queue":
+            await query.answer()
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(
+                    _render_queue_text(),
+                    reply_markup=build_back_home_keyboard(),
+                )
+            return
+
+        if action == "stats":
+            await query.answer()
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(
+                    await _render_stats_text(),
+                    reply_markup=build_back_home_keyboard(),
+                )
+            return
+
+        if action == "help":
+            await query.answer()
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(
+                    _render_help_text(is_owner),
+                    reply_markup=build_back_home_keyboard(),
+                )
 
     # ── Recepción de Video, Documento de Video o Subtítulo Externo (.srt/.ass) ─
 
@@ -322,7 +451,7 @@ def register_user_handlers(
         if pending_state and pending_state[1] == "attach_sub" and message.document:
             if not _is_subtitle_document(message):
                 await message.reply_text(
-                    "❌ Ese archivo no es un subtítulo compatible. Envía un `.srt`, `.ass`, `.ssa` o `.vtt`."
+                    "❌ Formato no compatible. Envía un archivo `.srt`, `.ass`, `.ssa` o `.vtt`."
                 )
                 return
             sid, _ = awaiting_input.pop(user_id)
@@ -337,8 +466,7 @@ def register_user_handlers(
                 session.options.subtitle_mode = "soft"
             await _refresh_session_message(session, view="tracks")
             await message.reply_text(
-                f"✅ Subtítulo externo `{sub_name[:48]}` adjuntado (`{session.options.subtitle_mode}`).\n"
-                "*(Puedes alternar entre Softsub y Hardsub en el panel de arriba.)*",
+                f"✅ Subtítulo externo `{sub_name[:48]}` adjuntado (`{session.options.subtitle_mode}`).",
                 quote=True,
             )
             return
@@ -366,7 +494,6 @@ def register_user_handlers(
             width = None
             height = None
 
-        # Si el usuario activó /auto (Modo Lotes), encolar directamente sin menú
         if auto_mode:
             await _enqueue_auto_job(
                 message=message,
@@ -444,7 +571,7 @@ def register_user_handlers(
         user_id = message.from_user.id
         text = message.text.strip()
 
-        # 0. ¿El dueño está completando el asistente seguro /login?
+        # 0. Asistente seguro /login
         if user_id == config.owner_id and user_session.login_in_progress:
             with contextlib.suppress(Exception):
                 await message.delete()
@@ -466,7 +593,7 @@ def register_user_handlers(
                 await message.reply_text(f"⚠️ {exc}")
             return
 
-        # 1. ¿El usuario estaba respondiendo a una solicitud del panel inline?
+        # 1. Inputs interactivos del panel inline
         if user_id in awaiting_input:
             sid, mode = awaiting_input.pop(user_id)
             session = sessions.get(sid)
@@ -486,7 +613,7 @@ def register_user_handlers(
                         raise ValueError
                 except ValueError:
                     awaiting_input[user_id] = (sid, mode)
-                    await message.reply_text("❌ Escribe un número válido entre `2` y `10240` (ejemplo: `45` o `150`).")
+                    await message.reply_text("❌ Escribe un número entre `2` y `10240` (ej: `45` o `150`).")
                     return
                 session.options.target_mb = round(mb_val, 1)
                 with contextlib.suppress(Exception):
@@ -499,9 +626,8 @@ def register_user_handlers(
                 if cleaned.lower() in {"-", "reset", "original"}:
                     session.options.custom_output_name = ""
                 else:
-                    # Quitar extensión si el usuario la incluyó
                     stem = Path(cleaned).stem if Path(cleaned).suffix.lower() in VIDEO_EXTENSIONS else cleaned
-                    session.options.custom_output_name = stem[:80].strip()
+                    session.options.custom_output_name = stem[:120].strip()
                 with contextlib.suppress(Exception):
                     await message.delete()
                 await _refresh_session_message(session, view="main")
@@ -523,7 +649,7 @@ def register_user_handlers(
                     awaiting_input[user_id] = (sid, mode)
                     await message.reply_text(
                         f"❌ Formato inválido ({exc}).\n"
-                        "Ejemplos válidos: `00:30 - 05:00`, `01:20 - fin` o `15 - 90`."
+                        "Ejemplos: `00:30 - 05:00`, `01:20 - fin` o `15 - 90`."
                     )
                     return
                 session.options.trim_start = start_s
@@ -542,7 +668,7 @@ def register_user_handlers(
                 await _refresh_session_message(session, view="extras")
                 return
 
-        # 2. ¿Envió un enlace directo HTTP(S) para comprimir?
+        # 2. Enlace directo HTTP(S)
         if URL_REGEX.match(text):
             if not await _check_access(message):
                 return
@@ -667,11 +793,11 @@ def register_user_handlers(
         if action == "toggle_10bit":
             if session.options.bit_depth == 10:
                 session.options.bit_depth = 8
-                await query.answer("Profundidad cambiada a 8-bit")
+                await query.answer("Profundidad: 8-bit")
             else:
                 session.options.bit_depth = 10
                 session.options.codec = "libx265"
-                await query.answer("10-bit activado (H.265 Main10)")
+                await query.answer("Profundidad: 10-bit (H.265 Main10)")
             await _refresh_session_message(session, view="advanced")
             return
 
@@ -770,14 +896,14 @@ def register_user_handlers(
             if parts[3] in {"tl", "tr", "bl", "br"}:
                 session.options.watermark_pos = parts[3]  # type: ignore[assignment]
                 await db.set_watermark(session.user_id, session.options.watermark_text, parts[3])
-            await query.answer("Posición de marca actualizada")
+            await query.answer("Posición actualizada")
             await _refresh_session_message(session, view="extras")
             return
 
         if action == "audio" and len(parts) >= 4:
             val = ":".join(parts[3:])
             session.options.audio_mode = val
-            await query.answer("Pista de audio actualizada")
+            await query.answer("Audio actualizado")
             await _refresh_session_message(session, view="tracks")
             return
 
@@ -798,21 +924,21 @@ def register_user_handlers(
 
         if action == "abr" and len(parts) >= 4:
             session.options.audio_bitrate_k = int(parts[3])
-            await query.answer(f"Bitrate de audio: {parts[3]} kbps")
+            await query.answer(f"Audio: {parts[3]} kbps")
             await _refresh_session_message(session, view="tracks")
             return
 
         if action == "toggle_doc":
             session.options.send_as_document = not session.options.send_as_document
             await db.set_send_as_document(session.user_id, session.options.send_as_document)
-            await query.answer("Modo de envío actualizado")
+            await query.answer("Formato de envío actualizado")
             await _refresh_session_message(session, view="main")
             return
 
         if action == "save_auto":
             await db.save_default_options(session.user_id, session.options.to_saved_dict())
             await query.answer(
-                "Ajuste guardado como favorito. Usa /auto para comprimir videos en lote automáticamente.",
+                "Ajuste guardado como favorito. Activa /auto para comprimir en lote automáticamente.",
                 show_alert=True,
             )
             return
@@ -822,10 +948,17 @@ def register_user_handlers(
             sample_opts.sample_duration = 15.0
             sample_opts.target_mb = None
             job_id = secrets.token_hex(4)
+            cached_note = (
+                "⚡ *Video en caché: sin re-descargar*"
+                if queue_mgr.has_cached_source(session.session_id)
+                else "💾 *Se guardará en caché temporal para no re-descargarlo al comprimir*"
+            )
             sample_status = await session.config_message.reply_text(
-                f"🎞 **Muestra 15s encolada (`{job_id}`)**\n"
-                f"• **Archivo:** `{session.filename[:60]}`\n"
-                "*(El panel superior sigue abierto para que ajustes o inicies el video completo)*",
+                f"🎞 **Muestra 15s · En cola**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{session.filename[:56]}`\n"
+                f"└ **Trabajo:** `{job_id}`\n\n"
+                f"{cached_note}",
                 reply_markup=build_job_cancel_keyboard(job_id),
             )
             job = CompressionJob(
@@ -838,6 +971,8 @@ def register_user_handlers(
                 source_message=session.source_message,
                 source_url=session.source_url,
                 expected_size=session.file_size or (500 * 1024 * 1024),
+                session_id=session.session_id,
+                keep_cached_source=True,
             )
             pos = await queue_mgr.enqueue(job)
             await query.answer(f"Muestra 15s encolada (#{pos})")
@@ -846,7 +981,8 @@ def register_user_handlers(
         if action == "discard":
             sessions.pop(sid, None)
             awaiting_input.pop(session.user_id, None)
-            await query.answer("Cancelado")
+            queue_mgr.release_session_cache(sid)
+            await query.answer("Descartado")
             with contextlib.suppress(Exception):
                 await session.config_message.edit_text("✖ Operación descartada.")
             return
@@ -855,6 +991,7 @@ def register_user_handlers(
             sessions.pop(sid, None)
             awaiting_input.pop(session.user_id, None)
             job_id = secrets.token_hex(4)
+            has_cache = queue_mgr.has_or_pending_cache(session.session_id)
 
             job = CompressionJob(
                 job_id=job_id,
@@ -866,14 +1003,18 @@ def register_user_handlers(
                 source_message=session.source_message,
                 source_url=session.source_url,
                 expected_size=session.file_size or (500 * 1024 * 1024),
+                session_id=session.session_id if has_cache else None,
+                keep_cached_source=False,
             )
             pos = await queue_mgr.enqueue(job)
-            await query.answer(f"Trabajo #{job_id} encolado (posición {pos})")
+            await query.answer(f"Encolado (#{pos})")
+            cache_line = "\n⚡ *Usará el video ya descargado en caché*" if has_cache else ""
             await session.config_message.edit_text(
-                f"⏳ **En cola (posición #{pos})**\n"
-                f"• **Trabajo:** `{job_id}`\n"
-                f"• **Archivo:** `{session.filename[:60]}`\n"
-                f"• **Hilos asignados:** `{queue_mgr.threads_per_job()}` (`{queue_mgr.concurrency_limit}` en paralelo)",
+                f"⏳ **En Cola · Posición #{pos}**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{session.filename[:56]}`\n"
+                f"├ **Hilos:** `{queue_mgr.threads_per_job()}` (`{queue_mgr.concurrency_limit}` en paralelo)\n"
+                f"└ **Trabajo:** `{job_id}`{cache_line}",
                 reply_markup=build_job_cancel_keyboard(job_id),
             )
 
@@ -893,7 +1034,7 @@ def register_user_handlers(
         src = queue_mgr.get_recompress_source(token)
         if not src:
             await query.answer(
-                "Ese acceso rápido expiró. Reenvía el video y elige 1.9 GB TG en Tamaño Exacto.",
+                "Ese acceso expiró. Reenvía el video y elige 1.9 GB en Tamaño Exacto.",
                 show_alert=True,
             )
             return
@@ -912,9 +1053,10 @@ def register_user_handlers(
 
         job_id = secrets.token_hex(4)
         status_msg = await query.message.reply_text(
-            f"⏳ **Re-compresión 2-Pass a 1.90 GB (para Telegram) encolada**\n"
-            f"• **Trabajo:** `{job_id}`\n"
-            f"• **Archivo:** `{src.filename[:60]}`",
+            f"⏳ **Re-compresión 2-Pass (1.90 GB)**\n"
+            f"`{DIVIDER}`\n"
+            f"├ **Archivo:** `{src.filename[:56]}`\n"
+            f"└ **Trabajo:** `{job_id}`",
             reply_markup=build_job_cancel_keyboard(job_id),
         )
         job = CompressionJob(
@@ -929,4 +1071,4 @@ def register_user_handlers(
             expected_size=2 * 1024 * 1024 * 1024,
         )
         pos = await queue_mgr.enqueue(job)
-        await query.answer(f"Re-compresión a 1.90 GB encolada (#{pos})")
+        await query.answer(f"Re-compresión encolada (#{pos})")

@@ -2,8 +2,8 @@
 
 Arquitectura 100% Telegram nativa (sin panel web), construida con Hydrogram +
 TgCrypto + FFmpeg para panel.plugged.host (Egg Python Generic Pelican/Pterodactyl).
-Incluye auto-instalación rootless de FFmpeg/FFprobe y soporte opcional de cuenta
-de Telegram (/login) para subir el límite nativo hasta 4 GB con Premium.
+Incluye auto-instalación rootless de FFmpeg/FFprobe, registro automático de
+comandos nativos de Telegram y soporte opcional de cuenta (/login) para 4 GB Premium.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ _MAIN_LOOP = asyncio.new_event_loop()
 asyncio.set_event_loop(_MAIN_LOOP)
 
 from hydrogram import Client, idle
+from hydrogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 
 from config import BotConfig
 from core.console_commands import console_command_loop
@@ -37,6 +38,52 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("hydrocompress")
+
+USER_BOT_COMMANDS: list[BotCommand] = [
+    BotCommand("start", "Inicio rápido y menú principal"),
+    BotCommand("help", "Guía de uso y lista de comandos"),
+    BotCommand("auto", "Activar o desactivar Modo Lotes automático"),
+    BotCommand("queue", "Ver cola de compresión y trabajos activos"),
+    BotCommand("stats", "Ver videos comprimidos y espacio ahorrado"),
+    BotCommand("setthumb", "Fijar miniatura (responde a una foto)"),
+    BotCommand("delthumb", "Borrar miniatura personalizada"),
+    BotCommand("setwatermark", "Guardar marca de agua para tus videos"),
+    BotCommand("delwatermark", "Borrar marca de agua guardada"),
+    BotCommand("id", "Mostrar tu ID de Telegram"),
+]
+
+OWNER_BOT_COMMANDS: list[BotCommand] = [
+    *USER_BOT_COMMANDS,
+    BotCommand("admin", "Panel del servidor, recursos y alertas"),
+    BotCommand("logs", "Ver últimos errores o descargar bot.log"),
+    BotCommand("update", "Actualizar el bot desde GitHub y reiniciar"),
+    BotCommand("users", "Ver usuarios autorizados (lista blanca)"),
+    BotCommand("adduser", "Autorizar usuario por ID"),
+    BotCommand("deluser", "Quitar usuario de la lista blanca"),
+    BotCommand("purge", "Limpiar archivos y enlaces temporales"),
+    BotCommand("cancelall", "Cancelar todos los trabajos activos/en cola"),
+    BotCommand("login", "Vincular cuenta Telegram (Premium 4 GB)"),
+    BotCommand("logout", "Desconectar cuenta Telegram vinculada"),
+    BotCommand("setdump", "Configurar canal puente para 2–4 GB"),
+]
+
+
+async def _sync_bot_commands(app: Client, owner_id: int) -> None:
+    """Registra el menú nativo '/' en Telegram separado por rol (usuarios vs dueño)."""
+    try:
+        await app.set_bot_commands(USER_BOT_COMMANDS, scope=BotCommandScopeDefault())
+        logger.info("Menú de comandos de usuario registrado (%d comandos).", len(USER_BOT_COMMANDS))
+    except Exception as exc:
+        logger.warning("No se pudieron registrar los comandos por defecto: %s", exc)
+
+    try:
+        await app.set_bot_commands(
+            OWNER_BOT_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=owner_id),
+        )
+        logger.info("Menú de comandos de dueño registrado para %s (%d comandos).", owner_id, len(OWNER_BOT_COMMANDS))
+    except Exception as exc:
+        logger.warning("No se pudo registrar el menú extendido del dueño (%s): %s", owner_id, exc)
 
 
 def _check_tgcrypto() -> None:
@@ -109,6 +156,7 @@ async def main() -> None:
 
     await direct_store.start()
     await app.start()
+    await _sync_bot_commands(app, config.owner_id)
     await queue_mgr.start()
 
     me = await app.get_me()

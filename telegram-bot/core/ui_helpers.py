@@ -12,6 +12,8 @@ from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from core.ffmpeg_engine import PRESETS, CompressionOptions
 from core.media_probe import MediaInfo
 
+DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
+
 
 def human_bytes(num_bytes: int | float) -> str:
     value = float(max(0, num_bytes))
@@ -34,7 +36,7 @@ def human_duration(seconds: float) -> str:
 def progress_bar(percent: float, width: int = 12) -> str:
     clamped = max(0.0, min(100.0, percent))
     filled = int(round((clamped / 100.0) * width))
-    return f"[{'█' * filled}{'░' * (width - filled)}] {clamped:.1f}%"
+    return f"{'▰' * filled}{'▱' * (width - filled)}  {clamped:5.1f}%"
 
 
 class ProgressUpdater:
@@ -88,6 +90,31 @@ class ProgressUpdater:
                 pass
 
 
+# ── Teclado del Menú Principal (/start) ──────────────────────────────────────
+
+def build_start_keyboard(is_owner: bool, auto_mode: bool) -> InlineKeyboardMarkup:
+    auto_label = "⚡ Modo Lotes: ON" if auto_mode else "⚡ Modo Lotes: OFF"
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(auto_label, callback_data="home:toggle_auto"),
+            InlineKeyboardButton("📋 Ver Cola", callback_data="home:queue"),
+        ],
+        [
+            InlineKeyboardButton("📊 Estadísticas", callback_data="home:stats"),
+            InlineKeyboardButton("📖 Comandos", callback_data="home:help"),
+        ],
+    ]
+    if is_owner:
+        rows.append([InlineKeyboardButton("🛡 Panel de Administración", callback_data="home:admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_back_home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅ Menú Principal", callback_data="home:main")]]
+    )
+
+
 # ── Textos y Teclados de Configuración de Video ──────────────────────────────
 
 def _audio_mode_label(opts: CompressionOptions) -> str:
@@ -104,9 +131,9 @@ def _audio_mode_label(opts: CompressionOptions) -> str:
 def _sub_mode_label(opts: CompressionOptions) -> str:
     if opts.subtitle_mode == "none":
         return "Sin subtítulos"
-    kind = "Softsub" if opts.subtitle_mode == "soft" else "Hardsub (quemado)"
+    kind = "Softsub" if opts.subtitle_mode == "soft" else "Hardsub"
     if opts.external_sub_name:
-        return f"{kind} · Externo ({opts.external_sub_name[:22]})"
+        return f"{kind} · {opts.external_sub_name[:22]}"
     if opts.subtitle_track_idx is not None:
         return f"{kind} #{opts.subtitle_track_idx + 1}"
     return f"{kind} (auto)"
@@ -131,72 +158,72 @@ def format_draft_summary(
     media: MediaInfo | None = None,
     source_is_url: bool = False,
 ) -> str:
-    bit_str = " 10-bit" if (opts.bit_depth == 10 and opts.codec == "libx265") else ""
-    codec_label = f"H.265{bit_str}" if opts.codec == "libx265" else "H.264 (AVC)"
+    bit_str = " · 10-bit" if (opts.bit_depth == 10 and opts.codec == "libx265") else ""
+    codec_label = f"H.265{bit_str}" if opts.codec == "libx265" else "H.264"
     res_label = f"{opts.max_height}p" if opts.max_height else "Original"
-    mode_line = (
-        f"🎯 **Tamaño exacto (2-Pass):** `{opts.target_mb:.0f} MB`"
+    mode_val = (
+        f"2-Pass · {opts.target_mb:.0f} MB"
         if opts.target_mb
-        else f"🎚 **Calidad (CRF):** `{opts.crf}` · Vel `{opts.speed}`"
+        else f"CRF {opts.crf} · {opts.speed}"
     )
 
-    size_str = human_bytes(file_size) if file_size else "Se detectará al descargar"
+    size_str = human_bytes(file_size) if file_size else "Al descargar"
     dur_str = human_duration(duration) if duration else "Auto"
     dim_str = f"{width}×{height}" if width and height else "Auto"
-    src_tag = "🌐 Enlace directo" if source_is_url else "📎 Archivo de Telegram"
+    src_tag = "Enlace directo" if source_is_url else "Telegram"
 
     lines = [
-        "🎬 **Panel de Compresión**",
-        f"• **Origen:** {src_tag}",
-        f"• **Archivo:** `{filename[:64]}`",
-        f"• **Peso:** `{size_str}` · **Duración:** `{dur_str}` · **Res:** `{dim_str}`",
+        "🎬 **Configurar Compresión**",
+        f"`{DIVIDER}`",
+        f"📄 `{filename[:64]}`",
+        f"├ **Origen:** `{src_tag}` · **Peso:** `{size_str}`",
+        f"└ **Duración:** `{dur_str}` · **Resolución:** `{dim_str}`",
     ]
     if opts.custom_output_name:
-        lines.append(f"• **Nombre salida:** `{opts.custom_output_name[:56]}`")
+        lines.append(f"✏️ **Renombrado:** `{opts.custom_output_name[:56]}`")
     if media:
         lines.append(
-            f"• **Pistas:** `{len(media.audio_tracks)}` audio · `{len(media.subtitle_tracks)}` subtítulos · Códec `{media.video_codec}`"
+            f"🔎 **Pistas:** `{len(media.audio_tracks)}` audio · `{len(media.subtitle_tracks)}` subs · `{media.video_codec}`"
         )
+
     lines.extend(
         [
             "",
-            "⚙️ **Configuración actual:**",
-            f"• **Códec:** `{codec_label}` · **Resolución máx:** `{res_label}`",
-            f"• {mode_line}",
-            f"• **Audio:** `{_audio_mode_label(opts)}` (`{opts.audio_bitrate_k}k`)",
-            f"• **Subtítulos:** `{_sub_mode_label(opts)}`",
+            "⚙️ **Ajustes Activos**",
+            f"├ **Video:** `{codec_label}` · `{res_label}`",
+            f"├ **Modo:** `{mode_val}`",
+            f"├ **Audio:** `{_audio_mode_label(opts)}` (`{opts.audio_bitrate_k}k`)",
+            f"├ **Subtítulos:** `{_sub_mode_label(opts)}`",
         ]
     )
     if opts.trim_start is not None or opts.trim_end is not None:
         s = human_duration(opts.trim_start or 0.0)
         e = human_duration(opts.trim_end) if opts.trim_end else "fin"
-        lines.append(f"• **Recorte (Trim):** `{s} → {e}`")
+        lines.append(f"├ **Recorte:** `{s} → {e}`")
     if opts.watermark_text.strip():
         lines.append(
-            f"• **Marca de agua:** `{opts.watermark_text}` ({_watermark_pos_label(opts.watermark_pos)})"
+            f"├ **Marca:** `{opts.watermark_text}` ({_watermark_pos_label(opts.watermark_pos)})"
         )
     lines.append(
-        f"• **Envío:** `{'Documento' if opts.send_as_document else 'Video reproducible'}`"
+        f"└ **Formato envío:** `{'Documento' if opts.send_as_document else 'Video reproducible'}`"
     )
-    lines.append("")
-    lines.append("ℹ️ *Si el resultado supera 2 GB, se entrega por cuenta Premium (4 GB) o enlace directo.*")
     return "\n".join(lines)
 
 
 def build_main_config_keyboard(session_id: str, opts: CompressionOptions) -> InlineKeyboardMarkup:
-    doc_label = "📄 Como Documento" if opts.send_as_document else "🎞 Como Video"
+    doc_label = "📄 Envío: Doc" if opts.send_as_document else "🎞 Envío: Video"
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("⚡ Presets Rápidos", callback_data=f"cfg:{session_id}:presets"),
-                InlineKeyboardButton("🎯 Tamaño Exacto (MB)", callback_data=f"cfg:{session_id}:target"),
+                InlineKeyboardButton("⚡ Presets", callback_data=f"cfg:{session_id}:presets"),
+                InlineKeyboardButton("🎯 Tamaño (MB)", callback_data=f"cfg:{session_id}:target"),
             ],
             [
-                InlineKeyboardButton("🛠 Códec / Res / 10-bit", callback_data=f"cfg:{session_id}:advanced"),
-                InlineKeyboardButton("🎧 Audio y Subtítulos", callback_data=f"cfg:{session_id}:tracks"),
+                InlineKeyboardButton("🛠 Códec / 10-bit", callback_data=f"cfg:{session_id}:advanced"),
+                InlineKeyboardButton("🎧 Audio / Subs", callback_data=f"cfg:{session_id}:tracks"),
             ],
             [
-                InlineKeyboardButton("✂️ Trim y Marca", callback_data=f"cfg:{session_id}:extras"),
+                InlineKeyboardButton("✂️ Trim / Marca", callback_data=f"cfg:{session_id}:extras"),
                 InlineKeyboardButton("✏️ Renombrar", callback_data=f"cfg:{session_id}:rename"),
             ],
             [
@@ -205,7 +232,7 @@ def build_main_config_keyboard(session_id: str, opts: CompressionOptions) -> Inl
             ],
             [
                 InlineKeyboardButton("🎞 Muestra 15s", callback_data=f"cfg:{session_id}:sample"),
-                InlineKeyboardButton("🚀 Iniciar Compresión", callback_data=f"cfg:{session_id}:start"),
+                InlineKeyboardButton("🚀 Comprimir", callback_data=f"cfg:{session_id}:start"),
             ],
             [
                 InlineKeyboardButton("✖ Descartar", callback_data=f"cfg:{session_id}:discard"),
@@ -228,7 +255,7 @@ def build_presets_keyboard(session_id: str, current_key: str) -> InlineKeyboardM
 def build_advanced_keyboard(session_id: str, opts: CompressionOptions) -> InlineKeyboardMarkup:
     c265 = "✓ H.265 (HEVC)" if opts.codec == "libx265" else "H.265 (HEVC)"
     c264 = "✓ H.264 (AVC)" if opts.codec == "libx264" else "H.264 (AVC)"
-    bit_label = "🎨 Profundidad: 10-bit (Anime/Cine)" if opts.bit_depth == 10 else "🎨 Profundidad: 8-bit (Estándar)"
+    bit_label = "🎨 10-bit Activado (Main10)" if opts.bit_depth == 10 else "🎨 8-bit Estándar"
 
     def _res_btn(label: str, val: int | None) -> InlineKeyboardButton:
         mark = "✓ " if opts.max_height == val else ""
@@ -262,9 +289,9 @@ def build_advanced_keyboard(session_id: str, opts: CompressionOptions) -> Inline
                 _spd_btn("medium"),
             ],
             [
-                InlineKeyboardButton("CRF -2 (Más calidad)", callback_data=f"cfg:{session_id}:crf:-2"),
-                InlineKeyboardButton(f"CRF: {opts.crf}", callback_data=f"cfg:{session_id}:noop"),
-                InlineKeyboardButton("CRF +2 (Más ligero)", callback_data=f"cfg:{session_id}:crf:+2"),
+                InlineKeyboardButton("➖ CRF -2", callback_data=f"cfg:{session_id}:crf:-2"),
+                InlineKeyboardButton(f"CRF {opts.crf}", callback_data=f"cfg:{session_id}:noop"),
+                InlineKeyboardButton("➕ CRF +2", callback_data=f"cfg:{session_id}:crf:+2"),
             ],
             [InlineKeyboardButton("⬅ Volver", callback_data=f"cfg:{session_id}:main")],
         ]
@@ -282,7 +309,7 @@ def build_target_size_keyboard(session_id: str, opts: CompressionOptions) -> Inl
     ]
     row2 = [
         InlineKeyboardButton(
-            f"{'✓ ' if opts.target_mb == s else ''}{'1.9 GB TG' if s == 1900 else f'{s} MB'}",
+            f"{'✓ ' if opts.target_mb == s else ''}{'1.9 GB' if s == 1900 else f'{s} MB'}",
             callback_data=f"cfg:{session_id}:set_mb:{s}",
         )
         for s in sizes[4:]
@@ -292,8 +319,8 @@ def build_target_size_keyboard(session_id: str, opts: CompressionOptions) -> Inl
             row1,
             row2,
             [
-                InlineKeyboardButton("✍️ Escribir tamaño en MB", callback_data=f"cfg:{session_id}:custom_mb"),
-                InlineKeyboardButton("♻ Volver a modo CRF", callback_data=f"cfg:{session_id}:clear_mb"),
+                InlineKeyboardButton("✍️ Escribir MB", callback_data=f"cfg:{session_id}:custom_mb"),
+                InlineKeyboardButton("♻ Modo CRF", callback_data=f"cfg:{session_id}:clear_mb"),
             ],
             [InlineKeyboardButton("⬅ Volver", callback_data=f"cfg:{session_id}:main")],
         ]
@@ -312,7 +339,7 @@ def build_tracks_keyboard(
                 callback_data=f"cfg:{session_id}:audio:first",
             ),
             InlineKeyboardButton(
-                f"{'✓ ' if opts.audio_mode == 'all' else ''}Todos los audios",
+                f"{'✓ ' if opts.audio_mode == 'all' else ''}Todos",
                 callback_data=f"cfg:{session_id}:audio:all",
             ),
             InlineKeyboardButton(
@@ -354,13 +381,13 @@ def build_tracks_keyboard(
 
     ext_row = [
         InlineKeyboardButton(
-            "📎 Adjuntar .srt / .ass" if not opts.external_sub_name else f"📎 Cambiar ({opts.external_sub_name[:14]})",
+            "📎 Adjuntar .srt / .ass" if not opts.external_sub_name else f"📎 {opts.external_sub_name[:16]}",
             callback_data=f"cfg:{session_id}:attach_sub",
         )
     ]
     if opts.external_sub_name:
         ext_row.append(
-            InlineKeyboardButton("🗑 Quitar externo", callback_data=f"cfg:{session_id}:clear_ext_sub")
+            InlineKeyboardButton("🗑 Quitar", callback_data=f"cfg:{session_id}:clear_ext_sub")
         )
     rows.append(ext_row)
 
@@ -378,10 +405,10 @@ def build_tracks_keyboard(
 
     rows.append(
         [
-            InlineKeyboardButton("Audio 64k", callback_data=f"cfg:{session_id}:abr:64"),
-            InlineKeyboardButton("Audio 96k", callback_data=f"cfg:{session_id}:abr:96"),
-            InlineKeyboardButton("Audio 128k", callback_data=f"cfg:{session_id}:abr:128"),
-            InlineKeyboardButton("Audio 192k", callback_data=f"cfg:{session_id}:abr:192"),
+            InlineKeyboardButton("64k", callback_data=f"cfg:{session_id}:abr:64"),
+            InlineKeyboardButton("96k", callback_data=f"cfg:{session_id}:abr:96"),
+            InlineKeyboardButton("128k", callback_data=f"cfg:{session_id}:abr:128"),
+            InlineKeyboardButton("192k", callback_data=f"cfg:{session_id}:abr:192"),
         ]
     )
     rows.append([InlineKeyboardButton("⬅ Volver", callback_data=f"cfg:{session_id}:main")])
@@ -396,11 +423,11 @@ def build_extras_keyboard(session_id: str, opts: CompressionOptions) -> InlineKe
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✂️ Fijar Recorte (Trim)", callback_data=f"cfg:{session_id}:set_trim"),
+                InlineKeyboardButton("✂️ Fijar Recorte", callback_data=f"cfg:{session_id}:set_trim"),
                 InlineKeyboardButton("♻ Quitar Recorte", callback_data=f"cfg:{session_id}:clear_trim"),
             ],
             [
-                InlineKeyboardButton("🏷 Texto Marca de Agua", callback_data=f"cfg:{session_id}:set_wm"),
+                InlineKeyboardButton("🏷 Texto Marca", callback_data=f"cfg:{session_id}:set_wm"),
                 InlineKeyboardButton("🗑 Quitar Marca", callback_data=f"cfg:{session_id}:clear_wm"),
             ],
             [
@@ -431,7 +458,7 @@ def build_large_file_link_keyboard(
         rows.append(
             [
                 InlineKeyboardButton(
-                    "📉 Re-comprimir a 1.90 GB (para Telegram)",
+                    "📉 Re-comprimir a 1.90 GB (Telegram)",
                     callback_data=f"recomp:{recompress_token}",
                 )
             ]
@@ -445,43 +472,37 @@ def build_admin_keyboard(
     uploader: str,
     error_alerts: bool = True,
 ) -> InlineKeyboardMarkup:
-    mode_btn = (
-        "🔒 Acceso: Solo Lista Blanca"
-        if access_mode == "private"
-        else "🌍 Acceso: Público"
-    )
-    conc_btn = (
-        "⚙️ Concurrencia: 1 trabajo × 4 hilos"
-        if concurrent_jobs == 1
-        else "⚙️ Concurrencia: 2 trabajos × 2 hilos"
-    )
+    mode_btn = "🔒 Lista Blanca" if access_mode == "private" else "🌍 Público"
+    conc_btn = "⚙️ 1 × 4 hilos" if concurrent_jobs == 1 else "⚙️ 2 × 2 hilos"
     up_names = {
         "gofile": "GoFile",
         "buzzheavier": "Buzzheavier",
-        "direct_http": "Enlace Directo",
+        "direct_http": "Directo",
     }
-    alert_btn = "🔔 Alertas de error: ON" if error_alerts else "🔕 Alertas de error: OFF"
+    alert_btn = "🔔 Alertas: ON" if error_alerts else "🔕 Alertas: OFF"
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(mode_btn, callback_data="adm:toggle_access")],
-            [InlineKeyboardButton(conc_btn, callback_data="adm:toggle_conc")],
+            [
+                InlineKeyboardButton(mode_btn, callback_data="adm:toggle_access"),
+                InlineKeyboardButton(conc_btn, callback_data="adm:toggle_conc"),
+            ],
             [
                 InlineKeyboardButton(
-                    f"🔗 Host >2 GB: {up_names.get(uploader, uploader)}",
+                    f"🔗 Host: {up_names.get(uploader, uploader)}",
                     callback_data="adm:cycle_uploader",
-                )
+                ),
+                InlineKeyboardButton(alert_btn, callback_data="adm:toggle_alerts"),
             ],
-            [InlineKeyboardButton(alert_btn, callback_data="adm:toggle_alerts")],
             [
                 InlineKeyboardButton("📄 Ver Logs", callback_data="adm:logs"),
                 InlineKeyboardButton("⬇ Bajar bot.log", callback_data="adm:logfile"),
             ],
             [
-                InlineKeyboardButton("👥 Ver Lista Blanca", callback_data="adm:users"),
-                InlineKeyboardButton("🧹 Purgar Temporales", callback_data="adm:purge"),
+                InlineKeyboardButton("👥 Usuarios", callback_data="adm:users"),
+                InlineKeyboardButton("🧹 Purgar Temp", callback_data="adm:purge"),
             ],
             [
-                InlineKeyboardButton("🔄 Actualizar Métricas", callback_data="adm:refresh"),
+                InlineKeyboardButton("🔄 Actualizar", callback_data="adm:refresh"),
                 InlineKeyboardButton("🛑 Cancelar Cola", callback_data="adm:cancelall"),
             ],
         ]
