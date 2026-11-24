@@ -271,6 +271,7 @@ def register_user_handlers(
                 "users",
                 "purge",
                 "cancelall",
+                "update",
             ]
         )
     )

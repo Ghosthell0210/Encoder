@@ -13,7 +13,10 @@ import asyncio
 import logging
 import sys
 
+from pathlib import Path
+
 from core.database import Database
+from core.git_updater import pull_from_github, restart_process
 from core.queue_manager import QueueManager
 from core.user_session import UserSessionManager
 
@@ -31,8 +34,8 @@ async def console_command_loop(
 ) -> None:
     """Lee líneas de stdin en segundo plano para controlar login desde la consola."""
     _print_console(
-        "\n[CONSOLA] Comandos disponibles: login | logout | status | help\n"
-        "[CONSOLA] Escribe 'login' y pulsa Enter para iniciar sesión con tu cuenta de Telegram.\n"
+        "\n[CONSOLA] Comandos disponibles: login | logout | status | update | help\n"
+        "[CONSOLA] Escribe 'login' para vincular tu cuenta de Telegram o 'update' para actualizar desde GitHub.\n"
     )
 
     console_login_active = False
@@ -124,14 +127,23 @@ async def console_command_loop(
                 f"Hilos/trabajo: {queue_mgr.threads_per_job()}"
             )
 
+        elif cmd == "update":
+            _print_console("[UPDATE] Sincronizando con GitHub...")
+            ok, msg, changed = await pull_from_github(Path.cwd())
+            _print_console(f"[UPDATE] {msg}")
+            if ok and changed:
+                _print_console("[UPDATE] Reiniciando bot con la nueva versión...")
+                restart_process()
+
         elif cmd == "help":
             _print_console(
                 "[CONSOLA] Comandos:\n"
                 "  login   - Iniciar sesión con tu cuenta de Telegram (teléfono + código + 2FA)\n"
                 "  logout  - Cerrar y borrar la sesión de la cuenta de Telegram\n"
                 "  status  - Ver estado de la cuenta vinculada y la cola\n"
+                "  update  - Descargar la última versión desde GitHub y reiniciar\n"
                 "  help    - Mostrar esta ayuda"
             )
 
         else:
-            _print_console(f"[CONSOLA] Comando no reconocido: '{text}'. Escribe 'login', 'logout', 'status' o 'help'.")
+            _print_console(f"[CONSOLA] Comando no reconocido: '{text}'. Escribe 'login', 'logout', 'status', 'update' o 'help'.")

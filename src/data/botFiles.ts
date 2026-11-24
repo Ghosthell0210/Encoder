@@ -13,6 +13,7 @@ import coreInitPy from '../../telegram-bot/core/__init__.py?raw';
 import consoleCommandsPy from '../../telegram-bot/core/console_commands.py?raw';
 import databasePy from '../../telegram-bot/core/database.py?raw';
 import ffmpegBootstrapPy from '../../telegram-bot/core/ffmpeg_bootstrap.py?raw';
+import gitUpdaterPy from '../../telegram-bot/core/git_updater.py?raw';
 import mediaProbePy from '../../telegram-bot/core/media_probe.py?raw';
 import ffmpegEnginePy from '../../telegram-bot/core/ffmpeg_engine.py?raw';
 import uploaderPy from '../../telegram-bot/core/uploader.py?raw';
@@ -141,6 +142,12 @@ export const BOT_FILES: BotFileItem[] = [
     'core/',
     'Descarga automática sin root de ffmpeg y ffprobe estáticos para Egg Python Generic',
     ffmpegBootstrapPy,
+  ),
+  makeFile(
+    'core/git_updater.py',
+    'core/',
+    'Actualizador automático desde GitHub (funciona incluso sin .git inicial)',
+    gitUpdaterPy,
   ),
   makeFile(
     'core/ffmpeg_engine.py',

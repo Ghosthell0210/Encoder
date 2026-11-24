@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from pathlib import Path
 import shutil
 
 import psutil
@@ -11,6 +12,7 @@ from hydrogram.types import CallbackQuery, Message
 
 from config import BotConfig
 from core.database import Database
+from core.git_updater import pull_from_github, restart_process
 from core.queue_manager import QueueManager, dir_size_bytes
 from core.ui_helpers import build_admin_keyboard, human_bytes
 from core.user_session import UserSessionManager
@@ -65,7 +67,7 @@ def register_admin_handlers(
             f"• **Videos:** `{stats.total_jobs}` · **Enlaces >2 GB:** `{stats.total_link_deliveries}`\n"
             f"• **Ahorro total:** `{human_bytes(stats.total_saved_bytes)}`\n\n"
             "**Comandos de dueño:**\n"
-            "`/login` · `/logout` · `/setdump <id>`\n"
+            "`/login` · `/logout` · `/setdump <id>` · `/update`\n"
             "`/adduser <id>` · `/deluser <id>` · `/users` · `/purge` · `/cancelall`"
         )
         return text, access_mode, conc, uploader
@@ -188,6 +190,21 @@ def register_admin_handlers(
             return
         count = await queue_mgr.cancel_all()
         await message.reply_text(f"🛑 Se cancelaron `{count}` trabajos activos/en cola.")
+
+    @app.on_message(filters.private & filters.command("update"))
+    async def cmd_update(_client: Client, message: Message) -> None:
+        if not message.from_user or not _is_owner(message.from_user.id):
+            return
+        status = await message.reply_text("🔄 Buscando actualizaciones en GitHub...")
+        ok, msg, changed = await pull_from_github(Path.cwd())
+        if not ok:
+            await status.edit_text(f"❌ {msg}")
+            return
+        if not changed:
+            await status.edit_text(f"✅ {msg}")
+            return
+        await status.edit_text(f"✅ {msg}\n♻️ Reiniciando bot...")
+        restart_process()
 
     # ── Callbacks inline de /admin ────────────────────────────────────────────
 

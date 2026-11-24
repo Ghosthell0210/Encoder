@@ -14,12 +14,9 @@ import shutil
 import signal
 import sys
 
-# Compatibilidad con Python 3.14+ (donde asyncio.get_event_loop no crea loop implícito)
-try:
-    _MAIN_LOOP = asyncio.get_event_loop()
-except RuntimeError:
-    _MAIN_LOOP = asyncio.new_event_loop()
-    asyncio.set_event_loop(_MAIN_LOOP)
+# Compatibilidad Python 3.11–3.14 sin DeprecationWarning antes de importar hydrogram
+_MAIN_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(_MAIN_LOOP)
 
 from hydrogram import Client, idle
 

@@ -12,11 +12,9 @@ import runpy
 import sys
 from pathlib import Path
 
-# Compatibilidad Python 3.14+ antes de importar hydrogram
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+# Crear event loop explícito antes de importar hydrogram (compatible Python 3.11–3.14 sin warnings)
+_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(_LOOP)
 
 ROOT_DIR = Path(__file__).resolve().parent
 BOT_DIR = ROOT_DIR / "telegram-bot"
