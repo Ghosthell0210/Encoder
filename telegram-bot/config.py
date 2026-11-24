@@ -15,7 +15,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+_THIS_DIR = Path(__file__).resolve().parent
+for _candidate_env in (Path.cwd() / ".env", _THIS_DIR.parent / ".env", _THIS_DIR / ".env"):
+    if _candidate_env.exists():
+        load_dotenv(_candidate_env, override=False)
+load_dotenv(override=False)
 
 # Límite seguro de subida MTProto para bots (2000 MiB exactos en Telegram;
 # usamos 1990 MiB para evitar rechazos por redondeo de partes de 512 KiB).
@@ -51,7 +55,7 @@ def _env_str(name: str, default: str = "") -> str:
 
 def _interactive_setup_env(base_dir: Path) -> None:
     """Si faltan credenciales y hay consola interactiva (Pelican/Pterodactyl), las pide y guarda .env."""
-    env_path = base_dir / ".env"
+    env_path = Path.cwd() / ".env" if Path.cwd().exists() else base_dir / ".env"
     print("\n═══ Configuración inicial de HydroCompress Bot ═══")
     print("Faltan credenciales de Telegram. Introdúcelas ahora para crear .env automáticamente:\n")
     api_id = input("1) API_ID (de https://my.telegram.org): ").strip()
