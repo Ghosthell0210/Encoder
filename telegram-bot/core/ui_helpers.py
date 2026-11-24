@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from typing import Any
 
 from hydrogram.errors import FloodWait, MessageNotModified
 from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -106,9 +105,20 @@ def _sub_mode_label(opts: CompressionOptions) -> str:
     if opts.subtitle_mode == "none":
         return "Sin subtítulos"
     kind = "Softsub" if opts.subtitle_mode == "soft" else "Hardsub (quemado)"
+    if opts.external_sub_name:
+        return f"{kind} · Externo ({opts.external_sub_name[:22]})"
     if opts.subtitle_track_idx is not None:
         return f"{kind} #{opts.subtitle_track_idx + 1}"
     return f"{kind} (auto)"
+
+
+def _watermark_pos_label(pos: str) -> str:
+    return {
+        "tl": "↖ Arriba-Izq",
+        "tr": "↗ Arriba-Der",
+        "bl": "↙ Abajo-Izq",
+        "br": "↘ Abajo-Der",
+    }.get(pos, "↘ Abajo-Der")
 
 
 def format_draft_summary(
@@ -121,12 +131,13 @@ def format_draft_summary(
     media: MediaInfo | None = None,
     source_is_url: bool = False,
 ) -> str:
-    codec_label = "H.265 (HEVC)" if opts.codec == "libx265" else "H.264 (AVC)"
+    bit_str = " 10-bit" if (opts.bit_depth == 10 and opts.codec == "libx265") else ""
+    codec_label = f"H.265{bit_str}" if opts.codec == "libx265" else "H.264 (AVC)"
     res_label = f"{opts.max_height}p" if opts.max_height else "Original"
     mode_line = (
         f"🎯 **Tamaño exacto (2-Pass):** `{opts.target_mb:.0f} MB`"
         if opts.target_mb
-        else f"🎚 **Calidad (CRF):** `{opts.crf}` · Velocidad `{opts.speed}`"
+        else f"🎚 **Calidad (CRF):** `{opts.crf}` · Vel `{opts.speed}`"
     )
 
     size_str = human_bytes(file_size) if file_size else "Se detectará al descargar"
@@ -140,6 +151,8 @@ def format_draft_summary(
         f"• **Archivo:** `{filename[:64]}`",
         f"• **Peso:** `{size_str}` · **Duración:** `{dur_str}` · **Res:** `{dim_str}`",
     ]
+    if opts.custom_output_name:
+        lines.append(f"• **Nombre salida:** `{opts.custom_output_name[:56]}`")
     if media:
         lines.append(
             f"• **Pistas:** `{len(media.audio_tracks)}` audio · `{len(media.subtitle_tracks)}` subtítulos · Códec `{media.video_codec}`"
@@ -152,11 +165,21 @@ def format_draft_summary(
             f"• {mode_line}",
             f"• **Audio:** `{_audio_mode_label(opts)}` (`{opts.audio_bitrate_k}k`)",
             f"• **Subtítulos:** `{_sub_mode_label(opts)}`",
-            f"• **Envío:** `{'Documento' if opts.send_as_document else 'Video reproducible'}`",
-            "",
-            "ℹ️ *Si el resultado supera 2 GB, se enviará automáticamente por enlace de descarga directa.*",
         ]
     )
+    if opts.trim_start is not None or opts.trim_end is not None:
+        s = human_duration(opts.trim_start or 0.0)
+        e = human_duration(opts.trim_end) if opts.trim_end else "fin"
+        lines.append(f"• **Recorte (Trim):** `{s} → {e}`")
+    if opts.watermark_text.strip():
+        lines.append(
+            f"• **Marca de agua:** `{opts.watermark_text}` ({_watermark_pos_label(opts.watermark_pos)})"
+        )
+    lines.append(
+        f"• **Envío:** `{'Documento' if opts.send_as_document else 'Video reproducible'}`"
+    )
+    lines.append("")
+    lines.append("ℹ️ *Si el resultado supera 2 GB, se entrega por cuenta Premium (4 GB) o enlace directo.*")
     return "\n".join(lines)
 
 
@@ -169,15 +192,23 @@ def build_main_config_keyboard(session_id: str, opts: CompressionOptions) -> Inl
                 InlineKeyboardButton("🎯 Tamaño Exacto (MB)", callback_data=f"cfg:{session_id}:target"),
             ],
             [
-                InlineKeyboardButton("🛠 Códec / Res / Vel", callback_data=f"cfg:{session_id}:advanced"),
+                InlineKeyboardButton("🛠 Códec / Res / 10-bit", callback_data=f"cfg:{session_id}:advanced"),
                 InlineKeyboardButton("🎧 Audio y Subtítulos", callback_data=f"cfg:{session_id}:tracks"),
             ],
             [
-                InlineKeyboardButton(doc_label, callback_data=f"cfg:{session_id}:toggle_doc"),
+                InlineKeyboardButton("✂️ Trim y Marca", callback_data=f"cfg:{session_id}:extras"),
+                InlineKeyboardButton("✏️ Renombrar", callback_data=f"cfg:{session_id}:rename"),
             ],
             [
+                InlineKeyboardButton(doc_label, callback_data=f"cfg:{session_id}:toggle_doc"),
+                InlineKeyboardButton("💾 Guardar Auto", callback_data=f"cfg:{session_id}:save_auto"),
+            ],
+            [
+                InlineKeyboardButton("🎞 Muestra 15s", callback_data=f"cfg:{session_id}:sample"),
                 InlineKeyboardButton("🚀 Iniciar Compresión", callback_data=f"cfg:{session_id}:start"),
-                InlineKeyboardButton("✖ Cancelar", callback_data=f"cfg:{session_id}:discard"),
+            ],
+            [
+                InlineKeyboardButton("✖ Descartar", callback_data=f"cfg:{session_id}:discard"),
             ],
         ]
     )
@@ -197,6 +228,7 @@ def build_presets_keyboard(session_id: str, current_key: str) -> InlineKeyboardM
 def build_advanced_keyboard(session_id: str, opts: CompressionOptions) -> InlineKeyboardMarkup:
     c265 = "✓ H.265 (HEVC)" if opts.codec == "libx265" else "H.265 (HEVC)"
     c264 = "✓ H.264 (AVC)" if opts.codec == "libx264" else "H.264 (AVC)"
+    bit_label = "🎨 Profundidad: 10-bit (Anime/Cine)" if opts.bit_depth == 10 else "🎨 Profundidad: 8-bit (Estándar)"
 
     def _res_btn(label: str, val: int | None) -> InlineKeyboardButton:
         mark = "✓ " if opts.max_height == val else ""
@@ -212,6 +244,9 @@ def build_advanced_keyboard(session_id: str, opts: CompressionOptions) -> Inline
             [
                 InlineKeyboardButton(c265, callback_data=f"cfg:{session_id}:codec:libx265"),
                 InlineKeyboardButton(c264, callback_data=f"cfg:{session_id}:codec:libx264"),
+            ],
+            [
+                InlineKeyboardButton(bit_label, callback_data=f"cfg:{session_id}:toggle_10bit"),
             ],
             [
                 _res_btn("Orig", None),
@@ -317,6 +352,18 @@ def build_tracks_keyboard(
         ]
     )
 
+    ext_row = [
+        InlineKeyboardButton(
+            "📎 Adjuntar .srt / .ass" if not opts.external_sub_name else f"📎 Cambiar ({opts.external_sub_name[:14]})",
+            callback_data=f"cfg:{session_id}:attach_sub",
+        )
+    ]
+    if opts.external_sub_name:
+        ext_row.append(
+            InlineKeyboardButton("🗑 Quitar externo", callback_data=f"cfg:{session_id}:clear_ext_sub")
+        )
+    rows.append(ext_row)
+
     if media and media.subtitle_tracks:
         for sub in media.subtitle_tracks[:6]:
             mark = "✓ " if opts.subtitle_track_idx == sub.rel_index else ""
@@ -339,6 +386,32 @@ def build_tracks_keyboard(
     )
     rows.append([InlineKeyboardButton("⬅ Volver", callback_data=f"cfg:{session_id}:main")])
     return InlineKeyboardMarkup(rows)
+
+
+def build_extras_keyboard(session_id: str, opts: CompressionOptions) -> InlineKeyboardMarkup:
+    def _pos_btn(pos: str, label: str) -> InlineKeyboardButton:
+        mark = "✓ " if opts.watermark_pos == pos else ""
+        return InlineKeyboardButton(f"{mark}{label}", callback_data=f"cfg:{session_id}:wmpos:{pos}")
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✂️ Fijar Recorte (Trim)", callback_data=f"cfg:{session_id}:set_trim"),
+                InlineKeyboardButton("♻ Quitar Recorte", callback_data=f"cfg:{session_id}:clear_trim"),
+            ],
+            [
+                InlineKeyboardButton("🏷 Texto Marca de Agua", callback_data=f"cfg:{session_id}:set_wm"),
+                InlineKeyboardButton("🗑 Quitar Marca", callback_data=f"cfg:{session_id}:clear_wm"),
+            ],
+            [
+                _pos_btn("tl", "↖ Arr-Izq"),
+                _pos_btn("tr", "↗ Arr-Der"),
+                _pos_btn("bl", "↙ Abj-Izq"),
+                _pos_btn("br", "↘ Abj-Der"),
+            ],
+            [InlineKeyboardButton("⬅ Volver", callback_data=f"cfg:{session_id}:main")],
+        ]
+    )
 
 
 def build_job_cancel_keyboard(job_id: str) -> InlineKeyboardMarkup:
@@ -370,6 +443,7 @@ def build_admin_keyboard(
     access_mode: str,
     concurrent_jobs: int,
     uploader: str,
+    error_alerts: bool = True,
 ) -> InlineKeyboardMarkup:
     mode_btn = (
         "🔒 Acceso: Solo Lista Blanca"
@@ -386,6 +460,7 @@ def build_admin_keyboard(
         "buzzheavier": "Buzzheavier",
         "direct_http": "Enlace Directo",
     }
+    alert_btn = "🔔 Alertas de error: ON" if error_alerts else "🔕 Alertas de error: OFF"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(mode_btn, callback_data="adm:toggle_access")],
@@ -395,6 +470,11 @@ def build_admin_keyboard(
                     f"🔗 Host >2 GB: {up_names.get(uploader, uploader)}",
                     callback_data="adm:cycle_uploader",
                 )
+            ],
+            [InlineKeyboardButton(alert_btn, callback_data="adm:toggle_alerts")],
+            [
+                InlineKeyboardButton("📄 Ver Logs", callback_data="adm:logs"),
+                InlineKeyboardButton("⬇ Bajar bot.log", callback_data="adm:logfile"),
             ],
             [
                 InlineKeyboardButton("👥 Ver Lista Blanca", callback_data="adm:users"),

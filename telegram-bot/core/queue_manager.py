@@ -32,6 +32,7 @@ from core.ffmpeg_engine import (
     compress_video,
     extract_thumbnail,
 )
+from core.fast_transfer import fast_download_media, fast_send_video_or_doc
 from core.media_probe import MediaInfo, probe_media
 from core.ui_helpers import (
     ProgressUpdater,
@@ -298,9 +299,33 @@ class QueueManager:
             )
             media: MediaInfo = await probe_media(input_path)
 
+            # 2b. Descargar subtítulo externo (.srt / .ass) si fue adjuntado
+            external_sub_path: Path | None = None
+            if job.options.external_sub_file_id:
+                sub_ext = Path(job.options.external_sub_name or "sub.srt").suffix.lower()
+                if sub_ext not in {".srt", ".ass", ".ssa", ".vtt"}:
+                    sub_ext = ".srt"
+                sub_dest = job_dir / f"ext_sub{sub_ext}"
+                dl_sub = await self.client.download_media(
+                    job.options.external_sub_file_id,
+                    file_name=str(sub_dest),
+                )
+                if dl_sub and Path(dl_sub).exists():
+                    external_sub_path = Path(dl_sub)
+
+            # Duración efectiva del clip (muestra 15s, recorte Trim o video completo)
+            if job.options.sample_duration and job.options.sample_duration > 0:
+                effective_dur = min(job.options.sample_duration, media.duration)
+            elif job.options.trim_start is not None or job.options.trim_end is not None:
+                t_start = max(0.0, job.options.trim_start or 0.0)
+                t_end = min(job.options.trim_end, media.duration) if job.options.trim_end else media.duration
+                effective_dur = max(1.0, t_end - t_start)
+            else:
+                effective_dur = media.duration
+
             # 3. Compresión FFmpeg aprovechando los hilos configurados
             threads = self.threads_per_job()
-            job.phase = "Comprimiendo"
+            job.phase = "Muestra 15s" if job.options.sample_duration else "Comprimiendo"
             encode_start = time.monotonic()
 
             async def _on_encode_progress(prog: EncodeProgress) -> None:
@@ -310,7 +335,7 @@ class QueueManager:
                     f"⚙️ **{prog.pass_label}** (`{threads} hilos`)\n"
                     f"`{progress_bar(prog.percent)}`\n"
                     f"• **Velocidad:** `{prog.speed}` · **FPS:** `{prog.fps:.1f}`\n"
-                    f"• **Procesado:** `{human_duration(prog.out_time_sec)} / {human_duration(media.duration)}`\n"
+                    f"• **Procesado:** `{human_duration(prog.out_time_sec)} / {human_duration(effective_dur)}`\n"
                     f"• **Tamaño parcial:** `{human_bytes(prog.current_size_bytes)}` · **ETA:** `{human_duration(eta)}`\n"
                     f"• **Trabajo:** `{job.job_id}` (Worker #{worker_num})"
                 )
@@ -327,12 +352,39 @@ class QueueManager:
                 cancel_event=job.cancel_event,
                 on_progress=_on_encode_progress,
                 register_proc=_reg_proc,
+                external_sub_path=external_sub_path,
             )
 
             output_size = output_path.stat().st_size
             out_media = await probe_media(output_path)
             elapsed_total = time.time() - (job.started_at or time.time())
             reduction_pct = ((input_size - output_size) / max(input_size, 1)) * 100.0
+
+            # 3b. Si es Muestra rápida de 15s, enviar con proyección de tamaño final y sin sumar a estadísticas
+            if job.options.sample_duration:
+                est_full_bytes = output_size * (media.duration / max(out_media.duration, 1.0))
+                bit_tag = " 10-bit" if (job.options.bit_depth == 10 and job.options.codec == "libx265") else ""
+                sample_caption = safe_caption(
+                    f"🎞 **Muestra rápida ({int(round(out_media.duration))}s) — Vista previa**\n"
+                    f"• **Peso muestra:** `{human_bytes(output_size)}` · **Estimado video completo:** `~{human_bytes(est_full_bytes)}` (orig: `{human_bytes(input_size)}`)\n"
+                    f"• **Calidad:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}{bit_tag}` · CRF `{job.options.crf}`\n"
+                    f"• **Tiempo:** `{human_duration(elapsed_total)}` *(Tu panel de configuración sigue abierto arriba)*"
+                )
+                await self._deliver_via_telegram(
+                    job=job,
+                    job_dir=job_dir,
+                    output_path=output_path,
+                    input_size=input_size,
+                    output_size=output_size,
+                    out_media=out_media,
+                    reduction_pct=reduction_pct,
+                    elapsed_total=elapsed_total,
+                    updater=updater,
+                    cancel_kb=cancel_kb,
+                    custom_caption=sample_caption,
+                    record_stats=False,
+                )
+                return
 
             # 4. Decisión inteligente de entrega:
             #    • ≤ 1.99 GB → Bot directo en Telegram
@@ -390,11 +442,25 @@ class QueueManager:
         except JobCancelledError:
             await updater.update(f"🛑 **Trabajo `{job.job_id}` cancelado.** Archivos temporales eliminados.", force=True)
         except Exception as exc:
-            logger.exception("Error procesando trabajo %s", job.job_id)
+            logger.exception("Error procesando trabajo %s (fase=%s, archivo=%s)", job.job_id, job.phase, job.filename)
+            logs_hint = "\n\n💡 *Usa `/logs` para ver el detalle completo en `data/bot.log`.*" if job.user_id == self.config.owner_id else ""
             await updater.update(
-                f"❌ **Error en el trabajo `{job.job_id}`**\n`{str(exc)[:600]}`",
+                f"❌ **Error en el trabajo `{job.job_id}`** (`{job.phase}`)\n`{str(exc)[:600]}`{logs_hint}",
                 force=True,
             )
+            # Alerta automática al dueño si falló el trabajo de otro usuario y las alertas están activas
+            if job.user_id != self.config.owner_id:
+                with contextlib.suppress(Exception):
+                    if await self.db.get_setting("error_alerts", "1") == "1":
+                        await self.client.send_message(
+                            self.config.owner_id,
+                            f"🚨 **Alerta de error en trabajo `{job.job_id}`**\n"
+                            f"• **Usuario:** `{job.user_id}`\n"
+                            f"• **Fase:** `{job.phase}`\n"
+                            f"• **Archivo:** `{job.filename[:60]}`\n"
+                            f"• **Detalle:** `{str(exc)[:400]}`\n\n"
+                            "Usa `/logs errors` o `/logs file` para ver el registro completo.",
+                        )
         finally:
             shutil.rmtree(job_dir, ignore_errors=True)
 
@@ -434,37 +500,38 @@ class QueueManager:
         thumb_path = await self._prepare_thumbnail(
             job.user_id, output_path, out_media.duration, job_dir
         )
+        orig_caption = (
+            safe_caption(job.source_message.caption)
+            if job.source_message and job.source_message.caption
+            else ""
+        )
         sign = "-" if reduction_pct >= 0 else "+"
-        caption = safe_caption(
+        bit_tag = " 10-bit" if (job.options.bit_depth == 10 and job.options.codec == "libx265") else ""
+        summary_msg = (
             f"✅ **Video comprimido (Entrega Premium >2 GB)**\n"
+            f"• **Archivo:** `{output_path.name[:80]}`\n"
             f"• **Original:** `{human_bytes(input_size)}` → **Final:** `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
-            f"• **Calidad:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}` · `{human_duration(out_media.duration)}`\n"
+            f"• **Calidad:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}{bit_tag}` · `{human_duration(out_media.duration)}`\n"
             f"• **Tiempo total:** `{human_duration(elapsed_total)}`"
         )
 
         target_peer: int | str = dump_chat_id if dump_chat_id != 0 else "me"
         send_as_doc = job.options.send_as_document or output_path.suffix.lower() == ".mkv"
 
-        if send_as_doc:
-            sent_msg = await self.user_session.client.send_document(
-                chat_id=target_peer,
-                document=str(output_path),
-                thumb=thumb_path,
-                caption=caption,
-                progress=_up_progress,
-            )
-        else:
-            sent_msg = await self.user_session.client.send_video(
-                chat_id=target_peer,
-                video=str(output_path),
-                duration=int(round(out_media.duration)),
-                width=out_media.width,
-                height=out_media.height,
-                thumb=thumb_path,
-                supports_streaming=True,
-                caption=caption,
-                progress=_up_progress,
-            )
+        sent_msg = await fast_send_video_or_doc(
+            client=self.user_session.client,
+            chat_id=target_peer,
+            file_path=output_path,
+            duration=int(round(out_media.duration)),
+            width=out_media.width,
+            height=out_media.height,
+            thumb_path=thumb_path,
+            caption=orig_caption,
+            send_as_doc=send_as_doc,
+            cancel_event=job.cancel_event,
+            on_progress=_up_progress,
+            workers=self.config.fast_transfer_workers,
+        )
 
         if dump_chat_id != 0:
             await self.client.copy_message(
@@ -474,10 +541,10 @@ class QueueManager:
             )
             with contextlib.suppress(Exception):
                 await job.status_message.delete()
+            await self.client.send_message(job.chat_id, summary_msg)
         else:
             await updater.update(
-                f"⭐ **Video de `{human_bytes(output_size)}` enviado a tus Mensajes Guardados**\n"
-                "*(Superó los 2 GB del bot, así que se entregó directamente con tu cuenta Premium vinculada.)*",
+                f"⭐ **Video de `{human_bytes(output_size)}` enviado a tus Mensajes Guardados**\n\n{summary_msg}",
                 force=True,
             )
 
@@ -521,14 +588,14 @@ class QueueManager:
         assert job.source_message is not None
         dest_dir = job_dir / "in"
         dest_dir.mkdir(parents=True, exist_ok=True)
-        downloaded = await self.client.download_media(
-            job.source_message,
-            file_name=str(dest_dir / job.filename),
-            progress=_dl_progress,
+        return await fast_download_media(
+            client=self.client,
+            message=job.source_message,
+            dest_path=dest_dir / job.filename,
+            cancel_event=job.cancel_event,
+            on_progress=_dl_progress,
+            workers=self.config.fast_transfer_workers,
         )
-        if not downloaded:
-            raise RuntimeError("No se pudo descargar el archivo desde Telegram.")
-        return Path(downloaded)
 
     async def _prepare_thumbnail(
         self,
@@ -562,6 +629,8 @@ class QueueManager:
         elapsed_total: float,
         updater: ProgressUpdater,
         cancel_kb,
+        custom_caption: str | None = None,
+        record_stats: bool = True,
     ) -> None:
         job.phase = "Subiendo a Telegram"
         up_start = time.monotonic()
@@ -585,39 +654,53 @@ class QueueManager:
             job.user_id, output_path, out_media.duration, job_dir
         )
 
-        sign = "-" if reduction_pct >= 0 else "+"
-        caption = safe_caption(
-            f"✅ **Video comprimido**\n"
-            f"• **Original:** `{human_bytes(input_size)}` → **Final:** `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
-            f"• **Calidad:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}` · `{human_duration(out_media.duration)}`\n"
-            f"• **Tiempo total:** `{human_duration(elapsed_total)}`"
+        # El video se envía limpio con su nombre original y su pie original (si tenía)
+        video_caption = (
+            ""
+            if job.options.sample_duration
+            else (
+                safe_caption(job.source_message.caption)
+                if job.source_message and job.source_message.caption
+                else ""
+            )
         )
 
-        send_as_doc = job.options.send_as_document or output_path.suffix.lower() == ".mkv"
-        if send_as_doc:
-            await self.client.send_document(
-                chat_id=job.chat_id,
-                document=str(output_path),
-                thumb=thumb_path,
-                caption=caption,
-                progress=_up_progress,
-            )
+        # La notificación con estadísticas va en un mensaje separado justo debajo del video
+        if custom_caption is not None:
+            summary_msg = custom_caption
         else:
-            await self.client.send_video(
-                chat_id=job.chat_id,
-                video=str(output_path),
-                duration=int(round(out_media.duration)),
-                width=out_media.width,
-                height=out_media.height,
-                thumb=thumb_path,
-                supports_streaming=True,
-                caption=caption,
-                progress=_up_progress,
+            sign = "-" if reduction_pct >= 0 else "+"
+            bit_tag = " 10-bit" if (job.options.bit_depth == 10 and job.options.codec == "libx265") else ""
+            summary_msg = (
+                f"✅ **Video comprimido**\n"
+                f"• **Archivo:** `{output_path.name[:80]}`\n"
+                f"• **Original:** `{human_bytes(input_size)}` → **Final:** `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
+                f"• **Calidad:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}{bit_tag}` · `{human_duration(out_media.duration)}`\n"
+                f"• **Tiempo total:** `{human_duration(elapsed_total)}`"
             )
 
-        await self.db.record_job_completion(input_size, output_size, delivered_via_link=False)
+        send_as_doc = job.options.send_as_document or output_path.suffix.lower() == ".mkv"
+        await fast_send_video_or_doc(
+            client=self.client,
+            chat_id=job.chat_id,
+            file_path=output_path,
+            duration=int(round(out_media.duration)),
+            width=out_media.width,
+            height=out_media.height,
+            thumb_path=thumb_path,
+            caption=video_caption,
+            send_as_doc=send_as_doc,
+            cancel_event=job.cancel_event,
+            on_progress=_up_progress,
+            workers=self.config.fast_transfer_workers,
+        )
+
+        if record_stats:
+            await self.db.record_job_completion(input_size, output_size, delivered_via_link=False)
         with contextlib.suppress(Exception):
             await job.status_message.delete()
+        with contextlib.suppress(Exception):
+            await self.client.send_message(job.chat_id, summary_msg)
 
     async def _deliver_via_link(
         self,
@@ -666,6 +749,9 @@ class QueueManager:
 
         # Guardar referencia para el botón rápido "Re-comprimir a 1.90 GB (para Telegram)"
         recomp_token = secrets.token_hex(6)
+        recomp_opts = job.options.clone()
+        recomp_opts.target_mb = 1900.0
+        recomp_opts.sample_duration = None
         self._recompress_sources[recomp_token] = RecompressSource(
             token=recomp_token,
             user_id=job.user_id,
@@ -674,19 +760,7 @@ class QueueManager:
             source_message_id=job.source_message.id if job.source_message else None,
             source_url=job.source_url,
             filename=job.filename,
-            base_options=CompressionOptions(
-                preset_key=job.options.preset_key,
-                codec=job.options.codec,
-                crf=job.options.crf,
-                speed=job.options.speed,
-                max_height=job.options.max_height,
-                audio_bitrate_k=job.options.audio_bitrate_k,
-                audio_mode=job.options.audio_mode,
-                subtitle_mode=job.options.subtitle_mode,
-                subtitle_track_idx=job.options.subtitle_track_idx,
-                target_mb=1900.0,
-                send_as_document=job.options.send_as_document,
-            ),
+            base_options=recomp_opts,
         )
 
         sign = "-" if reduction_pct >= 0 else "+"

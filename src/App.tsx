@@ -671,12 +671,17 @@ export default function App() {
                 </thead>
                 <tbody className="divide-y divide-[#1F2937] text-xs">
                   {[
-                    ['/start', 'Autorizados', 'Guía de uso: acepta videos hasta 2 GB y enlaces HTTP(S) directos'],
+                    ['/start', 'Autorizados', 'Guía de uso: videos hasta 2 GB, enlaces HTTP(S), Muestra 15s, 10-bit, Trim y subs externos'],
+                    ['/auto', 'Autorizados', 'Activar/desactivar Modo Lotes (encola videos automáticamente con tu ajuste guardado)'],
                     ['/queue', 'Autorizados', 'Ver trabajos comprimiendo, hilos activos y posición en espera'],
                     ['/setthumb', 'Autorizados', 'Responder a una foto para fijarla como miniatura personalizada'],
                     ['/delthumb', 'Autorizados', 'Volver a extracción automática de miniatura al 15% del video'],
+                    ['/setwatermark <txt>', 'Autorizados', 'Guardar una marca de agua fija en tus videos comprimidos'],
+                    ['/delwatermark', 'Autorizados', 'Eliminar tu marca de agua guardada'],
                     ['/stats', 'Autorizados', 'Total de videos comprimidos, enlaces >2 GB y espacio ahorrado'],
-                    ['/admin', 'Dueño', 'CPU/RAM/Disco en vivo, cuenta Telegram, lista blanca y concurrencia'],
+                    ['/admin', 'Dueño', 'CPU/RAM/Disco en vivo, alertas de error, logs, cuenta Telegram y concurrencia'],
+                    ['/logs [n|errors|file]', 'Dueño', 'Ver últimas líneas/errores o descargar el archivo data/bot.log'],
+                    ['/update', 'Dueño', 'Descargar la última versión desde GitHub y reiniciar automáticamente'],
                     ['/login', 'Dueño', 'Asistente seguro para iniciar sesión con tu cuenta Telegram (4 GB con Premium)'],
                     ['/logout', 'Dueño', 'Desconectar y eliminar la sesión de la cuenta Telegram'],
                     ['/setdump <id>', 'Dueño', 'Canal privado puente para entregar videos 2–4 GB (Premium) a cualquier usuario'],

@@ -1,4 +1,5 @@
-"""Motor de compresión de video con FFmpeg (CRF, 2-Pass Tamaño Exacto, Audio, Subtítulos).
+"""Motor de compresión FFmpeg: CRF, 2-Pass Exacto, 10-bit/Anime, Sample 15s,
+Trim, Marca de Agua (drawtext), Multi-Audio y Subtítulos internos/externos.
 
 Optimizado para 4 vCPUs (400% CPU) y ejecución segura sin shell=True.
 """
@@ -12,13 +13,14 @@ import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from core.media_probe import MediaInfo
 
 CodecName = Literal["libx265", "libx264"]
 SpeedPreset = Literal["ultrafast", "veryfast", "fast", "medium"]
 SubMode = Literal["none", "soft", "hard"]
+WatermarkPos = Literal["tl", "tr", "bl", "br"]
 
 
 @dataclass(slots=True)
@@ -30,6 +32,8 @@ class PresetDef:
     speed: SpeedPreset
     max_height: int | None  # None = resolución original
     audio_bitrate_k: int
+    bit_depth: Literal[8, 10] = 8
+    tune: str | None = None
 
 
 PRESETS: dict[str, PresetDef] = {
@@ -47,16 +51,27 @@ PRESETS: dict[str, PresetDef] = {
         title="Equilibrado (H.265 · 720p)",
         codec="libx265",
         crf=26,
-        speed="fast",
+        speed="veryfast",
         max_height=720,
         audio_bitrate_k=96,
+    ),
+    "anime_10bit": PresetDef(
+        key="anime_10bit",
+        title="Anime 10-bit (H.265 · 720p · 10-bit)",
+        codec="libx265",
+        crf=25,
+        speed="veryfast",
+        max_height=720,
+        audio_bitrate_k=96,
+        bit_depth=10,
+        tune="animation",
     ),
     "light": PresetDef(
         key="light",
         title="Ultra Ligero (H.265 · 480p)",
         codec="libx265",
         crf=30,
-        speed="fast",
+        speed="veryfast",
         max_height=480,
         audio_bitrate_k=64,
     ),
@@ -65,7 +80,7 @@ PRESETS: dict[str, PresetDef] = {
         title="Compatible (H.264 · 720p)",
         codec="libx264",
         crf=24,
-        speed="fast",
+        speed="veryfast",
         max_height=720,
         audio_bitrate_k=128,
     ),
@@ -86,16 +101,31 @@ class CompressionOptions:
     preset_key: str = "balanced"
     codec: CodecName = "libx265"
     crf: int = 26
-    speed: SpeedPreset = "fast"
+    speed: SpeedPreset = "veryfast"
     max_height: int | None = 720  # None = Original
+    bit_depth: Literal[8, 10] = 8
+    tune: str | None = None
     audio_bitrate_k: int = 96
     # Audio: "all" | "first" | "none" | "track:<rel_idx>"
     audio_mode: str = "first"
     # Subtítulos: "none" | "soft" | "hard"
     subtitle_mode: SubMode = "none"
-    subtitle_track_idx: int | None = None  # None = todas (en soft) o 0 (en hard)
-    # Si se define > 0, usa compresión 2-Pass a ese tamaño exacto en MiB
+    subtitle_track_idx: int | None = None
+    # Subtítulo externo (.srt / .ass) adjuntado por el usuario
+    external_sub_file_id: str | None = None
+    external_sub_name: str | None = None
+    # Tamaño exacto en MiB (2-Pass)
     target_mb: float | None = None
+    # Recorte (en segundos)
+    trim_start: float | None = None
+    trim_end: float | None = None
+    # Modo muestra rápida (ej. 15s del centro del video)
+    sample_duration: float | None = None
+    # Marca de agua discreta
+    watermark_text: str = ""
+    watermark_pos: WatermarkPos = "br"
+    # Renombrado personalizado del archivo final (sin extensión)
+    custom_output_name: str = ""
     send_as_document: bool = False
 
     def apply_preset(self, key: str) -> None:
@@ -108,7 +138,89 @@ class CompressionOptions:
         self.speed = preset.speed
         self.max_height = preset.max_height
         self.audio_bitrate_k = preset.audio_bitrate_k
+        self.bit_depth = preset.bit_depth
+        self.tune = preset.tune
         self.target_mb = None
+
+    def clone(self) -> CompressionOptions:
+        return CompressionOptions(
+            preset_key=self.preset_key,
+            codec=self.codec,
+            crf=self.crf,
+            speed=self.speed,
+            max_height=self.max_height,
+            bit_depth=self.bit_depth,
+            tune=self.tune,
+            audio_bitrate_k=self.audio_bitrate_k,
+            audio_mode=self.audio_mode,
+            subtitle_mode=self.subtitle_mode,
+            subtitle_track_idx=self.subtitle_track_idx,
+            external_sub_file_id=self.external_sub_file_id,
+            external_sub_name=self.external_sub_name,
+            target_mb=self.target_mb,
+            trim_start=self.trim_start,
+            trim_end=self.trim_end,
+            sample_duration=self.sample_duration,
+            watermark_text=self.watermark_text,
+            watermark_pos=self.watermark_pos,
+            custom_output_name=self.custom_output_name,
+            send_as_document=self.send_as_document,
+        )
+
+    def to_saved_dict(self) -> dict[str, Any]:
+        return {
+            "preset_key": self.preset_key,
+            "codec": self.codec,
+            "crf": self.crf,
+            "speed": self.speed,
+            "max_height": self.max_height,
+            "bit_depth": self.bit_depth,
+            "tune": self.tune,
+            "audio_bitrate_k": self.audio_bitrate_k,
+            "audio_mode": self.audio_mode,
+            "subtitle_mode": self.subtitle_mode,
+            "target_mb": self.target_mb,
+            "send_as_document": self.send_as_document,
+        }
+
+    @classmethod
+    def from_saved_dict(
+        cls,
+        data: dict[str, Any] | None,
+        watermark_text: str = "",
+        watermark_pos: str = "br",
+        send_as_document: bool = False,
+    ) -> CompressionOptions:
+        opts = cls(
+            watermark_text=watermark_text,
+            watermark_pos=watermark_pos if watermark_pos in {"tl", "tr", "bl", "br"} else "br",  # type: ignore[arg-type]
+            send_as_document=send_as_document,
+        )
+        if not data:
+            return opts
+        if data.get("preset_key") in PRESETS:
+            opts.preset_key = str(data["preset_key"])
+        if data.get("codec") in {"libx265", "libx264"}:
+            opts.codec = data["codec"]
+        if isinstance(data.get("crf"), int):
+            opts.crf = max(16, min(38, data["crf"]))
+        if data.get("speed") in {"ultrafast", "veryfast", "fast", "medium"}:
+            opts.speed = data["speed"]
+        mh = data.get("max_height")
+        opts.max_height = int(mh) if isinstance(mh, int) and mh > 0 else None
+        opts.bit_depth = 10 if data.get("bit_depth") == 10 else 8
+        opts.tune = str(data["tune"]) if data.get("tune") else None
+        if isinstance(data.get("audio_bitrate_k"), int):
+            opts.audio_bitrate_k = data["audio_bitrate_k"]
+        if isinstance(data.get("audio_mode"), str):
+            opts.audio_mode = data["audio_mode"]
+        if data.get("subtitle_mode") in {"none", "soft", "hard"}:
+            opts.subtitle_mode = data["subtitle_mode"]
+        if isinstance(data.get("target_mb"), (int, float)) and data["target_mb"] > 0:
+            opts.target_mb = float(data["target_mb"])
+        if isinstance(data.get("send_as_document"), bool):
+            opts.send_as_document = data["send_as_document"]
+        return opts
 
 
 @dataclass(slots=True)
@@ -128,9 +240,56 @@ class JobCancelledError(Exception):
     """Se lanza cuando el usuario o el administrador cancela un trabajo."""
 
 
-def _needs_mkv_container(media: MediaInfo, opts: CompressionOptions) -> bool:
-    """Usa MKV si se conservan softsubs de tipo mapa de bits (PGS/VOBSUB) o ASS."""
-    if opts.subtitle_mode != "soft" or not media.subtitle_tracks:
+def parse_timestamp(raw: str) -> float:
+    """Convierte 'HH:MM:SS', 'MM:SS' o segundos a float."""
+    token = raw.strip()
+    if ":" not in token:
+        val = float(token.replace(",", "."))
+        if val < 0:
+            raise ValueError("El tiempo no puede ser negativo.")
+        return val
+    parts = [float(p) for p in token.split(":")]
+    if len(parts) == 2:
+        return parts[0] * 60.0 + parts[1]
+    if len(parts) == 3:
+        return parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]
+    raise ValueError("Formato de tiempo inválido. Usa MM:SS o HH:MM:SS.")
+
+
+def _escape_drawtext(text: str) -> str:
+    """Escapa caracteres especiales para el filtro drawtext de FFmpeg."""
+    escaped = text.replace("\\", "\\\\")
+    escaped = escaped.replace(":", "\\:")
+    escaped = escaped.replace("'", "\\'")
+    escaped = escaped.replace("%", "\\%")
+    return escaped
+
+
+def _build_watermark_filter(text: str, pos: WatermarkPos) -> str:
+    safe_txt = _escape_drawtext(text.strip()[:48])
+    coords = {
+        "tl": "x=20:y=20",
+        "tr": "x=w-tw-20:y=20",
+        "bl": "x=20:y=h-th-20",
+        "br": "x=w-tw-20:y=h-th-20",
+    }[pos]
+    return (
+        f"drawtext=text='{safe_txt}':{coords}:"
+        "fontsize=max(16\\,h/34):fontcolor=white@0.68:"
+        "shadowcolor=black@0.75:shadowx=2:shadowy=2"
+    )
+
+
+def _needs_mkv_container(
+    media: MediaInfo,
+    opts: CompressionOptions,
+    external_sub_path: Path | None,
+) -> bool:
+    if opts.subtitle_mode != "soft":
+        return False
+    if external_sub_path is not None:
+        return external_sub_path.suffix.lower() in {".ass", ".ssa"}
+    if not media.subtitle_tracks:
         return False
     selected = (
         [t for t in media.subtitle_tracks if t.rel_index == opts.subtitle_track_idx]
@@ -148,10 +307,6 @@ def _compute_target_bitrates(
     duration_sec: float,
     audio_track_count: int,
 ) -> tuple[int, int]:
-    """Calcula (video_kbps, audio_kbps) para clavar un peso exacto en MiB.
-
-    Aplica factor 0.96 (4% de margen para sobrecarga de contenedor MP4/MKV).
-    """
     if duration_sec <= 0:
         raise ValueError("La duración del video es inválida para modo tamaño exacto.")
 
@@ -171,16 +326,17 @@ def _compute_target_bitrates(
 
     video_kbps = int(total_kbps - (audio_kbps * max(audio_track_count, 0)))
 
-    # Si con varias pistas de audio no alcanza, bajar audio a 48k
     if video_kbps < 100 and audio_track_count > 0:
         audio_kbps = 48
         video_kbps = int(total_kbps - (audio_kbps * audio_track_count))
 
     if video_kbps < 90:
-        min_viable_mb = math.ceil(((100 + audio_kbps * audio_track_count) * duration_sec) / (8192.0 * 0.96))
+        min_viable_mb = math.ceil(
+            ((100 + audio_kbps * audio_track_count) * duration_sec) / (8192.0 * 0.96)
+        )
         raise ValueError(
-            f"El tamaño objetivo ({target_mb:.1f} MB) es demasiado pequeño para un video de "
-            f"{int(duration_sec)}s. Prueba al menos {max(min_viable_mb, 2)} MB."
+            f"El tamaño objetivo ({target_mb:.1f} MB) es demasiado pequeño para {int(duration_sec)}s. "
+            f"Prueba al menos {max(min_viable_mb, 2)} MB."
         )
 
     return video_kbps, audio_kbps
@@ -213,7 +369,6 @@ async def extract_thumbnail(
     thumb_path: Path,
     duration_sec: float,
 ) -> Path | None:
-    """Extrae una miniatura limpia al 15% del video (máx 320px de ancho)."""
     seek_sec = max(1.0, min(duration_sec * 0.15, max(duration_sec - 1.0, 1.0)))
     cmd = [
         "ffmpeg",
@@ -247,7 +402,6 @@ async def _extract_subtitle_for_burn(
     rel_sub_index: int,
     codec: str,
 ) -> Path:
-    """Extrae la pista de subtítulos a un archivo con nombre seguro para hardsub."""
     ext = "ass" if codec in {"ass", "ssa"} else "srt"
     sub_file = work_dir / f"burn_sub.{ext}"
     out_codec = "ass" if ext == "ass" else "srt"
@@ -377,7 +531,7 @@ async def _run_ffmpeg_pass(
 
         if proc.returncode != 0:
             tail = "\n".join(stderr_lines[-8:])
-            raise RuntimeError(f"FFmpeg falló ({pass_label}, código {proc.returncode}): {tail[:400]}")
+            raise RuntimeError(f"FFmpeg falló ({pass_label}, código {proc.returncode}): {tail[:450]}")
     finally:
         register_proc(None)
         if not stderr_task.done():
@@ -394,41 +548,83 @@ async def compress_video(
     cancel_event: asyncio.Event,
     on_progress: ProgressCallback | None = None,
     register_proc: Callable[[asyncio.subprocess.Process | None], None] | None = None,
+    external_sub_path: Path | None = None,
 ) -> Path:
-    """Comprime el video según opciones (CRF o 2-Pass Exacto) y devuelve la ruta final."""
+    """Comprime el video según todas las opciones configuradas y devuelve la ruta final."""
     reg = register_proc or (lambda _p: None)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    use_mkv = _needs_mkv_container(media, opts)
+    use_mkv = _needs_mkv_container(media, opts, external_sub_path)
     ext = "mkv" if use_mkv else "mp4"
-    stem = media.path.stem[:60].strip() or "video"
-    # Limpiar caracteres problemáticos en nombre de salida
-    safe_stem = "".join(c if c.isalnum() or c in " -_." else "_" for c in stem).strip(" .")
-    output_path = output_dir / f"{safe_stem or 'video'}_compressed.{ext}"
 
-    # ── Construir cadena de filtros de video (-vf) ────────────────────────────
+    raw_stem = opts.custom_output_name.strip() or media.path.stem[:140].strip() or "video"
+    safe_stem = "".join(
+        "_" if c in "/\\\0\r\n\t" or ord(c) < 32 else c for c in raw_stem
+    ).strip(" .")
+    suffix = "_sample15s" if opts.sample_duration else ""
+    output_path = output_dir / f"{safe_stem or 'video'}{suffix}.{ext}"
+
+    # ── Recorte (Trim) o Muestra rápida de 15s (Sample) ───────────────────────
+    seek_args: list[str] = []
+    dur_args: list[str] = []
+    effective_duration = media.duration
+
+    if opts.sample_duration and opts.sample_duration > 0:
+        sample_len = min(opts.sample_duration, media.duration)
+        start_sec = max(0.0, min(media.duration * 0.40, max(media.duration - sample_len, 0.0)))
+        seek_args = ["-ss", f"{start_sec:.2f}"]
+        dur_args = ["-t", f"{sample_len:.2f}"]
+        effective_duration = max(1.0, sample_len)
+    elif opts.trim_start is not None or opts.trim_end is not None:
+        start_sec = max(0.0, min(opts.trim_start or 0.0, max(media.duration - 1.0, 0.0)))
+        end_sec = min(opts.trim_end, media.duration) if opts.trim_end else media.duration
+        if end_sec <= start_sec:
+            raise ValueError("El tiempo final del recorte debe ser mayor que el tiempo inicial.")
+        clip_dur = end_sec - start_sec
+        if start_sec > 0:
+            seek_args = ["-ss", f"{start_sec:.2f}"]
+        dur_args = ["-t", f"{clip_dur:.2f}"]
+        effective_duration = max(1.0, clip_dur)
+
+    # ── Entradas FFmpeg (video + posible subtítulo externo) ───────────────────
+    input_args: list[str] = [*seek_args, "-i", str(media.path)]
+    ext_sub_local: Path | None = None
+    if external_sub_path is not None and external_sub_path.exists():
+        ext_suffix = external_sub_path.suffix.lower() or ".srt"
+        ext_sub_local = output_dir / f"ext_sub{ext_suffix}"
+        if external_sub_path.resolve() != ext_sub_local.resolve():
+            ext_sub_local.write_bytes(external_sub_path.read_bytes())
+        if opts.subtitle_mode == "soft":
+            input_args.extend(["-i", str(ext_sub_local)])
+
+    # ── Cadena de filtros de video (-vf) ──────────────────────────────────────
     vf_parts: list[str] = []
     if opts.max_height is not None and media.height > opts.max_height:
-        # Escala manteniendo proporción y garantizando dimensiones pares (requisito yuv420p)
         vf_parts.append(f"scale=-2:{opts.max_height}:flags=lanczos")
     else:
-        # Garantizar dimensiones pares incluso sin reescalar
         vf_parts.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
 
-    burn_sub_file: Path | None = None
-    if opts.subtitle_mode == "hard" and media.subtitle_tracks:
-        sub_idx = opts.subtitle_track_idx if opts.subtitle_track_idx is not None else 0
-        sub_track = next((t for t in media.subtitle_tracks if t.rel_index == sub_idx), media.subtitle_tracks[0])
-        if sub_track.is_bitmap:
-            raise ValueError(
-                "La pista de subtítulos seleccionada es de imagen (PGS/VOBSUB) y no puede quemarse como texto. "
-                "Elige modo Softsub (MKV) o selecciona una pista de texto (SRT/ASS)."
+    if opts.subtitle_mode == "hard":
+        if ext_sub_local is not None:
+            vf_parts.append(f"subtitles={ext_sub_local.name}")
+        elif media.subtitle_tracks:
+            sub_idx = opts.subtitle_track_idx if opts.subtitle_track_idx is not None else 0
+            sub_track = next(
+                (t for t in media.subtitle_tracks if t.rel_index == sub_idx),
+                media.subtitle_tracks[0],
             )
-        burn_sub_file = await _extract_subtitle_for_burn(
-            media.path, output_dir, sub_track.rel_index, sub_track.codec
-        )
-        # Nombre relativo simple dentro de output_dir (sin problemas de escape)
-        vf_parts.append(f"subtitles={burn_sub_file.name}")
+            if sub_track.is_bitmap:
+                raise ValueError(
+                    "La pista de subtítulos seleccionada es de imagen (PGS/VOBSUB) y no puede quemarse. "
+                    "Elige modo Softsub (MKV) o adjunta un archivo .srt/.ass."
+                )
+            burn_sub_file = await _extract_subtitle_for_burn(
+                media.path, output_dir, sub_track.rel_index, sub_track.codec
+            )
+            vf_parts.append(f"subtitles={burn_sub_file.name}")
+
+    if opts.watermark_text.strip():
+        vf_parts.append(_build_watermark_filter(opts.watermark_text, opts.watermark_pos))
 
     vf_filter = ",".join(vf_parts)
 
@@ -446,41 +642,52 @@ async def compress_video(
             map_args.extend(["-map", "0:a:0?"])
 
     sub_args: list[str] = []
-    if opts.subtitle_mode == "soft" and media.subtitle_tracks:
-        if opts.subtitle_track_idx is not None:
-            map_args.extend(["-map", f"0:s:{opts.subtitle_track_idx}?"])
+    if opts.subtitle_mode == "soft":
+        if ext_sub_local is not None:
+            map_args.extend(["-map", "1:0"])
+            sub_args.extend(["-c:s", "copy" if use_mkv else "mov_text"])
+        elif media.subtitle_tracks:
+            if opts.subtitle_track_idx is not None:
+                map_args.extend(["-map", f"0:s:{opts.subtitle_track_idx}?"])
+            else:
+                map_args.extend(["-map", "0:s?"])
+            sub_args.extend(["-c:s", "copy" if use_mkv else "mov_text"])
         else:
-            map_args.extend(["-map", "0:s?"])
-        sub_args.extend(["-c:s", "copy" if use_mkv else "mov_text"])
+            sub_args.append("-sn")
     else:
         sub_args.append("-sn")
 
-    # ── Parámetros de códec y optimización de hilos (400% CPU) ────────────────
+    # ── Códec, 8-bit vs 10-bit y optimización de 4 hilos ──────────────────────
+    pix_fmt = "yuv420p10le" if (opts.bit_depth == 10 and opts.codec == "libx265") else "yuv420p"
     codec_base: list[str] = [
         "-c:v",
         opts.codec,
         "-preset",
         opts.speed,
         "-pix_fmt",
-        "yuv420p",
+        pix_fmt,
         "-threads",
         str(max(1, threads)),
     ]
+    if opts.tune:
+        codec_base.extend(["-tune", opts.tune])
 
     def _x265_extra(extra_pairs: list[str] | None = None) -> list[str]:
         if opts.codec != "libx265":
             return []
         params = [f"pools={max(1, threads)}", "log-level=error"]
+        if opts.bit_depth == 10:
+            params.append("profile=main10")
         if extra_pairs:
             params.extend(extra_pairs)
         return ["-x265-params", ":".join(params), "-tag:v", "hvc1"]
 
     container_flags = ["-movflags", "+faststart"] if not use_mkv else []
 
-    # ── MODO A: 2-Pass Tamaño Exacto en MB ────────────────────────────────────
-    if opts.target_mb is not None and opts.target_mb > 0:
+    # ── MODO A: 2-Pass Tamaño Exacto en MB (no se aplica en Sample 15s) ───────
+    if opts.target_mb is not None and opts.target_mb > 0 and not opts.sample_duration:
         video_kbps, audio_kbps = _compute_target_bitrates(
-            opts.target_mb, media.duration, audio_count
+            opts.target_mb, effective_duration, audio_count
         )
         passlog_prefix = str(output_dir / "ffmpeg2pass")
         null_sink = "NUL" if os.name == "nt" else "/dev/null"
@@ -493,8 +700,10 @@ async def compress_video(
             "error",
             "-progress",
             "pipe:1",
+            *seek_args,
             "-i",
             str(media.path),
+            *dur_args,
             "-map",
             "0:v:0",
             "-vf",
@@ -507,7 +716,7 @@ async def compress_video(
             "-bufsize",
             f"{int(video_kbps * 2.0)}k",
             *(
-                _x265_extra([f"pass=1", f"stats={passlog_prefix}.log"])
+                _x265_extra(["pass=1", f"stats={passlog_prefix}.log"])
                 if opts.codec == "libx265"
                 else ["-pass", "1", "-passlogfile", passlog_prefix]
             ),
@@ -521,7 +730,7 @@ async def compress_video(
         await _run_ffmpeg_pass(
             cmd=pass1_cmd,
             cwd=output_dir,
-            duration_sec=media.duration,
+            duration_sec=effective_duration,
             pass_label="Pase 1/2 (Análisis)",
             progress_offset=0.0,
             progress_weight=0.45,
@@ -544,8 +753,8 @@ async def compress_video(
             "error",
             "-progress",
             "pipe:1",
-            "-i",
-            str(media.path),
+            *input_args,
+            *dur_args,
             *map_args,
             "-vf",
             vf_filter,
@@ -557,7 +766,7 @@ async def compress_video(
             "-bufsize",
             f"{int(video_kbps * 2.0)}k",
             *(
-                _x265_extra([f"pass=2", f"stats={passlog_prefix}.log"])
+                _x265_extra(["pass=2", f"stats={passlog_prefix}.log"])
                 if opts.codec == "libx265"
                 else ["-pass", "2", "-passlogfile", passlog_prefix]
             ),
@@ -570,7 +779,7 @@ async def compress_video(
         await _run_ffmpeg_pass(
             cmd=pass2_cmd,
             cwd=output_dir,
-            duration_sec=media.duration,
+            duration_sec=effective_duration,
             pass_label=f"Pase 2/2 (Objetivo {opts.target_mb:.0f} MB)",
             progress_offset=45.0,
             progress_weight=0.55,
@@ -580,12 +789,15 @@ async def compress_video(
         )
         return output_path
 
-    # ── MODO B: CRF Inteligente (Calidad Constante) ───────────────────────────
+    # ── MODO B: CRF Inteligente (o Muestra 15s) ───────────────────────────────
     audio_args = (
         ["-c:a", "aac", "-b:a", f"{opts.audio_bitrate_k}k", "-ac", "2"]
         if audio_count > 0
         else ["-an"]
     )
+
+    bit_tag = " 10-bit" if (opts.bit_depth == 10 and opts.codec == "libx265") else ""
+    label_prefix = "Muestra 15s" if opts.sample_duration else "Codificando"
 
     crf_cmd = [
         "ffmpeg",
@@ -595,8 +807,8 @@ async def compress_video(
         "error",
         "-progress",
         "pipe:1",
-        "-i",
-        str(media.path),
+        *input_args,
+        *dur_args,
         *map_args,
         "-vf",
         vf_filter,
@@ -613,8 +825,8 @@ async def compress_video(
     await _run_ffmpeg_pass(
         cmd=crf_cmd,
         cwd=output_dir,
-        duration_sec=media.duration,
-        pass_label=f"Codificando ({opts.codec.replace('lib', '').upper()} CRF {opts.crf})",
+        duration_sec=effective_duration,
+        pass_label=f"{label_prefix} ({opts.codec.replace('lib', '').upper()}{bit_tag} CRF {opts.crf})",
         progress_offset=0.0,
         progress_weight=1.0,
         cancel_event=cancel_event,

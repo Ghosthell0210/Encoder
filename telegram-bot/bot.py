@@ -24,6 +24,7 @@ from config import BotConfig
 from core.console_commands import console_command_loop
 from core.database import Database
 from core.ffmpeg_bootstrap import ensure_ffmpeg
+from core.logger_setup import setup_logging
 from core.queue_manager import QueueManager
 from core.uploader import DirectLinkStore
 from core.user_session import UserSessionManager
@@ -58,6 +59,8 @@ def _clean_startup_temps(config: BotConfig) -> None:
 
 async def main() -> None:
     config = BotConfig.from_env()
+    log_file = setup_logging(config.data_dir / "bot.log")
+    logger.info("Registro rotativo activo en: %s", log_file)
 
     # Instala ffmpeg y ffprobe estáticos en ./bin sin root si el Egg no los trae
     ensure_ffmpeg(config.bin_dir)
@@ -90,7 +93,7 @@ async def main() -> None:
         api_hash=config.api_hash,
         bot_token=config.bot_token,
         workers=16,
-        max_concurrent_transmissions=4,
+        max_concurrent_transmissions=16,
     )
 
     queue_mgr = QueueManager(
@@ -119,7 +122,9 @@ async def main() -> None:
         user_session.status_label(),
     )
 
-    console_task = asyncio.create_task(console_command_loop(db, queue_mgr, user_session))
+    console_task = asyncio.create_task(
+        console_command_loop(db, queue_mgr, user_session, log_file=log_file)
+    )
 
     try:
         await idle()

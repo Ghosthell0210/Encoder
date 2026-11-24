@@ -12,8 +12,10 @@ import readmeMd from '../../telegram-bot/README.md?raw';
 import coreInitPy from '../../telegram-bot/core/__init__.py?raw';
 import consoleCommandsPy from '../../telegram-bot/core/console_commands.py?raw';
 import databasePy from '../../telegram-bot/core/database.py?raw';
+import fastTransferPy from '../../telegram-bot/core/fast_transfer.py?raw';
 import ffmpegBootstrapPy from '../../telegram-bot/core/ffmpeg_bootstrap.py?raw';
 import gitUpdaterPy from '../../telegram-bot/core/git_updater.py?raw';
+import loggerSetupPy from '../../telegram-bot/core/logger_setup.py?raw';
 import mediaProbePy from '../../telegram-bot/core/media_probe.py?raw';
 import ffmpegEnginePy from '../../telegram-bot/core/ffmpeg_engine.py?raw';
 import uploaderPy from '../../telegram-bot/core/uploader.py?raw';
@@ -138,6 +140,12 @@ export const BOT_FILES: BotFileItem[] = [
     consoleCommandsPy,
   ),
   makeFile(
+    'core/fast_transfer.py',
+    'core/',
+    'Motor legal de descarga/subida paralela MTProto (múltiples conexiones media 20–60+ MB/s)',
+    fastTransferPy,
+  ),
+  makeFile(
     'core/ffmpeg_bootstrap.py',
     'core/',
     'Descarga automática sin root de ffmpeg y ffprobe estáticos para Egg Python Generic',
@@ -150,9 +158,15 @@ export const BOT_FILES: BotFileItem[] = [
     gitUpdaterPy,
   ),
   makeFile(
+    'core/logger_setup.py',
+    'core/',
+    'Logging rotativo en data/bot.log (5 MiB × 3) y lector rápido de errores para /logs',
+    loggerSetupPy,
+  ),
+  makeFile(
     'core/ffmpeg_engine.py',
     'core/',
-    'Motor FFmpeg H.265/H.264, 2-Pass exacto en MB, multi-audio, softsub/hardsub y miniatura',
+    'Motor FFmpeg H.265/H.264, 10-bit/Anime, Muestra 15s, Trim, Marca de Agua, 2-Pass y subtítulos',
     ffmpegEnginePy,
   ),
   makeFile(

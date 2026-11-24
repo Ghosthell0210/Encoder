@@ -102,6 +102,7 @@ class BotConfig:
     max_disk_gb: float = 30.0
     disk_reserve_gb: float = 2.0
     max_concurrent_jobs: int = 1
+    fast_transfer_workers: int = 10
 
     # Acceso inicial (private = solo dueño + lista blanca | public = abierto)
     default_access_mode: str = "private"
@@ -194,6 +195,7 @@ class BotConfig:
             max_disk_gb=max(5.0, _env_float("MAX_DISK_GB", 30.0)),
             disk_reserve_gb=max(0.5, _env_float("DISK_RESERVE_GB", 2.0)),
             max_concurrent_jobs=max_concurrent,
+            fast_transfer_workers=max(2, min(16, _env_int("FAST_TRANSFER_WORKERS", 10))),
             default_access_mode=access_mode,
             large_file_uploader=uploader,
             gofile_token=_env_str("GOFILE_TOKEN"),

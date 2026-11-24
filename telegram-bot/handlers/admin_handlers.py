@@ -1,10 +1,10 @@
-"""Panel de administración /admin, /login de cuenta Telegram y lista blanca."""
+"""Panel de administración /admin, /logs, /login de cuenta Telegram y lista blanca."""
 
 from __future__ import annotations
 
 import contextlib
-from pathlib import Path
 import shutil
+from pathlib import Path
 
 import psutil
 from hydrogram import Client, filters
@@ -13,9 +13,17 @@ from hydrogram.types import CallbackQuery, Message
 from config import BotConfig
 from core.database import Database
 from core.git_updater import pull_from_github, restart_process
+from core.logger_setup import read_last_log_lines
 from core.queue_manager import QueueManager, dir_size_bytes
 from core.ui_helpers import build_admin_keyboard, human_bytes
 from core.user_session import UserSessionManager
+
+
+def _format_log_block(title: str, content: str) -> str:
+    # Limitar a ~3700 chars para respetar el máximo de 4096 de Telegram
+    body = content[-3600:] if len(content) > 3600 else content
+    body = body.replace("```", "'''")
+    return f"📄 **{title}**\n```\n{body}\n```"
 
 
 def register_admin_handlers(
@@ -25,15 +33,18 @@ def register_admin_handlers(
     queue_mgr: QueueManager,
     user_session: UserSessionManager,
 ) -> None:
+    log_file = config.data_dir / "bot.log"
+
     def _is_owner(user_id: int | None) -> bool:
         return user_id == config.owner_id
 
-    async def _render_admin_text() -> tuple[str, str, int, str]:
+    async def _render_admin_text() -> tuple[str, str, int, str, bool]:
         settings = await db.get_all_settings()
         access_mode = settings.get("access_mode", config.default_access_mode)
         conc = queue_mgr.concurrency_limit
         uploader = settings.get("large_file_uploader", config.large_file_uploader)
         dump_id = settings.get("dump_chat_id", str(config.dump_chat_id or ""))
+        error_alerts = settings.get("error_alerts", "1") == "1"
         stats = await db.get_stats()
         users = await db.list_users()
         active, pending = queue_mgr.get_queue_snapshot()
@@ -49,6 +60,7 @@ def register_admin_handlers(
         disk_budget_bytes = int(config.max_disk_gb * (1024**3))
         threads_each = queue_mgr.threads_per_job()
         dump_label = dump_id if dump_id and dump_id != "0" else "Mensajes Guardados (dueño)"
+        log_size = human_bytes(log_file.stat().st_size) if log_file.exists() else "0 B"
 
         text = (
             "🛡 **Panel de Administración (panel.plugged.host)**\n\n"
@@ -62,26 +74,60 @@ def register_admin_handlers(
             f"• **Canal puente (2–4 GB):** `{dump_label}`\n"
             f"• **Cola:** `{len(active)}/{conc}` activos · `{len(pending)}` en espera\n"
             f"• **Acceso:** `{'Solo Lista Blanca' if access_mode == 'private' else 'Público'}` (`{len(users)}` usuarios)\n"
-            f"• **Proveedor >2 GB:** `{uploader}`\n\n"
+            f"• **Proveedor >2 GB:** `{uploader}`\n"
+            f"• **Log (`data/bot.log`):** `{log_size}` · **Alertas:** `{'ON' if error_alerts else 'OFF'}`\n\n"
             "📊 **Acumulado:**\n"
             f"• **Videos:** `{stats.total_jobs}` · **Enlaces >2 GB:** `{stats.total_link_deliveries}`\n"
             f"• **Ahorro total:** `{human_bytes(stats.total_saved_bytes)}`\n\n"
             "**Comandos de dueño:**\n"
-            "`/login` · `/logout` · `/setdump <id>` · `/update`\n"
+            "`/logs [n|errors|file]` · `/update` · `/login` · `/logout` · `/setdump <id>`\n"
             "`/adduser <id>` · `/deluser <id>` · `/users` · `/purge` · `/cancelall`"
         )
-        return text, access_mode, conc, uploader
+        return text, access_mode, conc, uploader, error_alerts
 
     @app.on_message(filters.private & filters.command("admin"))
     async def cmd_admin(_client: Client, message: Message) -> None:
         if not message.from_user or not _is_owner(message.from_user.id):
             await message.reply_text("⛔ Comando exclusivo del administrador.")
             return
-        text, access_mode, conc, uploader = await _render_admin_text()
+        text, access_mode, conc, uploader, error_alerts = await _render_admin_text()
         await message.reply_text(
             text,
-            reply_markup=build_admin_keyboard(access_mode, conc, uploader),
+            reply_markup=build_admin_keyboard(access_mode, conc, uploader, error_alerts=error_alerts),
         )
+
+    # ── Visor y descarga de logs (/logs [n|errors|file]) ──────────────────────
+
+    @app.on_message(filters.private & filters.command("logs"))
+    async def cmd_logs(_client: Client, message: Message) -> None:
+        if not message.from_user or not _is_owner(message.from_user.id):
+            await message.reply_text("⛔ Comando exclusivo del administrador.")
+            return
+
+        parts = message.text.split()
+        arg = parts[1].lower() if len(parts) > 1 else ""
+
+        if arg in {"file", "archivo", "doc"}:
+            if not log_file.exists():
+                await message.reply_text("ℹ️ Todavía no se ha generado `data/bot.log`.")
+                return
+            await message.reply_document(
+                document=str(log_file),
+                caption=f"📄 Registro completo del bot (`{human_bytes(log_file.stat().st_size)}`)",
+            )
+            return
+
+        if arg in {"errors", "error", "err"}:
+            content = read_last_log_lines(log_file, lines=40, errors_only=True)
+            await message.reply_text(_format_log_block("Últimos errores y avisos (bot.log)", content))
+            return
+
+        num_lines = 35
+        if arg.isdigit():
+            num_lines = max(5, min(120, int(arg)))
+
+        content = read_last_log_lines(log_file, lines=num_lines, errors_only=False)
+        await message.reply_text(_format_log_block(f"Últimas {num_lines} líneas (bot.log)", content))
 
     # ── Inicio de sesión de cuenta Telegram (/login, /logout, /setdump) ──────
 
@@ -237,6 +283,29 @@ def register_admin_handlers(
             await db.set_setting("large_file_uploader", nxt)
             await query.answer(f"Proveedor >2 GB: {nxt}")
 
+        elif action == "toggle_alerts":
+            cur = await db.get_setting("error_alerts", "1")
+            nxt = "0" if cur == "1" else "1"
+            await db.set_setting("error_alerts", nxt)
+            await query.answer(f"Alertas de error: {'ON' if nxt == '1' else 'OFF'}")
+
+        elif action == "logs":
+            await query.answer("Cargando logs...")
+            content = read_last_log_lines(log_file, lines=35, errors_only=False)
+            await query.message.reply_text(_format_log_block("Últimas 35 líneas (bot.log)", content))
+            return
+
+        elif action == "logfile":
+            if not log_file.exists():
+                await query.answer("Todavía no existe data/bot.log", show_alert=True)
+                return
+            await query.answer("Enviando bot.log...")
+            await query.message.reply_document(
+                document=str(log_file),
+                caption=f"📄 Registro completo (`{human_bytes(log_file.stat().st_size)}`)",
+            )
+            return
+
         elif action == "purge":
             removed = queue_mgr.purge_inactive_temp()
             await query.answer(f"Limpiados {removed} temporales", show_alert=True)
@@ -254,9 +323,9 @@ def register_admin_handlers(
         elif action == "refresh":
             await query.answer("Métricas actualizadas")
 
-        text, access_mode, conc, uploader = await _render_admin_text()
+        text, access_mode, conc, uploader, error_alerts = await _render_admin_text()
         with contextlib.suppress(Exception):
             await query.message.edit_text(
                 text,
-                reply_markup=build_admin_keyboard(access_mode, conc, uploader),
+                reply_markup=build_admin_keyboard(access_mode, conc, uploader, error_alerts=error_alerts),
             )

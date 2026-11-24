@@ -1,4 +1,5 @@
-"""Manejadores de usuario: recepción de videos/enlaces, menús inline, cola y miniaturas."""
+"""Manejadores de usuario: recepción de videos/enlaces, menús inline, Modo Lotes (/auto),
+Muestra 15s, subtítulos externos (.srt/.ass), 10-bit, Trim, Marca de Agua y Renombrado."""
 
 from __future__ import annotations
 
@@ -15,11 +16,12 @@ from hydrogram.types import CallbackQuery, Message
 
 from config import BotConfig
 from core.database import Database
-from core.ffmpeg_engine import CompressionOptions
+from core.ffmpeg_engine import CompressionOptions, parse_timestamp
 from core.media_probe import MediaInfo
 from core.queue_manager import CompressionJob, QueueManager
 from core.ui_helpers import (
     build_advanced_keyboard,
+    build_extras_keyboard,
     build_job_cancel_keyboard,
     build_main_config_keyboard,
     build_presets_keyboard,
@@ -32,6 +34,7 @@ from core.ui_helpers import (
 from core.user_session import UserSessionManager
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".flv", ".ts", ".wmv"}
+SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 URL_REGEX = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
 
@@ -64,6 +67,22 @@ def _is_video_document(message: Message) -> bool:
     return Path(name).suffix in VIDEO_EXTENSIONS
 
 
+def _is_subtitle_document(message: Message) -> bool:
+    doc = message.document
+    if not doc:
+        return False
+    name = (doc.file_name or "").lower()
+    return Path(name).suffix in SUBTITLE_EXTENSIONS
+
+
+def _format_saved_preset_line(opts: CompressionOptions) -> str:
+    bit = " 10-bit" if (opts.bit_depth == 10 and opts.codec == "libx265") else ""
+    codec = f"H.265{bit}" if opts.codec == "libx265" else "H.264"
+    res = f"{opts.max_height}p" if opts.max_height else "Original"
+    mode = f"2-Pass {opts.target_mb:.0f} MB" if opts.target_mb else f"CRF {opts.crf} ({opts.speed})"
+    return f"`{codec}` · `{res}` · `{mode}` · Audio `{opts.audio_bitrate_k}k`"
+
+
 def register_user_handlers(
     app: Client,
     config: BotConfig,
@@ -72,7 +91,8 @@ def register_user_handlers(
     user_session: UserSessionManager,
 ) -> None:
     sessions: dict[str, DraftSession] = {}
-    awaiting_custom_mb: dict[int, str] = {}  # user_id -> session_id
+    # user_id -> (session_id, mode) donde mode ∈ {"custom_mb", "rename", "trim", "watermark", "attach_sub"}
+    awaiting_input: dict[int, tuple[str, str]] = {}
 
     def _cleanup_old_sessions() -> None:
         now = time.time()
@@ -95,6 +115,55 @@ def register_user_handlers(
         )
         return False
 
+    async def _load_user_options(user_id: int) -> tuple[CompressionOptions, bool]:
+        user_rec = await db.get_user(user_id)
+        saved_dict = await db.get_default_options(user_id)
+        opts = CompressionOptions.from_saved_dict(
+            saved_dict,
+            watermark_text=user_rec.watermark_text if user_rec else "",
+            watermark_pos=user_rec.watermark_pos if user_rec else "br",
+            send_as_document=user_rec.send_as_document if user_rec else False,
+        )
+        auto_mode = bool(user_rec.auto_mode) if user_rec else False
+        return opts, auto_mode
+
+    async def _enqueue_auto_job(
+        message: Message,
+        user_id: int,
+        filename: str,
+        file_size: int | None,
+        opts: CompressionOptions,
+        source_message: Message | None = None,
+        source_url: str | None = None,
+    ) -> None:
+        job_id = secrets.token_hex(4)
+        status_msg = await message.reply_text(
+            f"⚡ **Modo Auto — Encolando trabajo `{job_id}`...**",
+            quote=True,
+        )
+        job = CompressionJob(
+            job_id=job_id,
+            user_id=user_id,
+            chat_id=message.chat.id,
+            status_message=status_msg,
+            filename=filename,
+            options=opts,
+            source_message=source_message,
+            source_url=source_url,
+            expected_size=file_size or (500 * 1024 * 1024),
+        )
+        pos = await queue_mgr.enqueue(job)
+        with contextlib.suppress(Exception):
+            await status_msg.edit_text(
+                f"⚡ **Modo Auto — En cola (posición #{pos})**\n"
+                f"• **Trabajo:** `{job_id}`\n"
+                f"• **Archivo:** `{filename[:60]}`\n"
+                f"• **Ajuste:** {_format_saved_preset_line(opts)}\n"
+                f"• **Hilos asignados:** `{queue_mgr.threads_per_job()}` (`{queue_mgr.concurrency_limit}` en paralelo)\n"
+                "*(Usa `/auto` para volver al menú manual)*",
+                reply_markup=build_job_cancel_keyboard(job_id),
+            )
+
     # ── Comandos informativos y de perfil ─────────────────────────────────────
 
     @app.on_message(filters.private & filters.command(["start", "help"]))
@@ -103,8 +172,10 @@ def register_user_handlers(
             return
         is_owner = message.from_user and message.from_user.id == config.owner_id
         admin_hint = (
-            "\n• `/admin` — Panel de servidor, lista blanca y concurrencia"
-            "\n• `/login` — Vincular tu cuenta de Telegram (MTProto / hasta 4 GB con Premium)"
+            "\n• `/admin` — Panel de servidor, lista blanca, alertas y concurrencia"
+            "\n• `/logs [n|errors|file]` — Ver o descargar `bot.log` con errores"
+            "\n• `/update` — Actualizar el bot desde GitHub y reiniciar"
+            "\n• `/login` — Vincular tu cuenta de Telegram (4 GB con Premium)"
             if is_owner
             else ""
         )
@@ -113,12 +184,13 @@ def register_user_handlers(
             "**Cómo usarlo:**\n"
             "1. Envíame o reenvíame cualquier **video** o **archivo de video** (MP4, MKV, MOV, AVI, WEBM hasta 2 GB).\n"
             "2. También puedes enviarme un **enlace directo `http(s)://`** de un video (incluso mayor a 2 GB).\n"
-            "3. Elige un preset rápido, ajusta códec/resolución/pistas o fija un **tamaño exacto en MB (2-Pass)**.\n"
-            "4. Si el resultado comprimido pesa **≤ 2 GB** lo recibes directo en Telegram; si supera **2 GB**, te entrego el **enlace de descarga directa** automáticamente.\n\n"
+            "3. Elige un preset (incluye **Anime 10-bit**), ajusta códec/CRF/10-bit/pistas, adjunta subtítulos `.srt`/`.ass`, recorta (**Trim**), añade **Marca de Agua**, prueba una **Muestra 15s** o fija un **tamaño exacto en MB (2-Pass)**.\n"
+            "4. Si el resultado pesa **≤ 2 GB** lo recibes directo en Telegram; si supera **2 GB**, se entrega por Premium (4 GB) o **enlace directo**.\n\n"
             "**Comandos disponibles:**\n"
+            "• `/auto` — Activar/desactivar **Modo Lotes** (encola videos automáticamente con tu ajuste guardado)\n"
             "• `/queue` — Ver trabajos activos y en cola\n"
-            "• `/setthumb` — Responde a una foto para fijarla como tu miniatura\n"
-            "• `/delthumb` — Borrar tu miniatura personalizada\n"
+            "• `/setthumb` / `/delthumb` — Miniatura personalizada (responde a una foto)\n"
+            "• `/setwatermark <texto>` / `/delwatermark` — Marca de agua fija en tus videos\n"
             "• `/stats` — Ver total de videos y espacio ahorrado\n"
             "• `/id` — Mostrar tu ID de Telegram"
             f"{admin_hint}"
@@ -129,6 +201,53 @@ def register_user_handlers(
         if not message.from_user:
             return
         await message.reply_text(f"🆔 Tu Telegram ID es: `{message.from_user.id}`")
+
+    @app.on_message(filters.private & filters.command("auto"))
+    async def cmd_auto(_client: Client, message: Message) -> None:
+        if not await _check_access(message):
+            return
+        user_id = message.from_user.id
+        opts, currently_on = await _load_user_options(user_id)
+        new_state = not currently_on
+        await db.set_auto_mode(user_id, new_state)
+        if new_state:
+            await message.reply_text(
+                "⚡ **Modo Lotes (/auto) ACTIVADO**\n\n"
+                "Ahora puedes reenviarme 5, 10 o 20 videos seguidos y todos entrarán directo a la cola sin pedir confirmación.\n"
+                f"• **Ajuste activo:** {_format_saved_preset_line(opts)}\n"
+                f"• **Marca de agua:** `{opts.watermark_text or 'Ninguna'}`\n\n"
+                "💡 *Para cambiar tu ajuste favorito, desactiva `/auto`, configura un video y pulsa `💾 Guardar Auto`.*"
+            )
+        else:
+            await message.reply_text(
+                "🎛 **Modo Lotes (/auto) DESACTIVADO**\n"
+                "Cada video volverá a mostrar el panel de configuración manual."
+            )
+
+    @app.on_message(filters.private & filters.command("setwatermark"))
+    async def cmd_setwatermark(_client: Client, message: Message) -> None:
+        if not await _check_access(message):
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.reply_text(
+                "🏷 Uso: `/setwatermark @TuCanal`\n"
+                "Se añadirá una marca de agua discreta a tus próximos videos. Usa `/delwatermark` para quitarla."
+            )
+            return
+        wm_text = parts[1].strip()[:48]
+        await db.set_watermark(message.from_user.id, wm_text)
+        await message.reply_text(
+            f"✅ Marca de agua guardada: `{wm_text}`\n"
+            "*(Puedes elegir la esquina desde `✂️ Trim y Marca` al configurar un video.)*"
+        )
+
+    @app.on_message(filters.private & filters.command("delwatermark"))
+    async def cmd_delwatermark(_client: Client, message: Message) -> None:
+        if not await _check_access(message):
+            return
+        await db.set_watermark(message.from_user.id, "")
+        await message.reply_text("🗑 Marca de agua eliminada.")
 
     @app.on_message(filters.private & filters.command("setthumb"))
     async def cmd_setthumb(_client: Client, message: Message) -> None:
@@ -190,19 +309,47 @@ def register_user_handlers(
             f"• **Espacio total ahorrado:** `{human_bytes(st.total_saved_bytes)}` (`{pct:.1f}%`)"
         )
 
-    # ── Recepción de Video o Documento de Video ───────────────────────────────
+    # ── Recepción de Video, Documento de Video o Subtítulo Externo (.srt/.ass) ─
 
     @app.on_message(filters.private & (filters.video | filters.document))
     async def on_video_message(_client: Client, message: Message) -> None:
+        if not message.from_user:
+            return
+        user_id = message.from_user.id
+
+        # 0. ¿Estaba esperando un archivo de subtítulo externo (.srt / .ass / .vtt)?
+        pending_state = awaiting_input.get(user_id)
+        if pending_state and pending_state[1] == "attach_sub" and message.document:
+            if not _is_subtitle_document(message):
+                await message.reply_text(
+                    "❌ Ese archivo no es un subtítulo compatible. Envía un `.srt`, `.ass`, `.ssa` o `.vtt`."
+                )
+                return
+            sid, _ = awaiting_input.pop(user_id)
+            session = sessions.get(sid)
+            if not session:
+                await message.reply_text("⚠️ Esa sesión expiró. Reenvía el video para configurarlo de nuevo.")
+                return
+            sub_name = message.document.file_name or "subtitulo.srt"
+            session.options.external_sub_file_id = message.document.file_id
+            session.options.external_sub_name = sub_name
+            if session.options.subtitle_mode == "none":
+                session.options.subtitle_mode = "soft"
+            await _refresh_session_message(session, view="tracks")
+            await message.reply_text(
+                f"✅ Subtítulo externo `{sub_name[:48]}` adjuntado (`{session.options.subtitle_mode}`).\n"
+                "*(Puedes alternar entre Softsub y Hardsub en el panel de arriba.)*",
+                quote=True,
+            )
+            return
+
         if message.document and not _is_video_document(message):
             return
         if not await _check_access(message):
             return
 
         _cleanup_old_sessions()
-        user_id = message.from_user.id
-        send_as_doc = await db.get_send_as_document(user_id)
-        opts = CompressionOptions(send_as_document=send_as_doc)
+        opts, auto_mode = await _load_user_options(user_id)
 
         if message.video:
             v = message.video
@@ -218,6 +365,18 @@ def register_user_handlers(
             duration = None
             width = None
             height = None
+
+        # Si el usuario activó /auto (Modo Lotes), encolar directamente sin menú
+        if auto_mode:
+            await _enqueue_auto_job(
+                message=message,
+                user_id=user_id,
+                filename=filename,
+                file_size=file_size,
+                opts=opts,
+                source_message=message,
+            )
+            return
 
         sid = secrets.token_hex(5)
         summary = format_draft_summary(
@@ -247,7 +406,7 @@ def register_user_handlers(
             source_message=message,
         )
 
-    # ── Recepción de texto: tamaño manual en MB o enlace directo HTTP(S) ──────
+    # ── Recepción de texto: inputs interactivos o enlace directo HTTP(S) ──────
 
     @app.on_message(
         filters.private
@@ -257,11 +416,15 @@ def register_user_handlers(
                 "start",
                 "help",
                 "id",
+                "auto",
+                "setwatermark",
+                "delwatermark",
                 "queue",
                 "stats",
                 "setthumb",
                 "delthumb",
                 "admin",
+                "logs",
                 "login",
                 "cancellogin",
                 "logout",
@@ -283,7 +446,6 @@ def register_user_handlers(
 
         # 0. ¿El dueño está completando el asistente seguro /login?
         if user_id == config.owner_id and user_session.login_in_progress:
-            # Borrar inmediatamente el mensaje sensible (teléfono, código o contraseña 2FA)
             with contextlib.suppress(Exception):
                 await message.delete()
             stage = user_session.current_stage
@@ -304,26 +466,81 @@ def register_user_handlers(
                 await message.reply_text(f"⚠️ {exc}")
             return
 
-        # 1. ¿El usuario estaba escribiendo un tamaño manual en MB?
-        if user_id in awaiting_custom_mb:
-            sid = awaiting_custom_mb.pop(user_id)
+        # 1. ¿El usuario estaba respondiendo a una solicitud del panel inline?
+        if user_id in awaiting_input:
+            sid, mode = awaiting_input.pop(user_id)
             session = sessions.get(sid)
             if not session:
                 await message.reply_text("⚠️ Esa sesión expiró. Reenvía el video para configurarlo de nuevo.")
                 return
-            try:
-                mb_val = float(text.replace(",", ".").replace("mb", "").replace("MB", "").strip())
-                if mb_val < 2 or mb_val > 10240:
-                    raise ValueError
-            except ValueError:
-                await message.reply_text("❌ Escribe un número válido entre `2` y `10240` (ejemplo: `45` o `150`).")
+
+            if text.lower() in {"cancelar", "cancel"}:
+                with contextlib.suppress(Exception):
+                    await message.delete()
                 return
 
-            session.options.target_mb = round(mb_val, 1)
-            with contextlib.suppress(Exception):
-                await message.delete()
-            await _refresh_session_message(session, view="main")
-            return
+            if mode == "custom_mb":
+                try:
+                    mb_val = float(text.replace(",", ".").replace("mb", "").replace("MB", "").strip())
+                    if mb_val < 2 or mb_val > 10240:
+                        raise ValueError
+                except ValueError:
+                    awaiting_input[user_id] = (sid, mode)
+                    await message.reply_text("❌ Escribe un número válido entre `2` y `10240` (ejemplo: `45` o `150`).")
+                    return
+                session.options.target_mb = round(mb_val, 1)
+                with contextlib.suppress(Exception):
+                    await message.delete()
+                await _refresh_session_message(session, view="main")
+                return
+
+            if mode == "rename":
+                cleaned = text.strip()
+                if cleaned.lower() in {"-", "reset", "original"}:
+                    session.options.custom_output_name = ""
+                else:
+                    # Quitar extensión si el usuario la incluyó
+                    stem = Path(cleaned).stem if Path(cleaned).suffix.lower() in VIDEO_EXTENSIONS else cleaned
+                    session.options.custom_output_name = stem[:80].strip()
+                with contextlib.suppress(Exception):
+                    await message.delete()
+                await _refresh_session_message(session, view="main")
+                return
+
+            if mode == "trim":
+                try:
+                    if "-" in text:
+                        left, right = text.split("-", 1)
+                        start_s = parse_timestamp(left) if left.strip() else 0.0
+                        r_clean = right.strip().lower()
+                        end_s = None if r_clean in {"", "fin", "end"} else parse_timestamp(r_clean)
+                    else:
+                        start_s = parse_timestamp(text)
+                        end_s = None
+                    if end_s is not None and end_s <= start_s:
+                        raise ValueError("El tiempo final debe ser mayor al inicial.")
+                except ValueError as exc:
+                    awaiting_input[user_id] = (sid, mode)
+                    await message.reply_text(
+                        f"❌ Formato inválido ({exc}).\n"
+                        "Ejemplos válidos: `00:30 - 05:00`, `01:20 - fin` o `15 - 90`."
+                    )
+                    return
+                session.options.trim_start = start_s
+                session.options.trim_end = end_s
+                with contextlib.suppress(Exception):
+                    await message.delete()
+                await _refresh_session_message(session, view="extras")
+                return
+
+            if mode == "watermark":
+                wm = "" if text.lower() in {"-", "ninguna", "borrar"} else text[:48]
+                session.options.watermark_text = wm
+                await db.set_watermark(user_id, wm, session.options.watermark_pos)
+                with contextlib.suppress(Exception):
+                    await message.delete()
+                await _refresh_session_message(session, view="extras")
+                return
 
         # 2. ¿Envió un enlace directo HTTP(S) para comprimir?
         if URL_REGEX.match(text):
@@ -335,10 +552,20 @@ def register_user_handlers(
                 return
 
             raw_name = Path(parsed.path).name or "video_enlace.mp4"
-            send_as_doc = await db.get_send_as_document(user_id)
-            opts = CompressionOptions(send_as_document=send_as_doc)
-            sid = secrets.token_hex(5)
+            opts, auto_mode = await _load_user_options(user_id)
 
+            if auto_mode:
+                await _enqueue_auto_job(
+                    message=message,
+                    user_id=user_id,
+                    filename=raw_name,
+                    file_size=None,
+                    opts=opts,
+                    source_url=text,
+                )
+                return
+
+            sid = secrets.token_hex(5)
             summary = format_draft_summary(
                 filename=raw_name,
                 file_size=None,
@@ -386,6 +613,8 @@ def register_user_handlers(
             kb = build_target_size_keyboard(session.session_id, session.options)
         elif view == "tracks":
             kb = build_tracks_keyboard(session.session_id, session.options, session.media)
+        elif view == "extras":
+            kb = build_extras_keyboard(session.session_id, session.options)
         else:
             kb = build_main_config_keyboard(session.session_id, session.options)
 
@@ -415,7 +644,7 @@ def register_user_handlers(
             await query.answer()
             return
 
-        if action in {"main", "presets", "advanced", "target", "tracks"}:
+        if action in {"main", "presets", "advanced", "target", "tracks", "extras"}:
             await query.answer()
             await _refresh_session_message(session, view=action)
             return
@@ -429,7 +658,20 @@ def register_user_handlers(
         if action == "codec" and len(parts) >= 4:
             if parts[3] in {"libx265", "libx264"}:
                 session.options.codec = parts[3]  # type: ignore[assignment]
+                if parts[3] == "libx264":
+                    session.options.bit_depth = 8
             await query.answer(f"Códec: {parts[3]}")
+            await _refresh_session_message(session, view="advanced")
+            return
+
+        if action == "toggle_10bit":
+            if session.options.bit_depth == 10:
+                session.options.bit_depth = 8
+                await query.answer("Profundidad cambiada a 8-bit")
+            else:
+                session.options.bit_depth = 10
+                session.options.codec = "libx265"
+                await query.answer("10-bit activado (H.265 Main10)")
             await _refresh_session_message(session, view="advanced")
             return
 
@@ -467,8 +709,69 @@ def register_user_handlers(
             return
 
         if action == "custom_mb":
-            awaiting_custom_mb[session.user_id] = sid
+            awaiting_input[session.user_id] = (sid, "custom_mb")
             await query.answer("Envía ahora el tamaño en MB (ej: 75)", show_alert=True)
+            return
+
+        if action == "rename":
+            awaiting_input[session.user_id] = (sid, "rename")
+            await query.answer(
+                "Escribe el nuevo nombre del archivo (sin extensión), o '-' para usar el original.",
+                show_alert=True,
+            )
+            return
+
+        if action == "attach_sub":
+            awaiting_input[session.user_id] = (sid, "attach_sub")
+            await query.answer(
+                "Envía ahora el archivo de subtítulos (.srt, .ass o .vtt) como documento en este chat.",
+                show_alert=True,
+            )
+            return
+
+        if action == "clear_ext_sub":
+            session.options.external_sub_file_id = None
+            session.options.external_sub_name = None
+            await query.answer("Subtítulo externo quitado")
+            await _refresh_session_message(session, view="tracks")
+            return
+
+        if action == "set_trim":
+            awaiting_input[session.user_id] = (sid, "trim")
+            await query.answer(
+                "Envía el rango de recorte: ej. 00:30 - 05:00 o 01:20 - fin",
+                show_alert=True,
+            )
+            return
+
+        if action == "clear_trim":
+            session.options.trim_start = None
+            session.options.trim_end = None
+            await query.answer("Recorte eliminado")
+            await _refresh_session_message(session, view="extras")
+            return
+
+        if action == "set_wm":
+            awaiting_input[session.user_id] = (sid, "watermark")
+            await query.answer(
+                "Escribe el texto de tu marca de agua (ej: @TuCanal) o '-' para quitarla.",
+                show_alert=True,
+            )
+            return
+
+        if action == "clear_wm":
+            session.options.watermark_text = ""
+            await db.set_watermark(session.user_id, "")
+            await query.answer("Marca de agua quitada")
+            await _refresh_session_message(session, view="extras")
+            return
+
+        if action == "wmpos" and len(parts) >= 4:
+            if parts[3] in {"tl", "tr", "bl", "br"}:
+                session.options.watermark_pos = parts[3]  # type: ignore[assignment]
+                await db.set_watermark(session.user_id, session.options.watermark_text, parts[3])
+            await query.answer("Posición de marca actualizada")
+            await _refresh_session_message(session, view="extras")
             return
 
         if action == "audio" and len(parts) >= 4:
@@ -506,9 +809,43 @@ def register_user_handlers(
             await _refresh_session_message(session, view="main")
             return
 
+        if action == "save_auto":
+            await db.save_default_options(session.user_id, session.options.to_saved_dict())
+            await query.answer(
+                "Ajuste guardado como favorito. Usa /auto para comprimir videos en lote automáticamente.",
+                show_alert=True,
+            )
+            return
+
+        if action == "sample":
+            sample_opts = session.options.clone()
+            sample_opts.sample_duration = 15.0
+            sample_opts.target_mb = None
+            job_id = secrets.token_hex(4)
+            sample_status = await session.config_message.reply_text(
+                f"🎞 **Muestra 15s encolada (`{job_id}`)**\n"
+                f"• **Archivo:** `{session.filename[:60]}`\n"
+                "*(El panel superior sigue abierto para que ajustes o inicies el video completo)*",
+                reply_markup=build_job_cancel_keyboard(job_id),
+            )
+            job = CompressionJob(
+                job_id=job_id,
+                user_id=session.user_id,
+                chat_id=session.chat_id,
+                status_message=sample_status,
+                filename=session.filename,
+                options=sample_opts,
+                source_message=session.source_message,
+                source_url=session.source_url,
+                expected_size=session.file_size or (500 * 1024 * 1024),
+            )
+            pos = await queue_mgr.enqueue(job)
+            await query.answer(f"Muestra 15s encolada (#{pos})")
+            return
+
         if action == "discard":
             sessions.pop(sid, None)
-            awaiting_custom_mb.pop(session.user_id, None)
+            awaiting_input.pop(session.user_id, None)
             await query.answer("Cancelado")
             with contextlib.suppress(Exception):
                 await session.config_message.edit_text("✖ Operación descartada.")
@@ -516,7 +853,7 @@ def register_user_handlers(
 
         if action == "start":
             sessions.pop(sid, None)
-            awaiting_custom_mb.pop(session.user_id, None)
+            awaiting_input.pop(session.user_id, None)
             job_id = secrets.token_hex(4)
 
             job = CompressionJob(
