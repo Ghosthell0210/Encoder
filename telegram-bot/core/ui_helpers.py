@@ -494,16 +494,19 @@ def build_admin_keyboard(
                 InlineKeyboardButton(alert_btn, callback_data="adm:toggle_alerts"),
             ],
             [
+                InlineKeyboardButton("📈 Consumo / RAM", callback_data="adm:usage"),
                 InlineKeyboardButton("📄 Ver Logs", callback_data="adm:logs"),
+            ],
+            [
                 InlineKeyboardButton("⬇ Bajar bot.log", callback_data="adm:logfile"),
-            ],
-            [
                 InlineKeyboardButton("👥 Usuarios", callback_data="adm:users"),
-                InlineKeyboardButton("🧹 Purgar Temp", callback_data="adm:purge"),
             ],
             [
-                InlineKeyboardButton("🔄 Actualizar", callback_data="adm:refresh"),
+                InlineKeyboardButton("🧹 Purgar Temp", callback_data="adm:purge"),
                 InlineKeyboardButton("🛑 Cancelar Cola", callback_data="adm:cancelall"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Actualizar Panel", callback_data="adm:refresh"),
             ],
         ]
     )

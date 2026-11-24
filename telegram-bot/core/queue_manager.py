@@ -34,6 +34,7 @@ from core.ffmpeg_engine import (
 )
 from core.fast_transfer import fast_download_media, fast_send_video_or_doc
 from core.media_probe import MediaInfo, probe_media
+from core.resource_monitor import JobResourceMetrics, JobResourceMonitor
 from core.ui_helpers import (
     DIVIDER,
     ProgressUpdater,
@@ -314,6 +315,9 @@ class QueueManager:
         job_dir.mkdir(parents=True, exist_ok=True)
         updater = ProgressUpdater(job.status_message, interval_sec=self.config.progress_interval_sec)
         cancel_kb = build_job_cancel_keyboard(job.job_id)
+        monitor = JobResourceMonitor(watch_dirs=[job_dir], interval_sec=1.0)
+        monitor.start()
+        metrics: JobResourceMetrics | None = None
 
         try:
             # 0. Guardia de disco antes de descargar
@@ -326,6 +330,7 @@ class QueueManager:
             # 1. Descarga de origen (Telegram MTProto o enlace HTTP directo)
             job.phase = "Descargando"
             input_path = await self._download_source(job, job_dir, updater, cancel_kb)
+            monitor.add_watch_path(input_path.parent)
 
             if job.cancel_event.is_set():
                 raise JobCancelledError("Trabajo cancelado.")
@@ -405,16 +410,50 @@ class QueueManager:
             elapsed_total = time.time() - (job.started_at or time.time())
             reduction_pct = ((input_size - output_size) / max(input_size, 1)) * 100.0
 
+            metrics = await monitor.stop()
+            logger.info(
+                "Consumo trabajo %s (%s): RAM pico=%s (prom=%s) | CPU pico=%.1f%% (prom=%.1f%%) | Disco pico=%s",
+                job.job_id,
+                output_path.name,
+                human_bytes(metrics.peak_ram_bytes),
+                human_bytes(metrics.avg_ram_bytes),
+                metrics.peak_cpu_pct,
+                metrics.avg_cpu_pct,
+                human_bytes(metrics.peak_disk_bytes),
+            )
+
+            bit_tag = " 10-bit" if (job.options.bit_depth == 10 and job.options.codec == "libx265") else ""
+
+            if not job.options.sample_duration:
+                try:
+                    await self.db.record_job_metrics(
+                        job_id=job.job_id,
+                        filename=output_path.name,
+                        codec=f"{out_media.video_codec.upper()}{bit_tag}",
+                        resolution=f"{out_media.width}x{out_media.height}",
+                        input_bytes=input_size,
+                        output_bytes=output_size,
+                        duration_sec=out_media.duration,
+                        elapsed_sec=elapsed_total,
+                        peak_ram_bytes=metrics.peak_ram_bytes,
+                        avg_ram_bytes=metrics.avg_ram_bytes,
+                        peak_cpu_pct=metrics.peak_cpu_pct,
+                        avg_cpu_pct=metrics.avg_cpu_pct,
+                        peak_disk_bytes=metrics.peak_disk_bytes,
+                    )
+                except Exception:
+                    logger.warning("No se pudieron guardar las métricas del trabajo %s", job.job_id, exc_info=True)
+
             # 3b. Si es Muestra rápida de 15s, enviar con proyección de tamaño final y sin sumar a estadísticas
             if job.options.sample_duration:
                 est_full_bytes = output_size * (media.duration / max(out_media.duration, 1.0))
-                bit_tag = " 10-bit" if (job.options.bit_depth == 10 and job.options.codec == "libx265") else ""
                 sample_summary = (
                     f"🎞 **Muestra Lista ({int(round(out_media.duration))}s)**\n"
                     f"`{DIVIDER}`\n"
                     f"├ **Peso muestra:** `{human_bytes(output_size)}`\n"
                     f"├ **Estimado completo:** `~{human_bytes(est_full_bytes)}` (orig: `{human_bytes(input_size)}`)\n"
                     f"├ **Calidad:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}{bit_tag}` · CRF `{job.options.crf}`\n"
+                    f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
                     f"└ **Tiempo:** `{human_duration(elapsed_total)}`\n\n"
                     "*(Tu panel de configuración sigue abierto arriba.)*"
                 )
@@ -431,6 +470,7 @@ class QueueManager:
                     cancel_kb=cancel_kb,
                     custom_caption=sample_summary,
                     record_stats=False,
+                    metrics=metrics,
                 )
                 return
 
@@ -456,6 +496,7 @@ class QueueManager:
                     elapsed_total=elapsed_total,
                     updater=updater,
                     cancel_kb=cancel_kb,
+                    metrics=metrics,
                 )
             elif can_use_premium:
                 await self._deliver_via_premium_account(
@@ -470,6 +511,7 @@ class QueueManager:
                     dump_chat_id=dump_chat_id,
                     updater=updater,
                     cancel_kb=cancel_kb,
+                    metrics=metrics,
                 )
             else:
                 await self._deliver_via_link(
@@ -482,6 +524,7 @@ class QueueManager:
                     elapsed_total=elapsed_total,
                     updater=updater,
                     cancel_kb=cancel_kb,
+                    metrics=metrics,
                 )
 
         except JobCancelledError:
@@ -510,6 +553,9 @@ class QueueManager:
                             "Usa `/logs errors` o `/logs file` para ver el registro.",
                         )
         finally:
+            if metrics is None:
+                with contextlib.suppress(Exception):
+                    await monitor.stop()
             shutil.rmtree(job_dir, ignore_errors=True)
             if job.session_id and not job.keep_cached_source:
                 self.release_session_cache(job.session_id, exclude_job_id=job.job_id)
@@ -527,6 +573,7 @@ class QueueManager:
         dump_chat_id: int,
         updater: ProgressUpdater,
         cancel_kb,
+        metrics: JobResourceMetrics | None = None,
     ) -> None:
         assert self.user_session.client is not None
         job.phase = "Subiendo con cuenta Premium (2–4 GB)"
@@ -557,12 +604,18 @@ class QueueManager:
         )
         sign = "-" if reduction_pct >= 0 else "+"
         bit_tag = " 10-bit" if (job.options.bit_depth == 10 and job.options.codec == "libx265") else ""
+        usage_line = (
+            f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
+            if metrics is not None
+            else ""
+        )
         summary_msg = (
             f"✅ **Compresión Completada (Premium)**\n"
             f"`{DIVIDER}`\n"
             f"├ **Archivo:** `{output_path.name[:72]}`\n"
             f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
             f"├ **Video:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}{bit_tag}` · `{human_duration(out_media.duration)}`\n"
+            f"{usage_line}"
             f"└ **Tiempo total:** `{human_duration(elapsed_total)}`"
         )
 
@@ -713,6 +766,7 @@ class QueueManager:
         cancel_kb,
         custom_caption: str | None = None,
         record_stats: bool = True,
+        metrics: JobResourceMetrics | None = None,
     ) -> None:
         job.phase = "Subiendo a Telegram"
         up_start = time.monotonic()
@@ -753,12 +807,18 @@ class QueueManager:
         else:
             sign = "-" if reduction_pct >= 0 else "+"
             bit_tag = " 10-bit" if (job.options.bit_depth == 10 and job.options.codec == "libx265") else ""
+            usage_line = (
+                f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
+                if metrics is not None
+                else ""
+            )
             summary_msg = (
                 f"✅ **Compresión Completada**\n"
                 f"`{DIVIDER}`\n"
                 f"├ **Archivo:** `{output_path.name[:72]}`\n"
                 f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
                 f"├ **Video:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}{bit_tag}` · `{human_duration(out_media.duration)}`\n"
+                f"{usage_line}"
                 f"└ **Tiempo total:** `{human_duration(elapsed_total)}`"
             )
 
@@ -796,6 +856,7 @@ class QueueManager:
         elapsed_total: float,
         updater: ProgressUpdater,
         cancel_kb,
+        metrics: JobResourceMetrics | None = None,
     ) -> None:
         job.phase = "Generando enlace (>2 GB)"
         preferred = await self.db.get_setting("large_file_uploader", self.config.large_file_uploader)
@@ -848,6 +909,11 @@ class QueueManager:
         )
 
         sign = "-" if reduction_pct >= 0 else "+"
+        usage_line = (
+            f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
+            if metrics is not None
+            else ""
+        )
         text = (
             f"🔗 **Video Listo (Enlace >2 GB)**\n"
             f"`{DIVIDER}`\n"
@@ -855,6 +921,7 @@ class QueueManager:
             f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
             f"├ **Video:** `{out_media.width}×{out_media.height}` · `{out_media.video_codec.upper()}` · `{human_duration(out_media.duration)}`\n"
             f"├ **Proveedor:** `{result.provider}`\n"
+            f"{usage_line}"
             f"└ **Tiempo total:** `{human_duration(elapsed_total)}`\n\n"
             f"📥 **Enlace:** {result.url}\n"
             f"ℹ️ *{result.expires_note}*"

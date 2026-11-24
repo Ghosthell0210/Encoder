@@ -55,6 +55,7 @@ USER_BOT_COMMANDS: list[BotCommand] = [
 OWNER_BOT_COMMANDS: list[BotCommand] = [
     *USER_BOT_COMMANDS,
     BotCommand("admin", "Panel del servidor, recursos y alertas"),
+    BotCommand("usage", "Consumo real de RAM, CPU y disco por video"),
     BotCommand("logs", "Ver últimos errores o descargar bot.log"),
     BotCommand("update", "Actualizar el bot desde GitHub y reiniciar"),
     BotCommand("users", "Ver usuarios autorizados (lista blanca)"),

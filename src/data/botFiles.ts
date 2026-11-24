@@ -22,6 +22,7 @@ import uploaderPy from '../../telegram-bot/core/uploader.py?raw';
 import userSessionPy from '../../telegram-bot/core/user_session.py?raw';
 import uiHelpersPy from '../../telegram-bot/core/ui_helpers.py?raw';
 import queueManagerPy from '../../telegram-bot/core/queue_manager.py?raw';
+import resourceMonitorPy from '../../telegram-bot/core/resource_monitor.py?raw';
 
 import handlersInitPy from '../../telegram-bot/handlers/__init__.py?raw';
 import userHandlersPy from '../../telegram-bot/handlers/user_handlers.py?raw';
@@ -180,6 +181,12 @@ export const BOT_FILES: BotFileItem[] = [
     'core/',
     'Cola FIFO asíncrona, guardia de disco (30 GiB) y entrega híbrida Telegram / Premium / enlace',
     queueManagerPy,
+  ),
+  makeFile(
+    'core/resource_monitor.py',
+    'core/',
+    'Medición en vivo de RAM, CPU y disco por video (bot + FFmpeg) y cálculo de specs recomendadas',
+    resourceMonitorPy,
   ),
   makeFile(
     'core/uploader.py',

@@ -680,6 +680,7 @@ export default function App() {
                     ['/delwatermark', 'Autorizados', 'Eliminar tu marca de agua guardada'],
                     ['/stats', 'Autorizados', 'Total de videos comprimidos, enlaces >2 GB y espacio ahorrado'],
                     ['/admin', 'Dueño', 'CPU/RAM/Disco en vivo, alertas de error, logs, cuenta Telegram y concurrencia'],
+                    ['/usage [reset]', 'Dueño', 'Consumo real de RAM, CPU y disco por video + recomendación de GB para el panel'],
                     ['/logs [n|errors|file]', 'Dueño', 'Ver últimas líneas/errores o descargar el archivo data/bot.log'],
                     ['/update', 'Dueño', 'Descargar la última versión desde GitHub y reiniciar automáticamente'],
                     ['/login', 'Dueño', 'Asistente seguro para iniciar sesión con tu cuenta Telegram (4 GB con Premium)'],

@@ -38,6 +38,36 @@ class StatsRecord:
     total_saved_bytes: int
 
 
+@dataclass(slots=True)
+class JobMetricRecord:
+    job_id: str
+    filename: str
+    codec: str
+    resolution: str
+    input_bytes: int
+    output_bytes: int
+    duration_sec: float
+    elapsed_sec: float
+    peak_ram_bytes: int
+    avg_ram_bytes: int
+    peak_cpu_pct: float
+    avg_cpu_pct: float
+    peak_disk_bytes: int
+    created_at: int
+
+
+@dataclass(slots=True)
+class ResourceReport:
+    total_measured: int
+    max_ram_bytes: int
+    avg_ram_bytes: int
+    max_cpu_pct: float
+    avg_cpu_pct: float
+    max_disk_bytes: int
+    avg_disk_bytes: int
+    recent: list[JobMetricRecord]
+
+
 class Database:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
@@ -84,6 +114,24 @@ class Database:
                 total_input_bytes INTEGER NOT NULL DEFAULT 0,
                 total_output_bytes INTEGER NOT NULL DEFAULT 0,
                 total_saved_bytes INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS job_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                codec TEXT NOT NULL,
+                resolution TEXT NOT NULL,
+                input_bytes INTEGER NOT NULL,
+                output_bytes INTEGER NOT NULL,
+                duration_sec REAL NOT NULL,
+                elapsed_sec REAL NOT NULL,
+                peak_ram_bytes INTEGER NOT NULL,
+                avg_ram_bytes INTEGER NOT NULL,
+                peak_cpu_pct REAL NOT NULL,
+                avg_cpu_pct REAL NOT NULL,
+                peak_disk_bytes INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
             );
             """
         )
@@ -382,3 +430,124 @@ class Database:
                 total_output_bytes=int(r["total_output_bytes"]),
                 total_saved_bytes=int(r["total_saved_bytes"]),
             )
+
+    # ── Métricas de consumo real por video (RAM / CPU / Disco) ────────────────
+
+    async def record_job_metrics(
+        self,
+        job_id: str,
+        filename: str,
+        codec: str,
+        resolution: str,
+        input_bytes: int,
+        output_bytes: int,
+        duration_sec: float,
+        elapsed_sec: float,
+        peak_ram_bytes: int,
+        avg_ram_bytes: int,
+        peak_cpu_pct: float,
+        avg_cpu_pct: float,
+        peak_disk_bytes: int,
+    ) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO job_metrics (
+                job_id, filename, codec, resolution,
+                input_bytes, output_bytes, duration_sec, elapsed_sec,
+                peak_ram_bytes, avg_ram_bytes, peak_cpu_pct, avg_cpu_pct,
+                peak_disk_bytes, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                job_id,
+                filename[:120],
+                codec[:32],
+                resolution[:24],
+                int(input_bytes),
+                int(output_bytes),
+                float(duration_sec),
+                float(elapsed_sec),
+                int(peak_ram_bytes),
+                int(avg_ram_bytes),
+                float(peak_cpu_pct),
+                float(avg_cpu_pct),
+                int(peak_disk_bytes),
+                int(time.time()),
+            ),
+        )
+        # Conservar las últimas 200 mediciones para mantener la BD ligera
+        await self.conn.execute(
+            """
+            DELETE FROM job_metrics
+            WHERE id NOT IN (SELECT id FROM job_metrics ORDER BY id DESC LIMIT 200);
+            """
+        )
+        await self.conn.commit()
+
+    async def get_resource_report(self, limit: int = 6) -> ResourceReport:
+        async with self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS cnt,
+                COALESCE(MAX(peak_ram_bytes), 0) AS max_ram,
+                COALESCE(AVG(peak_ram_bytes), 0) AS avg_ram,
+                COALESCE(MAX(peak_cpu_pct), 0) AS max_cpu,
+                COALESCE(AVG(avg_cpu_pct), 0) AS avg_cpu,
+                COALESCE(MAX(peak_disk_bytes), 0) AS max_disk,
+                COALESCE(AVG(peak_disk_bytes), 0) AS avg_disk
+            FROM job_metrics;
+            """
+        ) as cursor:
+            agg = await cursor.fetchone()
+
+        total_measured = int(agg["cnt"]) if agg else 0
+        recent: list[JobMetricRecord] = []
+        if total_measured > 0:
+            async with self.conn.execute(
+                """
+                SELECT job_id, filename, codec, resolution,
+                       input_bytes, output_bytes, duration_sec, elapsed_sec,
+                       peak_ram_bytes, avg_ram_bytes, peak_cpu_pct, avg_cpu_pct,
+                       peak_disk_bytes, created_at
+                FROM job_metrics
+                ORDER BY id DESC
+                LIMIT ?;
+                """,
+                (max(1, min(20, limit)),),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                recent = [
+                    JobMetricRecord(
+                        job_id=str(r["job_id"]),
+                        filename=str(r["filename"]),
+                        codec=str(r["codec"]),
+                        resolution=str(r["resolution"]),
+                        input_bytes=int(r["input_bytes"]),
+                        output_bytes=int(r["output_bytes"]),
+                        duration_sec=float(r["duration_sec"]),
+                        elapsed_sec=float(r["elapsed_sec"]),
+                        peak_ram_bytes=int(r["peak_ram_bytes"]),
+                        avg_ram_bytes=int(r["avg_ram_bytes"]),
+                        peak_cpu_pct=float(r["peak_cpu_pct"]),
+                        avg_cpu_pct=float(r["avg_cpu_pct"]),
+                        peak_disk_bytes=int(r["peak_disk_bytes"]),
+                        created_at=int(r["created_at"]),
+                    )
+                    for r in rows
+                ]
+
+        return ResourceReport(
+            total_measured=total_measured,
+            max_ram_bytes=int(agg["max_ram"]) if agg else 0,
+            avg_ram_bytes=int(agg["avg_ram"]) if agg else 0,
+            max_cpu_pct=float(agg["max_cpu"]) if agg else 0.0,
+            avg_cpu_pct=float(agg["avg_cpu"]) if agg else 0.0,
+            max_disk_bytes=int(agg["max_disk"]) if agg else 0,
+            avg_disk_bytes=int(agg["avg_disk"]) if agg else 0,
+            recent=recent,
+        )
+
+    async def clear_job_metrics(self) -> int:
+        cursor = await self.conn.execute("DELETE FROM job_metrics;")
+        await self.conn.commit()
+        return cursor.rowcount

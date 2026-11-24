@@ -15,6 +15,7 @@ from core.database import Database
 from core.git_updater import pull_from_github, restart_process
 from core.logger_setup import read_last_log_lines
 from core.queue_manager import QueueManager, dir_size_bytes
+from core.resource_monitor import recommended_panel_specs
 from core.ui_helpers import DIVIDER, build_admin_keyboard, human_bytes
 from core.user_session import UserSessionManager
 
@@ -103,6 +104,70 @@ def register_admin_handlers(
                 text,
                 reply_markup=build_admin_keyboard(access_mode, conc, uploader, error_alerts=error_alerts),
             )
+
+    # ── Consumo real de RAM, CPU y disco por video (/usage [reset]) ───────────
+
+    async def _render_usage_text() -> str:
+        rep = await db.get_resource_report(limit=6)
+        if rep.total_measured == 0:
+            return (
+                "📈 **Consumo Real por Video**\n"
+                f"`{DIVIDER}`\n"
+                "Todavía no hay videos medidos.\n\n"
+                "Comprime al menos **1 video completo** y aquí verás el pico real de **RAM**, **CPU** y **disco** "
+                "(bot + FFmpeg) junto con los GB exactos recomendados para tu panel."
+            )
+
+        ram_1, cpu_1, disk_1 = recommended_panel_specs(
+            rep.max_ram_bytes, rep.max_cpu_pct, rep.max_disk_bytes
+        )
+        ram_2, _, disk_2 = recommended_panel_specs(
+            int(rep.max_ram_bytes * 1.85), rep.max_cpu_pct, int(rep.max_disk_bytes * 2)
+        )
+
+        lines = [
+            "📈 **Consumo Real por Video (Bot + FFmpeg)**",
+            f"`{DIVIDER}`",
+            "",
+            f"📊 **Picos Registrados ({rep.total_measured} videos)**",
+            f"├ **RAM:** máx `{human_bytes(rep.max_ram_bytes)}` · prom `{human_bytes(rep.avg_ram_bytes)}`",
+            f"├ **CPU:** máx `{rep.max_cpu_pct:.0f}%` · prom `{rep.avg_cpu_pct:.0f}%` *(100% = 1 vCPU)*",
+            f"└ **Disco:** máx `{human_bytes(rep.max_disk_bytes)}` · prom `{human_bytes(rep.avg_disk_bytes)}`",
+            "",
+            "🖥 **Especificaciones Sugeridas (panel.plugged.host)**",
+            f"├ **1 video a la vez:** `{ram_1:.1f} GiB RAM` · `{cpu_1}% CPU` · `{disk_1:.0f} GiB Disco`",
+            f"└ **2 videos a la vez:** `{ram_2:.1f} GiB RAM` · `{max(200, cpu_1)}% CPU` · `{disk_2:.0f} GiB Disco`",
+            "",
+            "🎬 **Últimos videos medidos**",
+        ]
+
+        for idx, rec in enumerate(rep.recent):
+            branch = "└" if idx == len(rep.recent) - 1 else "├"
+            short_name = rec.filename[:28] + ("…" if len(rec.filename) > 28 else "")
+            lines.append(
+                f"{branch} `{short_name}` ({rec.resolution} · {rec.codec})\n"
+                f"   `{human_bytes(rec.input_bytes)}`→`{human_bytes(rec.output_bytes)}` · "
+                f"RAM `{human_bytes(rec.peak_ram_bytes)}` · CPU `{rec.peak_cpu_pct:.0f}%` · Disco `{human_bytes(rec.peak_disk_bytes)}`"
+            )
+
+        lines.append("")
+        lines.append("💡 *Usa `/usage reset` para reiniciar las mediciones.*")
+        return "\n".join(lines)
+
+    @app.on_message(filters.private & filters.command("usage"))
+    async def cmd_usage(_client: Client, message: Message) -> None:
+        if not message.from_user or not _is_owner(message.from_user.id):
+            await message.reply_text("⛔ Comando exclusivo del administrador.")
+            return
+        parts = message.text.split()
+        arg = parts[1].lower() if len(parts) > 1 else ""
+        if arg in {"reset", "clear", "limpiar"}:
+            deleted = await db.clear_job_metrics()
+            await message.reply_text(
+                f"🧹 Historial de consumo reiniciado (`{deleted}` registros eliminados)."
+            )
+            return
+        await message.reply_text(await _render_usage_text())
 
     # ── Visor y descarga de logs (/logs [n|errors|file]) ──────────────────────
 
@@ -297,6 +362,11 @@ def register_admin_handlers(
             nxt = "0" if cur == "1" else "1"
             await db.set_setting("error_alerts", nxt)
             await query.answer(f"Alertas: {'ON' if nxt == '1' else 'OFF'}")
+
+        elif action == "usage":
+            await query.answer("Cargando reporte de consumo...")
+            await query.message.reply_text(await _render_usage_text())
+            return
 
         elif action == "logs":
             await query.answer("Cargando logs...")
