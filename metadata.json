@@ -1,0 +1,6 @@
+{
+  "name": "HydroCompress Bot — Compresor de Videos para Telegram",
+  "description": "Bot de compresión de videos de alto rendimiento en Python + Hydrogram + FFmpeg optimizado para 400% CPU, 10 GiB RAM y 30 GiB de disco en panel.plugged.host, con soporte hasta 2 GB en Telegram y enlace directo automático para archivos mayores.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

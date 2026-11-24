@@ -1,0 +1,247 @@
+import JSZip from 'jszip';
+
+import botPy from '../../telegram-bot/bot.py?raw';
+import configPy from '../../telegram-bot/config.py?raw';
+import requirementsTxt from '../../telegram-bot/requirements.txt?raw';
+import envExample from '../../telegram-bot/.env.example?raw';
+import dockerfile from '../../telegram-bot/Dockerfile?raw';
+import startSh from '../../telegram-bot/start.sh?raw';
+import readmeMd from '../../telegram-bot/README.md?raw';
+
+import coreInitPy from '../../telegram-bot/core/__init__.py?raw';
+import databasePy from '../../telegram-bot/core/database.py?raw';
+import mediaProbePy from '../../telegram-bot/core/media_probe.py?raw';
+import ffmpegEnginePy from '../../telegram-bot/core/ffmpeg_engine.py?raw';
+import uploaderPy from '../../telegram-bot/core/uploader.py?raw';
+import uiHelpersPy from '../../telegram-bot/core/ui_helpers.py?raw';
+import queueManagerPy from '../../telegram-bot/core/queue_manager.py?raw';
+
+import handlersInitPy from '../../telegram-bot/handlers/__init__.py?raw';
+import userHandlersPy from '../../telegram-bot/handlers/user_handlers.py?raw';
+import adminHandlersPy from '../../telegram-bot/handlers/admin_handlers.py?raw';
+
+export interface BotFileItem {
+  path: string;
+  name: string;
+  group: 'Raíz' | 'core/' | 'handlers/';
+  summary: string;
+  content: string;
+  lines: number;
+  bytes: number;
+}
+
+export interface EnvFormState {
+  apiId: string;
+  apiHash: string;
+  botToken: string;
+  ownerId: string;
+  accessMode: 'private' | 'public';
+  maxConcurrentJobs: '1' | '2';
+  largeFileUploader: 'gofile' | 'buzzheavier' | 'direct_http';
+  gofileToken: string;
+  publicDownloadBaseUrl: string;
+  directLinkPort: string;
+  directLinkTtlHours: string;
+  includeEnvInZip: boolean;
+}
+
+export const DEFAULT_ENV_FORM: EnvFormState = {
+  apiId: '',
+  apiHash: '',
+  botToken: '',
+  ownerId: '',
+  accessMode: 'private',
+  maxConcurrentJobs: '1',
+  largeFileUploader: 'gofile',
+  gofileToken: '',
+  publicDownloadBaseUrl: '',
+  directLinkPort: '8080',
+  directLinkTtlHours: '6',
+  includeEnvInZip: false,
+};
+
+function makeFile(
+  path: string,
+  group: BotFileItem['group'],
+  summary: string,
+  content: string,
+): BotFileItem {
+  const normalized = content.replace(/\r\n/g, '\n');
+  const lines = normalized.split('\n').length;
+  const bytes = new TextEncoder().encode(normalized).length;
+  const name = path.split('/').pop() || path;
+  return { path, name, group, summary, content: normalized, lines, bytes };
+}
+
+export const BOT_FILES: BotFileItem[] = [
+  makeFile(
+    'bot.py',
+    'Raíz',
+    'Arranque principal Hydrogram + TgCrypto, limpieza inicial y apagado seguro',
+    botPy,
+  ),
+  makeFile(
+    'config.py',
+    'Raíz',
+    'Variables de entorno y límites calibrados (400% CPU, 10 GiB RAM, 30 GiB Disco)',
+    configPy,
+  ),
+  makeFile(
+    'requirements.txt',
+    'Raíz',
+    'Dependencias Python (hydrogram, tgcrypto, aiohttp, aiosqlite, psutil)',
+    requirementsTxt,
+  ),
+  makeFile(
+    '.env.example',
+    'Raíz',
+    'Plantilla de configuración de credenciales y proveedor >2 GB',
+    envExample,
+  ),
+  makeFile(
+    'start.sh',
+    'Raíz',
+    'Script de arranque automático para Pterodactyl / panel.plugged.host',
+    startSh,
+  ),
+  makeFile(
+    'Dockerfile',
+    'Raíz',
+    'Imagen opcional Python 3.11 + FFmpeg + TgCrypto lista para producción',
+    dockerfile,
+  ),
+  makeFile(
+    'README.md',
+    'Raíz',
+    'Guía rápida de despliegue y tabla de comandos de Telegram',
+    readmeMd,
+  ),
+  makeFile(
+    'core/ffmpeg_engine.py',
+    'core/',
+    'Motor FFmpeg H.265/H.264, 2-Pass exacto en MB, multi-audio, softsub/hardsub y miniatura',
+    ffmpegEnginePy,
+  ),
+  makeFile(
+    'core/queue_manager.py',
+    'core/',
+    'Cola FIFO asíncrona, guardia de disco (30 GiB) y entrega híbrida Telegram / enlace >2 GB',
+    queueManagerPy,
+  ),
+  makeFile(
+    'core/uploader.py',
+    'core/',
+    'Descarga HTTP directa y subida streaming >2 GB (GoFile, Buzzheavier y enlace temporal)',
+    uploaderPy,
+  ),
+  makeFile(
+    'core/media_probe.py',
+    'core/',
+    'Inspector FFprobe JSON para códec, duración, pistas de audio y subtítulos',
+    mediaProbePy,
+  ),
+  makeFile(
+    'core/database.py',
+    'core/',
+    'Persistencia SQLite asíncrona (lista blanca, miniaturas, ajustes y estadísticas)',
+    databasePy,
+  ),
+  makeFile(
+    'core/ui_helpers.py',
+    'core/',
+    'Barras de progreso anti-FloodWait y menús inline de Telegram',
+    uiHelpersPy,
+  ),
+  makeFile('core/__init__.py', 'core/', 'Inicializador del paquete core', coreInitPy),
+  makeFile(
+    'handlers/user_handlers.py',
+    'handlers/',
+    'Recepción de videos/enlaces, botones de presets, tamaño exacto, pistas y re-compresión 1.9 GB',
+    userHandlersPy,
+  ),
+  makeFile(
+    'handlers/admin_handlers.py',
+    'handlers/',
+    'Panel /admin con telemetría psutil, lista blanca, concurrencia 1×4 / 2×2 y purga',
+    adminHandlersPy,
+  ),
+  makeFile('handlers/__init__.py', 'handlers/', 'Inicializador del paquete handlers', handlersInitPy),
+];
+
+export function buildEnvFileContent(form: EnvFormState): string {
+  const apiId = form.apiId.trim() || '12345678';
+  const apiHash = form.apiHash.trim() || 'tu_api_hash_aqui';
+  const botToken = form.botToken.trim() || '123456789:tu_bot_token_aqui';
+  const ownerId = form.ownerId.trim() || '123456789';
+  const gofileToken = form.gofileToken.trim();
+  const publicUrl = form.publicDownloadBaseUrl.trim().replace(/\/+$/, '');
+  const port = form.directLinkPort.trim() || '8080';
+  const ttl = form.directLinkTtlHours.trim() || '6';
+
+  return [
+    '# Credenciales de Telegram (MTProto hasta 2 GB)',
+    `API_ID=${apiId}`,
+    `API_HASH=${apiHash}`,
+    `BOT_TOKEN=${botToken}`,
+    `OWNER_ID=${ownerId}`,
+    '',
+    '# Recursos asignados en panel.plugged.host (Máxima potencia libre)',
+    'MAX_CPU_THREADS=4',
+    'MAX_RAM_GB=10',
+    'MAX_DISK_GB=30',
+    'DISK_RESERVE_GB=2.0',
+    `MAX_CONCURRENT_JOBS=${form.maxConcurrentJobs}`,
+    `ACCESS_MODE=${form.accessMode}`,
+    '',
+    '# Entrega automática por enlace si el video comprimido supera 2 GB',
+    `LARGE_FILE_UPLOADER=${form.largeFileUploader}`,
+    `GOFILE_TOKEN=${gofileToken}`,
+    '',
+    '# Opcional: enlace directo temporal desde tu puerto (sin web UI)',
+    `PUBLIC_DOWNLOAD_BASE_URL=${publicUrl}`,
+    'DIRECT_LINK_HOST=0.0.0.0',
+    `DIRECT_LINK_PORT=${port}`,
+    `DIRECT_LINK_TTL_HOURS=${ttl}`,
+    'PROGRESS_INTERVAL_SEC=3.5',
+    '',
+  ].join('\n');
+}
+
+export async function downloadBotZip(envForm: EnvFormState): Promise<void> {
+  const zip = new JSZip();
+  for (const file of BOT_FILES) {
+    zip.file(file.path, file.content, {
+      unixPermissions: file.path === 'start.sh' ? '755' : '644',
+    });
+  }
+  if (envForm.includeEnvInZip) {
+    zip.file('.env', buildEnvFileContent(envForm), { unixPermissions: '600' });
+  }
+
+  const blob = await zip.generateAsync({
+    type: 'blob',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 6 },
+  });
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'hydrocompress-telegram-bot.zip';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+export function downloadSingleTextFile(filename: string, content: string): void {
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
