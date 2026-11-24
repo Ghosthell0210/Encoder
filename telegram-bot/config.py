@@ -144,12 +144,15 @@ class BotConfig:
         bot_token = _env_str("BOT_TOKEN")
         owner_id = _env_int("OWNER_ID", 0)
 
-        if (api_id <= 0 or not api_hash or not bot_token or owner_id <= 0) and sys.stdin.isatty():
-            _interactive_setup_env(base_dir)
-            api_id = _env_int("API_ID", 0)
-            api_hash = _env_str("API_HASH")
-            bot_token = _env_str("BOT_TOKEN")
-            owner_id = _env_int("OWNER_ID", 0)
+        if (api_id <= 0 or not api_hash or not bot_token or owner_id <= 0) and not sys.stdin.closed:
+            try:
+                _interactive_setup_env(base_dir)
+                api_id = _env_int("API_ID", 0)
+                api_hash = _env_str("API_HASH")
+                bot_token = _env_str("BOT_TOKEN")
+                owner_id = _env_int("OWNER_ID", 0)
+            except EOFError:
+                pass
 
         missing = []
         if api_id <= 0:

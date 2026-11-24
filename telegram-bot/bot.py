@@ -24,6 +24,7 @@ except RuntimeError:
 from hydrogram import Client, idle
 
 from config import BotConfig
+from core.console_commands import console_command_loop
 from core.database import Database
 from core.ffmpeg_bootstrap import ensure_ffmpeg
 from core.queue_manager import QueueManager
@@ -78,7 +79,7 @@ async def main() -> None:
     direct_store = DirectLinkStore(config)
     user_session = UserSessionManager(config)
 
-    # Restaurar cuenta de Telegram vinculada (.env o SQLite vía /login)
+    # Restaurar cuenta de Telegram vinculada (.env o SQLite vía consola 'login' / '/login')
     saved_session = config.user_session_string or await db.get_setting("user_session_string", "")
     if saved_session:
         try:
@@ -121,10 +122,13 @@ async def main() -> None:
         user_session.status_label(),
     )
 
+    console_task = asyncio.create_task(console_command_loop(db, queue_mgr, user_session))
+
     try:
         await idle()
     finally:
         logger.info("Deteniendo bot y limpiando recursos...")
+        console_task.cancel()
         await queue_mgr.stop()
         await user_session.stop()
         await app.stop()

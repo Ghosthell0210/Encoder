@@ -10,6 +10,7 @@ import startSh from '../../telegram-bot/start.sh?raw';
 import readmeMd from '../../telegram-bot/README.md?raw';
 
 import coreInitPy from '../../telegram-bot/core/__init__.py?raw';
+import consoleCommandsPy from '../../telegram-bot/core/console_commands.py?raw';
 import databasePy from '../../telegram-bot/core/database.py?raw';
 import ffmpegBootstrapPy from '../../telegram-bot/core/ffmpeg_bootstrap.py?raw';
 import mediaProbePy from '../../telegram-bot/core/media_probe.py?raw';
@@ -128,6 +129,12 @@ export const BOT_FILES: BotFileItem[] = [
     'Raíz',
     'Guía completa para Egg Python Generic, API_ID/API_HASH y /login',
     readmeMd,
+  ),
+  makeFile(
+    'core/console_commands.py',
+    'core/',
+    'Consola interactiva de Pelican/Pterodactyl (comandos login, logout, status)',
+    consoleCommandsPy,
   ),
   makeFile(
     'core/ffmpeg_bootstrap.py',
