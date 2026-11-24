@@ -140,9 +140,9 @@ export default function App() {
         <div className="flex flex-wrap items-center gap-2 font-mono tabular-nums">
           <span className="text-[#F3F4F6] font-medium">Python 3.11 + Hydrogram + FFmpeg</span>
           <span aria-hidden="true">·</span>
-          <span>400% CPU (4 hilos)</span>
+          <span>500% CPU (auto · 5 hilos)</span>
           <span aria-hidden="true">·</span>
-          <span>10 GiB RAM</span>
+          <span>4 GiB RAM (auto)</span>
           <span aria-hidden="true">·</span>
           <span>30 GiB Disco</span>
           <span aria-hidden="true">·</span>
@@ -400,7 +400,7 @@ export default function App() {
                 </div>
 
                 <div className="space-y-1.5">
-                  <span className="block text-xs font-medium text-[#D1D5DB]">Concurrencia (400% CPU)</span>
+                  <span className="block text-xs font-medium text-[#D1D5DB]">Concurrencia (500% CPU)</span>
                   <div className="grid grid-cols-2 gap-1 p-1 bg-[#0B111E] border border-[#1F2937] rounded-md">
                     <button
                       type="button"
@@ -411,7 +411,7 @@ export default function App() {
                           : 'text-[#9CA3AF] hover:text-[#F3F4F6]'
                       }`}
                     >
-                      1 × 4 hilos
+                      1 × 5 hilos
                     </button>
                     <button
                       type="button"
@@ -542,7 +542,7 @@ export default function App() {
               Despliegue directo en panel.plugged.host
             </h1>
             <p className="text-sm text-[#9CA3AF] max-w-2xl leading-relaxed">
-              Calibrado a los recursos libres de tu captura (400% CPU, 13 GiB RAM y 35 GiB Disco). El bot corre 100% en Telegram sin abrir interfaces web ni consumir recursos innecesarios.
+              Detecta automáticamente la CPU y RAM asignadas al contenedor (calibrado para 500% CPU, 4 GiB RAM y 30 GiB Disco). El bot corre 100% en Telegram sin abrir interfaces web ni consumir recursos innecesarios.
             </p>
           </section>
 
@@ -558,7 +558,7 @@ export default function App() {
                 <thead className="border-b border-[#1F2937] text-xs text-[#9CA3AF]">
                   <tr>
                     <th className="px-5 py-3 font-medium">Recurso</th>
-                    <th className="px-5 py-3 font-medium text-right">Libre en tu servidor</th>
+                    <th className="px-5 py-3 font-medium text-right">Detección</th>
                     <th className="px-5 py-3 font-medium text-right">Asignar a este bot</th>
                     <th className="px-5 py-3 font-medium">Comportamiento configurado</th>
                   </tr>
@@ -566,18 +566,18 @@ export default function App() {
                 <tbody className="divide-y divide-[#1F2937] font-mono text-xs tabular-nums">
                   <tr className="hover:bg-[#161F31]">
                     <td className="px-5 py-3 font-sans text-sm text-[#F3F4F6]">CPU</td>
-                    <td className="px-5 py-3 text-right text-[#9CA3AF]">400% (4 vCPU)</td>
-                    <td className="px-5 py-3 text-right text-[#60A5FA] font-semibold">400%</td>
+                    <td className="px-5 py-3 text-right text-[#9CA3AF]">Auto (cgroup)</td>
+                    <td className="px-5 py-3 text-right text-[#60A5FA] font-semibold">500%</td>
                     <td className="px-5 py-3 font-sans text-[#D1D5DB]">
-                      1 trabajo × 4 hilos (conmutable a 2 × 2 hilos desde /admin)
+                      1 trabajo × 5 hilos (conmutable a 2 × 2 hilos desde /admin)
                     </td>
                   </tr>
                   <tr className="hover:bg-[#161F31]">
                     <td className="px-5 py-3 font-sans text-sm text-[#F3F4F6]">RAM</td>
-                    <td className="px-5 py-3 text-right text-[#9CA3AF]">13 GiB</td>
-                    <td className="px-5 py-3 text-right text-[#60A5FA] font-semibold">10 GiB</td>
+                    <td className="px-5 py-3 text-right text-[#9CA3AF]">Auto (cgroup)</td>
+                    <td className="px-5 py-3 text-right text-[#60A5FA] font-semibold">4 GiB</td>
                     <td className="px-5 py-3 font-sans text-[#D1D5DB]">
-                      Subida streaming por bloques de 1 MiB (reserva 3 GiB libres)
+                      Suficiente para HEVC/AV1 10-bit + subida streaming por bloques
                     </td>
                   </tr>
                   <tr className="hover:bg-[#161F31]">
@@ -618,7 +618,7 @@ export default function App() {
 
             <ol className="space-y-4 text-sm text-[#D1D5DB] list-decimal list-inside">
               <li>
-                Crea el servidor usando el Egg <span className="font-medium text-[#F3F4F6]">Python Generic (Pelican / Pterodactyl)</span> con <span className="font-mono text-[#60A5FA]">400% CPU</span>, <span className="font-mono text-[#60A5FA]">10240 MiB RAM</span> y <span className="font-mono text-[#60A5FA]">30720 MiB Disco</span>.
+                Crea el servidor usando el Egg <span className="font-medium text-[#F3F4F6]">Python Generic (Pelican / Pterodactyl)</span> con <span className="font-mono text-[#60A5FA]">500% CPU</span>, <span className="font-mono text-[#60A5FA]">4096 MiB RAM</span> y <span className="font-mono text-[#60A5FA]">30720 MiB Disco</span>.
               </li>
               <li>
                 Rellena tus credenciales en la pestaña <span className="font-medium text-[#F3F4F6]">Configurar .env</span>, marca incluir <code className="font-mono">.env</code> y descarga <code className="font-mono text-[#60A5FA]">hydrocompress-telegram-bot.zip</code>.

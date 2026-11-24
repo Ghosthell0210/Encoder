@@ -169,12 +169,17 @@ async def main() -> None:
     await queue_mgr.start()
 
     me = await app.get_me()
+    cpu_tag = " auto" if config.cpu_auto_detected else ""
+    ram_tag = " auto" if config.ram_auto_detected else ""
     logger.info(
-        "Bot iniciado como @%s (ID: %s) | Presupuesto: %s%% CPU · %.0f GiB RAM · %.0f GiB Disco | Cuenta: %s",
+        "Bot iniciado como @%s (ID: %s) | Presupuesto: %s%% CPU (%s hilos%s) · %.1f GiB RAM%s · %.0f GiB Disco | Cuenta: %s",
         me.username,
         me.id,
         config.max_cpu_threads * 100,
+        config.max_cpu_threads,
+        cpu_tag,
         config.max_ram_gb,
+        ram_tag,
         config.max_disk_gb,
         user_session.status_label(),
     )

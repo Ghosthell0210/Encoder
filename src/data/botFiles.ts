@@ -97,7 +97,7 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'config.py',
     'Raíz',
-    'Variables de entorno, asistente interactivo y presupuesto 400% CPU / 10 GiB RAM / 30 GiB Disco',
+    'Variables de entorno, asistente interactivo y auto-detección cgroup de CPU/RAM (500% CPU / 4 GiB RAM / 30 GiB Disco)',
     configPy,
   ),
   makeFile(
@@ -265,9 +265,10 @@ export function buildEnvFileContent(form: EnvFormState): string {
     `USER_SESSION_STRING=${userSession}`,
     `DUMP_CHAT_ID=${dumpChatId}`,
     '',
-    '# 3. Recursos asignados en panel.plugged.host (Máxima potencia libre)',
-    'MAX_CPU_THREADS=4',
-    'MAX_RAM_GB=10',
+    '# 3. Recursos asignados en panel.plugged.host (auto-detecta CPU/RAM del contenedor)',
+    'AUTO_DETECT_RESOURCES=true',
+    'MAX_CPU_THREADS=5',
+    'MAX_RAM_GB=4',
     'MAX_DISK_GB=30',
     'DISK_RESERVE_GB=2.0',
     `MAX_CONCURRENT_JOBS=${form.maxConcurrentJobs}`,

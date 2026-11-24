@@ -3,7 +3,7 @@
 Bot nativo de compresión de videos para Telegram (**sin servidor web**), construido con **Python 3.11+**, **Hydrogram + TgCrypto** y **FFmpeg**, listo para el Egg **Python Generic (Pelican / Pterodactyl)** en **panel.plugged.host**:
 
 - **Auto-instalación rootless de FFmpeg/FFprobe:** Si tu Egg `Python Generic` no trae `ffmpeg`, `bot.py` descarga automáticamente binarios estáticos Linux (con `libx264`, `libx265` y `libass`) en `./bin/` al arrancar por primera vez, sin requerir permisos root.
-- **Recursos calibrados:** `400% CPU (4 hilos)` · `10 GiB RAM` · `30 GiB Disco` con guardia automática de espacio libre y borrado inmediato tras cada envío.
+- **Recursos auto-detectados:** lee automáticamente la CPU y RAM asignadas al contenedor (calibrado para `500% CPU / 5 hilos` · `4 GiB RAM` · `30 GiB Disco`) con guardia automática de espacio libre y borrado inmediato tras cada envío.
 - **Límite de 2 GB, cuenta Telegram y >2 GB por enlace:**
   - Con `API_ID` + `API_HASH` + `BOT_TOKEN` el bot ya soporta nativamente **hasta 2 GB** vía MTProto.
   - Además puedes vincular tu cuenta de Telegram con **`/login`** dentro del propio chat (o con `python3 login_account.py`): si tu cuenta es **Telegram Premium**, desbloquea entregas nativas **hasta 4 GB**.
@@ -25,7 +25,7 @@ Bot nativo de compresión de videos para Telegram (**sin servidor web**), constr
 
 ## 2. Instalación en `panel.plugged.host` (Egg Python Generic)
 
-1. Crea el servidor con el Egg **Python Generic (Pelican/Pterodactyl)** asignando **400% CPU**, **10240 MiB RAM** y **30720 MiB Disco**.
+1. Crea el servidor con el Egg **Python Generic (Pelican/Pterodactyl)** asignando **500% CPU**, **4096 MiB RAM** y **30720 MiB Disco**.
 2. En **Startup**, elige imagen **Python 3.11** (recomendada por ruedas binarias precompiladas de `tgcrypto`) y cambia **`App py file` (`PY_FILE`)** a:
    ```text
    bot.py

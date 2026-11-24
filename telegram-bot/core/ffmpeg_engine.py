@@ -2,7 +2,7 @@
 10-bit/Anime, Sample 15s, Trim, FPS, Metadatos, Marca de Agua, Audio Opus/AAC/Copy
 y Subtítulos internos/externos.
 
-Optimizado para 4 vCPUs (400% CPU), RAM contenida y ejecución segura sin shell=True.
+Optimizado para vCPUs dinámicos (cgroup auto-detect / 500% CPU), RAM contenida y ejecución segura sin shell=True.
 """
 
 from __future__ import annotations

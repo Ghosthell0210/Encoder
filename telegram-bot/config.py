@@ -1,8 +1,7 @@
 """Configuración central del bot de compresión de videos para Telegram.
 
 Calibrado por defecto para panel.plugged.host (Egg Python Generic Pelican/Pterodactyl):
-  - 400% CPU (4 hilos FFmpeg)
-  - 10 GiB RAM asignada
+  - Auto-detección de CPU y RAM desde cgroups del contenedor (por defecto 500% CPU / 5 hilos y 4 GiB RAM)
   - 30 GiB Disco asignado (con reserva de seguridad de 2 GiB)
 """
 
@@ -31,7 +30,7 @@ TELEGRAM_PREMIUM_MAX_UPLOAD_BYTES: int = 3980 * 1024 * 1024
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name, "").strip()
-    if not raw:
+    if not raw or raw.lower() == "auto":
         return default
     try:
         return int(raw)
@@ -41,7 +40,7 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name, "").strip()
-    if not raw:
+    if not raw or raw.lower() == "auto":
         return default
     try:
         return float(raw)
@@ -51,6 +50,97 @@ def _env_float(name: str, default: float) -> float:
 
 def _env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on", "si", "sí"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _read_text_safe(path: str) -> str | None:
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _detect_cgroup_cpu_threads() -> int | None:
+    """Detecta la cuota real de vCPUs del contenedor Docker/Pelican (cgroup v2 y v1)."""
+    detected: int | None = None
+
+    # cgroup v2: /sys/fs/cgroup/cpu.max -> "<quota> <period>" o "max <period>"
+    cpu_max = _read_text_safe("/sys/fs/cgroup/cpu.max")
+    if cpu_max:
+        parts = cpu_max.split()
+        if len(parts) >= 2 and parts[0] != "max":
+            try:
+                quota = int(parts[0])
+                period = int(parts[1])
+                if quota > 0 and period > 0:
+                    detected = max(1, int(round(quota / period)))
+            except ValueError:
+                pass
+
+    # cgroup v1: cpu.cfs_quota_us / cpu.cfs_period_us
+    if detected is None:
+        for base in ("/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"):
+            q_txt = _read_text_safe(f"{base}/cpu.cfs_quota_us")
+            p_txt = _read_text_safe(f"{base}/cpu.cfs_period_us")
+            if q_txt and p_txt:
+                try:
+                    quota = int(q_txt)
+                    period = int(p_txt)
+                    if quota > 0 and period > 0:
+                        detected = max(1, int(round(quota / period)))
+                        break
+                except ValueError:
+                    pass
+
+    if detected is None:
+        return None
+
+    host_cpus = os.cpu_count()
+    if host_cpus and host_cpus > 0:
+        detected = min(detected, host_cpus)
+    return max(1, min(16, detected))
+
+
+def _detect_cgroup_ram_gb() -> float | None:
+    """Detecta el límite real de RAM (GiB) del contenedor Docker/Pelican (cgroup v2, v1 o SERVER_MEMORY)."""
+    # Límite máximo razonable (< 32 TiB) para descartar centinelas sin límite (~9e18)
+    max_sane_bytes = 1 << 45
+
+    for path in (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ):
+        raw = _read_text_safe(path)
+        if not raw or raw == "max":
+            continue
+        try:
+            limit_bytes = int(raw)
+        except ValueError:
+            continue
+        if 128 * 1024 * 1024 <= limit_bytes < max_sane_bytes:
+            return round(limit_bytes / (1024**3), 2)
+
+    # Variable estándar de Pelican/Pterodactyl (en MiB, ej. 4096)
+    srv_mem = os.getenv("SERVER_MEMORY", "").strip()
+    if srv_mem:
+        try:
+            mib = float(srv_mem)
+            if mib >= 128:
+                return round(mib / 1024.0, 2)
+        except ValueError:
+            pass
+
+    return None
 
 
 def _interactive_setup_env(base_dir: Path) -> None:
@@ -69,8 +159,9 @@ def _interactive_setup_env(base_dir: Path) -> None:
             f"API_HASH={api_hash}",
             f"BOT_TOKEN={bot_token}",
             f"OWNER_ID={owner_id}",
-            "MAX_CPU_THREADS=4",
-            "MAX_RAM_GB=10",
+            "AUTO_DETECT_RESOURCES=true",
+            "MAX_CPU_THREADS=5",
+            "MAX_RAM_GB=4",
             "MAX_DISK_GB=30",
             "DISK_RESERVE_GB=2.0",
             "MAX_CONCURRENT_JOBS=1",
@@ -97,12 +188,14 @@ class BotConfig:
     dump_chat_id: int = 0
 
     # Presupuesto de recursos del contenedor (panel.plugged.host)
-    max_cpu_threads: int = 4
-    max_ram_gb: float = 10.0
+    max_cpu_threads: int = 5
+    max_ram_gb: float = 4.0
     max_disk_gb: float = 30.0
     disk_reserve_gb: float = 2.0
     max_concurrent_jobs: int = 1
     fast_transfer_workers: int = 10
+    cpu_auto_detected: bool = False
+    ram_auto_detected: bool = False
 
     # Acceso inicial (private = solo dueño + lista blanca | public = abierto)
     default_access_mode: str = "private"
@@ -180,7 +273,24 @@ class BotConfig:
         if access_mode not in {"private", "public"}:
             access_mode = "private"
 
-        max_threads = max(1, min(16, _env_int("MAX_CPU_THREADS", 4)))
+        auto_detect = _env_bool("AUTO_DETECT_RESOURCES", True)
+        detected_threads = _detect_cgroup_cpu_threads() if auto_detect else None
+        detected_ram = _detect_cgroup_ram_gb() if auto_detect else None
+
+        if detected_threads is not None:
+            max_threads = detected_threads
+            cpu_auto = True
+        else:
+            max_threads = max(1, min(16, _env_int("MAX_CPU_THREADS", 5)))
+            cpu_auto = False
+
+        if detected_ram is not None:
+            max_ram_gb = max(0.5, detected_ram)
+            ram_auto = True
+        else:
+            max_ram_gb = max(0.5, _env_float("MAX_RAM_GB", 4.0))
+            ram_auto = False
+
         max_concurrent = max(1, min(2, _env_int("MAX_CONCURRENT_JOBS", 1)))
 
         return cls(
@@ -191,11 +301,13 @@ class BotConfig:
             user_session_string=_env_str("USER_SESSION_STRING"),
             dump_chat_id=_env_int("DUMP_CHAT_ID", 0),
             max_cpu_threads=max_threads,
-            max_ram_gb=max(1.0, _env_float("MAX_RAM_GB", 10.0)),
+            max_ram_gb=max_ram_gb,
             max_disk_gb=max(5.0, _env_float("MAX_DISK_GB", 30.0)),
             disk_reserve_gb=max(0.5, _env_float("DISK_RESERVE_GB", 2.0)),
             max_concurrent_jobs=max_concurrent,
             fast_transfer_workers=max(2, min(16, _env_int("FAST_TRANSFER_WORKERS", 10))),
+            cpu_auto_detected=cpu_auto,
+            ram_auto_detected=ram_auto,
             default_access_mode=access_mode,
             large_file_uploader=uploader,
             gofile_token=_env_str("GOFILE_TOKEN"),
