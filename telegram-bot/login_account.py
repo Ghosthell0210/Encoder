@@ -12,6 +12,12 @@ from __future__ import annotations
 import asyncio
 import os
 
+try:
+    _LOOP = asyncio.get_event_loop()
+except RuntimeError:
+    _LOOP = asyncio.new_event_loop()
+    asyncio.set_event_loop(_LOOP)
+
 from dotenv import load_dotenv
 from hydrogram import Client
 from hydrogram.errors import SessionPasswordNeeded
@@ -62,4 +68,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    _LOOP.run_until_complete(main())

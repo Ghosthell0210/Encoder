@@ -1,5 +1,5 @@
 hydrogram>=0.1.4
-tgcrypto>=1.2.5
+tgcrypto>=1.2.5; python_version < "3.13"
 aiohttp>=3.10.5
 aiosqlite>=0.20.0
 python-dotenv>=1.0.1

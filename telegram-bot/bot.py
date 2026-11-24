@@ -14,6 +14,13 @@ import shutil
 import signal
 import sys
 
+# Compatibilidad con Python 3.14+ (donde asyncio.get_event_loop no crea loop implícito)
+try:
+    _MAIN_LOOP = asyncio.get_event_loop()
+except RuntimeError:
+    _MAIN_LOOP = asyncio.new_event_loop()
+    asyncio.set_event_loop(_MAIN_LOOP)
+
 from hydrogram import Client, idle
 
 from config import BotConfig
@@ -130,6 +137,6 @@ if __name__ == "__main__":
     if sys.platform != "win32":
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
-        asyncio.run(main())
+        _MAIN_LOOP.run_until_complete(main())
     except (KeyboardInterrupt, SystemExit):
         pass
