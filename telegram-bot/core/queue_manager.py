@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 
 ActionKind = Literal[
     "compress",
+    "download_only",
     "mediainfo",
     "screenshots_grid",
     "screenshots_hd",
@@ -111,6 +112,7 @@ class CompressionJob:
     options: CompressionOptions
     source_message: Message | None = None
     source_url: str | None = None
+    download_max_height: int | None = None
     expected_size: int = 0
     session_id: str | None = None
     keep_cached_source: bool = False
@@ -128,6 +130,7 @@ class CompressionJob:
     @property
     def action_badge(self) -> str:
         mapping = {
+            "download_only": "Descarga Directa",
             "mediainfo": "MediaInfo",
             "screenshots_grid": "Cuadrícula 3×3",
             "screenshots_hd": "4 Capturas HD",
@@ -501,7 +504,14 @@ class QueueManager:
         try:
             # 0. Guardia de disco no bloqueante
             already_cached = self.has_cached_source(job.session_id)
-            light_tool = job.action_kind in {"mediainfo", "screenshots_grid", "screenshots_hd", "extract_opus", "extract_mp3"}
+            light_tool = job.action_kind in {
+                "download_only",
+                "mediainfo",
+                "screenshots_grid",
+                "screenshots_hd",
+                "extract_opus",
+                "extract_mp3",
+            }
             ok_disk, disk_msg = await asyncio.to_thread(
                 self.check_disk_budget, job.expected_size, already_cached, light_tool
             )
@@ -536,6 +546,37 @@ class QueueManager:
             if job.on_media_probed is not None:
                 with contextlib.suppress(Exception):
                     await job.on_media_probed(media)
+
+            # ── Descarga directa sin recomprimir ──────────────────────────────
+            if job.action_kind == "download_only":
+                elapsed_total = time.time() - (job.started_at or time.time())
+                metrics = await monitor.stop()
+                dl_summary = (
+                    f"⬇️ **Descarga Completada**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Archivo:** `{input_path.name[:72]}`\n"
+                    f"├ **Peso:** `{human_bytes(input_size)}`\n"
+                    f"├ **Video:** `{media.width}×{media.height}` · `{media.video_codec.upper()}` · `{human_duration(media.duration)}`\n"
+                    f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
+                    f"└ **Tiempo total:** `{human_duration(elapsed_total)}`"
+                )
+                await self._deliver_output(
+                    job=job,
+                    job_dir=job_dir,
+                    output_path=input_path,
+                    input_size=input_size,
+                    output_size=input_size,
+                    out_media=media,
+                    reduction_pct=0.0,
+                    elapsed_total=elapsed_total,
+                    updater=updater,
+                    cancel_kb=cancel_kb,
+                    metrics=metrics,
+                    custom_summary=dl_summary,
+                    record_stats=False,
+                )
+                outcome = "Completado con avisos" if collector.has_issues else "Completado"
+                return
 
             # ── Despacho de Herramientas Rápidas ──────────────────────────────
             if job.action_kind == "mediainfo":
@@ -1138,6 +1179,7 @@ class QueueManager:
                 max_allowed_bytes=max_allow,
                 cancel_event=job.cancel_event,
                 on_progress=_dl_progress,
+                max_height=job.download_max_height,
             )
 
         assert job.source_message is not None

@@ -11,6 +11,7 @@ from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from core.ffmpeg_engine import PRESETS, CompressionOptions
 from core.media_probe import MediaInfo
+from core.uploader import UrlFormatOption, UrlProbeInfo
 
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
 
@@ -163,6 +164,26 @@ def _watermark_pos_label(pos: str) -> str:
     }.get(pos, "↘ Abajo-Der")
 
 
+def _format_url_weight(est_bytes: int | None, is_approx: bool = True) -> str:
+    if not est_bytes or est_bytes <= 0:
+        return "Peso auto"
+    prefix = "~" if is_approx else ""
+    return f"{prefix}{human_bytes(est_bytes)}"
+
+
+def _resolve_selected_url_format(
+    url_info: UrlProbeInfo | None,
+    selected_dl_height: int | None,
+) -> UrlFormatOption | None:
+    if not url_info or not url_info.formats:
+        return None
+    if selected_dl_height is not None:
+        for opt in url_info.formats:
+            if opt.height == selected_dl_height:
+                return opt
+    return url_info.formats[0]
+
+
 def format_draft_summary(
     filename: str,
     file_size: int | None,
@@ -172,6 +193,8 @@ def format_draft_summary(
     opts: CompressionOptions,
     media: MediaInfo | None = None,
     source_is_url: bool = False,
+    url_info: UrlProbeInfo | None = None,
+    selected_dl_height: int | None = None,
 ) -> str:
     codec_label = opts.codec_display_label()
     res_label = f"{opts.max_height}p" if opts.max_height else "Original"
@@ -183,9 +206,21 @@ def format_draft_summary(
     else:
         mode_val = f"CRF {opts.crf} · {opts.speed}"
 
-    size_str = human_bytes(file_size) if file_size else "Al descargar"
+    chosen_fmt = _resolve_selected_url_format(url_info, selected_dl_height)
+    if chosen_fmt is not None and chosen_fmt.est_bytes:
+        size_str = _format_url_weight(chosen_fmt.est_bytes, chosen_fmt.is_approx)
+    elif file_size:
+        size_str = human_bytes(file_size)
+    else:
+        size_str = "Al descargar"
+
     dur_str = human_duration(duration) if duration else "Auto"
-    dim_str = f"{width}×{height}" if width and height else "Auto"
+    if chosen_fmt is not None:
+        dim_str = f"{chosen_fmt.width}×{chosen_fmt.height}" if chosen_fmt.width else chosen_fmt.label
+    elif width and height:
+        dim_str = f"{width}×{height}"
+    else:
+        dim_str = "Auto"
     src_tag = "Enlace (URL/yt-dlp)" if source_is_url else "Telegram"
 
     lines = [
@@ -195,6 +230,18 @@ def format_draft_summary(
         f"├ **Origen:** `{src_tag}` · **Peso:** `{size_str}`",
         f"└ **Duración:** `{dur_str}` · **Resolución:** `{dim_str}`",
     ]
+    if source_is_url and url_info and url_info.formats:
+        avail_parts = [
+            f"{f.label} ({_format_url_weight(f.est_bytes, f.is_approx)})"
+            for f in url_info.formats[:5]
+        ]
+        if chosen_fmt is not None:
+            fps_note = f" · {chosen_fmt.fps}fps" if chosen_fmt.fps else ""
+            lines.append(
+                f"📥 **Descarga elegida:** `{chosen_fmt.label}{fps_note}` (`{_format_url_weight(chosen_fmt.est_bytes, chosen_fmt.is_approx)}`)"
+            )
+        lines.append(f"📊 **Calidades URL:** `{' · '.join(avail_parts)}`")
+
     if opts.custom_output_name:
         lines.append(f"✏️ **Renombrado:** `{opts.custom_output_name[:56]}`")
     if media:
@@ -254,9 +301,43 @@ def format_draft_summary(
     return "\n".join(lines)
 
 
-def build_main_config_keyboard(session_id: str, opts: CompressionOptions) -> InlineKeyboardMarkup:
+def build_main_config_keyboard(
+    session_id: str,
+    opts: CompressionOptions,
+    source_is_url: bool = False,
+    url_info: UrlProbeInfo | None = None,
+    selected_dl_height: int | None = None,
+) -> InlineKeyboardMarkup:
     doc_label = "📄 Envío: Doc" if opts.send_as_document else "🎞 Envío: Video"
-    return InlineKeyboardMarkup(
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if source_is_url:
+        chosen_fmt = _resolve_selected_url_format(url_info, selected_dl_height)
+        if chosen_fmt is not None:
+            w_str = _format_url_weight(chosen_fmt.est_bytes, chosen_fmt.is_approx)
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"📥 Calidad URL: {chosen_fmt.label} ({w_str})",
+                        callback_data=f"cfg:{session_id}:dl_menu",
+                    ),
+                    InlineKeyboardButton(
+                        "⬇️ Solo Descargar",
+                        callback_data=f"cfg:{session_id}:download_only",
+                    ),
+                ]
+            )
+        else:
+            dl_txt = (
+                f"⬇️ Solo Descargar ({human_bytes(url_info.direct_bytes)})"
+                if url_info and url_info.direct_bytes
+                else "⬇️ Solo Descargar (Sin comprimir)"
+            )
+            rows.append(
+                [InlineKeyboardButton(dl_txt, callback_data=f"cfg:{session_id}:download_only")]
+            )
+
+    rows.extend(
         [
             [
                 InlineKeyboardButton("⚡ Presets (AV1/H265)", callback_data=f"cfg:{session_id}:presets"),
@@ -284,6 +365,38 @@ def build_main_config_keyboard(session_id: str, opts: CompressionOptions) -> Inl
             ],
         ]
     )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_url_quality_keyboard(
+    session_id: str,
+    url_info: UrlProbeInfo | None,
+    selected_dl_height: int | None,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    chosen = _resolve_selected_url_format(url_info, selected_dl_height)
+    if url_info and url_info.formats:
+        for opt in url_info.formats:
+            is_sel = chosen is not None and opt.height == chosen.height
+            mark = "✓ " if is_sel else ""
+            fps_tag = f" · {opt.fps}fps" if opt.fps else ""
+            w_tag = _format_url_weight(opt.est_bytes, opt.is_approx)
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{mark}{opt.label} · {w_tag}{fps_tag}",
+                        callback_data=f"cfg:{session_id}:set_dl_res:{opt.height}",
+                    )
+                ]
+            )
+    rows.append(
+        [
+            InlineKeyboardButton("⬇️ Descargar sin comprimir", callback_data=f"cfg:{session_id}:download_only"),
+            InlineKeyboardButton("🚀 Comprimir así", callback_data=f"cfg:{session_id}:start"),
+        ]
+    )
+    rows.append([InlineKeyboardButton("⬅ Volver al panel", callback_data=f"cfg:{session_id}:main")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_presets_keyboard(session_id: str, current_key: str) -> InlineKeyboardMarkup:

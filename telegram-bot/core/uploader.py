@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+import json
 import logging
 import mimetypes
 import os
@@ -47,6 +48,27 @@ class UploadLinkResult:
     url: str
     provider: str
     expires_note: str
+
+
+@dataclass(slots=True)
+class UrlFormatOption:
+    height: int
+    width: int | None
+    label: str
+    fps: int | None
+    est_bytes: int | None
+    is_approx: bool
+
+
+@dataclass(slots=True)
+class UrlProbeInfo:
+    url: str
+    title: str
+    filename: str
+    duration: float | None
+    is_direct: bool
+    direct_bytes: int | None
+    formats: list[UrlFormatOption]
 
 
 @dataclass(slots=True)
@@ -243,11 +265,11 @@ async def _validate_external_url(url: str) -> str:
     return clean
 
 
-async def _probe_direct_media(url: str) -> bool:
-    """Detecta rápidamente si el enlace apunta directo a un archivo de video descargable por HTTP."""
-    path_ext = Path(unquote(urlparse(url).path)).suffix.lower()
-    if path_ext in _DIRECT_MEDIA_EXTS:
-        return True
+async def _probe_direct_head(url: str) -> tuple[bool, int | None, str]:
+    """Detecta si el enlace apunta directo a un video HTTP y extrae Content-Length/nombre."""
+    path = unquote(urlparse(url).path)
+    path_name = Path(path).name or "video_enlace.mp4"
+    path_ext = Path(path).suffix.lower()
 
     timeout = aiohttp.ClientTimeout(total=12, sock_connect=10, sock_read=10)
     try:
@@ -255,20 +277,195 @@ async def _probe_direct_media(url: str) -> bool:
             async with session.head(url, allow_redirects=True) as resp:
                 await _validate_external_url(str(resp.url))
                 if resp.status >= 400:
-                    return False
+                    return (path_ext in _DIRECT_MEDIA_EXTS), None, path_name
                 ctype = (resp.headers.get("Content-Type") or "").lower()
                 cd = (resp.headers.get("Content-Disposition") or "").lower()
-                if ctype.startswith("video/") or ctype.startswith("audio/"):
-                    return True
-                if "attachment" in cd and any(ext in cd for ext in _DIRECT_MEDIA_EXTS):
-                    return True
-                if "octet-stream" in ctype and path_ext in _DIRECT_MEDIA_EXTS:
-                    return True
-                return False
+                cl_raw = resp.headers.get("Content-Length")
+                cl_val = int(cl_raw) if cl_raw and cl_raw.isdigit() and int(cl_raw) > 0 else None
+                fname = _extract_filename_from_response(str(resp.url), resp)
+                is_direct = (
+                    path_ext in _DIRECT_MEDIA_EXTS
+                    or ctype.startswith("video/")
+                    or ctype.startswith("audio/")
+                    or ("attachment" in cd and any(ext in cd for ext in _DIRECT_MEDIA_EXTS))
+                    or ("octet-stream" in ctype and path_ext in _DIRECT_MEDIA_EXTS)
+                )
+                return is_direct, cl_val, fname
     except RuntimeError:
         raise
     except Exception:
-        return path_ext in _DIRECT_MEDIA_EXTS
+        return (path_ext in _DIRECT_MEDIA_EXTS), None, path_name
+
+
+async def _probe_direct_media(url: str) -> bool:
+    """Detecta rápidamente si el enlace apunta directo a un archivo de video descargable por HTTP."""
+    is_direct, _, _ = await _probe_direct_head(url)
+    return is_direct
+
+
+def _estimate_stream_bytes(fmt: dict, duration: float | None) -> tuple[int | None, bool]:
+    exact = fmt.get("filesize")
+    if isinstance(exact, (int, float)) and exact > 0:
+        return int(exact), False
+    approx = fmt.get("filesize_approx")
+    if isinstance(approx, (int, float)) and approx > 0:
+        return int(approx), True
+    tbr = fmt.get("tbr") or fmt.get("vbr") or fmt.get("abr")
+    if duration and duration > 0 and isinstance(tbr, (int, float)) and tbr > 0:
+        return int((float(tbr) * 1000.0 / 8.0) * duration), True
+    return None, True
+
+
+def _format_res_label(width: int | None, height: int) -> str:
+    if width and width > 0 and width < height:
+        if width in {2160, 1440, 1080, 720, 480, 360, 240, 144}:
+            return f"{width}p ↕"
+        return f"{width}×{height}"
+    return f"{height}p"
+
+
+async def probe_url_info(url: str) -> UrlProbeInfo:
+    """Inspecciona un enlace antes de descargarlo para conocer resoluciones y pesos disponibles."""
+    safe_url = await _validate_external_url(url)
+    is_direct, direct_bytes, direct_name = await _probe_direct_head(safe_url)
+    if is_direct:
+        clean_name = "".join(
+            c if c.isalnum() or c in " -_." else "_" for c in direct_name
+        ).strip(" .") or "video_enlace.mp4"
+        if "." not in clean_name:
+            clean_name += ".mp4"
+        return UrlProbeInfo(
+            url=safe_url,
+            title=Path(clean_name).stem,
+            filename=clean_name[:100],
+            duration=None,
+            is_direct=True,
+            direct_bytes=direct_bytes,
+            formats=[],
+        )
+
+    base_cmd = await asyncio.to_thread(ensure_ytdlp, Path("bin"))
+    if base_cmd is None:
+        raise RuntimeError(
+            "No se pudo instalar automáticamente 'yt-dlp'. "
+            "Verifica la salida a internet del servidor o ejecuta 'pip install yt-dlp'."
+        )
+
+    cmd = [
+        *base_cmd,
+        "--dump-single-json",
+        "--no-playlist",
+        "--no-warnings",
+        "--no-color",
+        "--skip-download",
+        "--",
+        safe_url,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=25.0)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        raise RuntimeError("Tiempo agotado al inspeccionar el enlace.")
+
+    if proc.returncode != 0:
+        err_msg = stderr.decode("utf-8", errors="replace").strip()[:280]
+        raise RuntimeError(f"No se pudo analizar el enlace: {err_msg or f'código {proc.returncode}'}")
+
+    raw_json = stdout.decode("utf-8", errors="replace").strip()
+    data = json.loads(raw_json)
+    if isinstance(data.get("entries"), list) and data["entries"]:
+        first = data["entries"][0]
+        if isinstance(first, dict):
+            data = first
+
+    title = str(data.get("title") or "video_enlace").strip()
+    safe_stem = "".join(c if c.isalnum() or c in " -_." else "_" for c in title).strip(" .")
+    filename = f"{(safe_stem or 'video_enlace')[:84]}.mp4"
+    dur_raw = data.get("duration")
+    duration = float(dur_raw) if isinstance(dur_raw, (int, float)) and dur_raw > 0 else None
+
+    raw_formats = data.get("formats") or []
+    best_audio_bytes = 0
+    best_audio_approx = True
+    for f in raw_formats:
+        if not isinstance(f, dict):
+            continue
+        vcodec = str(f.get("vcodec") or "none").lower()
+        acodec = str(f.get("acodec") or "none").lower()
+        if vcodec == "none" and acodec != "none":
+            a_bytes, a_approx = _estimate_stream_bytes(f, duration)
+            if a_bytes and a_bytes > best_audio_bytes:
+                best_audio_bytes = a_bytes
+                best_audio_approx = a_approx
+
+    grouped: dict[int, tuple[tuple[int, int, float], UrlFormatOption]] = {}
+    for f in raw_formats:
+        if not isinstance(f, dict):
+            continue
+        vcodec = str(f.get("vcodec") or "none").lower()
+        if vcodec == "none":
+            continue
+        h_raw = f.get("height")
+        if not isinstance(h_raw, (int, float)) or int(h_raw) <= 0:
+            continue
+        h_val = int(h_raw)
+        w_raw = f.get("width")
+        w_val = int(w_raw) if isinstance(w_raw, (int, float)) and int(w_raw) > 0 else None
+        fps_raw = f.get("fps")
+        fps_val = int(round(float(fps_raw))) if isinstance(fps_raw, (int, float)) and fps_raw > 0 else None
+
+        v_bytes, v_approx = _estimate_stream_bytes(f, duration)
+        acodec = str(f.get("acodec") or "none").lower()
+        total_bytes = v_bytes
+        is_approx = v_approx
+        if total_bytes is not None and acodec == "none" and best_audio_bytes > 0:
+            total_bytes += best_audio_bytes
+            is_approx = is_approx or best_audio_approx
+
+        ext = str(f.get("ext") or "").lower()
+        tbr = float(f.get("tbr") or f.get("vbr") or 0.0)
+        score = (
+            1 if ext == "mp4" else 0,
+            1 if total_bytes is not None else 0,
+            tbr,
+        )
+        opt = UrlFormatOption(
+            height=h_val,
+            width=w_val,
+            label=_format_res_label(w_val, h_val),
+            fps=fps_val,
+            est_bytes=total_bytes,
+            is_approx=is_approx,
+        )
+        prev = grouped.get(h_val)
+        if prev is None or score > prev[0]:
+            grouped[h_val] = (score, opt)
+
+    formats_sorted = [
+        item[1] for _, item in sorted(grouped.items(), key=lambda kv: kv[0], reverse=True)
+    ][:7]
+
+    top_bytes, _ = _estimate_stream_bytes(data, duration)
+    if top_bytes is None and formats_sorted:
+        top_bytes = formats_sorted[0].est_bytes
+
+    return UrlProbeInfo(
+        url=safe_url,
+        title=title,
+        filename=filename,
+        duration=duration,
+        is_direct=False,
+        direct_bytes=top_bytes,
+        formats=formats_sorted,
+    )
 
 
 async def _download_http_direct(
@@ -321,6 +518,7 @@ async def _download_with_ytdlp(
     max_allowed_bytes: int,
     cancel_event: asyncio.Event,
     on_progress: TransferProgressCb | None = None,
+    max_height: int | None = None,
 ) -> Path:
     base_cmd = await asyncio.to_thread(ensure_ytdlp, Path("bin"))
     if base_cmd is None:
@@ -328,6 +526,15 @@ async def _download_with_ytdlp(
             "No se pudo instalar automáticamente 'yt-dlp'. "
             "Verifica la salida a internet del servidor o ejecuta 'pip install yt-dlp'."
         )
+
+    if max_height and max_height > 0:
+        fmt_expr = (
+            f"bv*[height<={max_height}][ext=mp4]+ba[ext=m4a]/"
+            f"bv*[height<={max_height}]+ba/"
+            f"b[height<={max_height}][ext=mp4]/b[height<={max_height}]/b"
+        )
+    else:
+        fmt_expr = "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b"
 
     dest_root = dest_dir.resolve()
     out_tmpl = str(dest_root / "%(title).70B [%(id).20B].%(ext)s")
@@ -341,7 +548,7 @@ async def _download_with_ytdlp(
         "--max-filesize",
         str(max_allowed_bytes),
         "--format",
-        "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b",
+        fmt_expr,
         "--merge-output-format",
         "mp4",
         "-o",
@@ -432,6 +639,7 @@ async def download_from_url(
     max_allowed_bytes: int,
     cancel_event: asyncio.Event,
     on_progress: TransferProgressCb | None = None,
+    max_height: int | None = None,
 ) -> Path:
     """Descarga un video desde enlace HTTP directo o plataformas (YouTube, TikTok, etc. vía yt-dlp)."""
     safe_url = await _validate_external_url(url)
@@ -453,6 +661,7 @@ async def download_from_url(
         max_allowed_bytes=max_allowed_bytes,
         cancel_event=cancel_event,
         on_progress=on_progress,
+        max_height=max_height,
     )
 
 

@@ -32,10 +32,12 @@ from core.ui_helpers import (
     build_target_size_keyboard,
     build_tools_keyboard,
     build_tracks_keyboard,
+    build_url_quality_keyboard,
     format_draft_summary,
     human_bytes,
     human_duration,
 )
+from core.uploader import UrlProbeInfo, probe_url_info
 from core.user_session import UserSessionManager
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".flv", ".ts", ".wmv"}
@@ -67,6 +69,8 @@ class DraftSession:
     options: CompressionOptions
     source_message: Message | None = None
     source_url: str | None = None
+    url_info: UrlProbeInfo | None = None
+    download_max_height: int | None = None
     media: MediaInfo | None = None
     created_at: float = field(default_factory=time.time)
 
@@ -308,6 +312,7 @@ def register_user_handlers(
         opts: CompressionOptions,
         source_message: Message | None = None,
         source_url: str | None = None,
+        download_max_height: int | None = None,
     ) -> None:
         job_id = secrets.token_hex(4)
         status_msg = await message.reply_text(
@@ -324,6 +329,7 @@ def register_user_handlers(
             options=opts,
             source_message=source_message,
             source_url=source_url,
+            download_max_height=download_max_height,
             expected_size=file_size or (500 * 1024 * 1024),
         )
         pos = await queue_mgr.enqueue(job)
@@ -814,7 +820,7 @@ def register_user_handlers(
                 await _refresh_session_message(session, view="extras")
                 return
 
-        # 2. Enlace directo HTTP(S)
+        # 2. Enlace directo HTTP(S) o YouTube / TikTok / redes
         if URL_REGEX.match(text):
             if not await _check_access(message):
                 return
@@ -835,37 +841,92 @@ def register_user_handlers(
                     file_size=None,
                     opts=opts,
                     source_url=text,
+                    download_max_height=opts.max_height,
                 )
                 return
 
-            sid = secrets.token_hex(5)
-            summary = format_draft_summary(
-                filename=raw_name,
-                file_size=None,
-                duration=None,
-                width=None,
-                height=None,
-                opts=opts,
-                source_is_url=True,
-            )
-            cfg_msg = await message.reply_text(
-                summary,
-                reply_markup=build_main_config_keyboard(sid, opts),
+            probe_msg = await message.reply_text(
+                "🔎 **Analizando enlace...**\nConsultando resoluciones y pesos disponibles...",
                 quote=True,
             )
+
+            url_info: UrlProbeInfo | None = None
+            try:
+                url_info = await probe_url_info(text)
+            except RuntimeError as exc:
+                err_txt = str(exc)
+                if any(
+                    kw in err_txt.lower()
+                    for kw in ("privada", "locales", "http://", "resolver", "reservadas")
+                ):
+                    with contextlib.suppress(Exception):
+                        await probe_msg.edit_text(f"❌ {err_txt}")
+                    return
+                url_info = None
+            except Exception:
+                url_info = None
+
+            sel_height: int | None = None
+            file_size: int | None = None
+            duration: float | None = None
+            width: int | None = None
+            height: int | None = None
+            final_name = raw_name
+
+            if url_info is not None:
+                final_name = url_info.filename or raw_name
+                duration = url_info.duration
+                if url_info.formats:
+                    chosen_fmt = url_info.formats[0]
+                    if opts.max_height:
+                        for fmt in url_info.formats:
+                            if fmt.height == opts.max_height or fmt.width == opts.max_height:
+                                chosen_fmt = fmt
+                                break
+                    sel_height = chosen_fmt.height
+                    file_size = chosen_fmt.est_bytes
+                    width = chosen_fmt.width
+                    height = chosen_fmt.height
+                elif url_info.direct_bytes:
+                    file_size = url_info.direct_bytes
+
+            sid = secrets.token_hex(5)
+            summary = format_draft_summary(
+                filename=final_name,
+                file_size=file_size,
+                duration=duration,
+                width=width,
+                height=height,
+                opts=opts,
+                source_is_url=True,
+                url_info=url_info,
+                selected_dl_height=sel_height,
+            )
+            kb = build_main_config_keyboard(
+                sid,
+                opts,
+                source_is_url=True,
+                url_info=url_info,
+                selected_dl_height=sel_height,
+            )
+            with contextlib.suppress(Exception):
+                await probe_msg.edit_text(summary, reply_markup=kb)
+
             sessions[sid] = DraftSession(
                 session_id=sid,
                 user_id=user_id,
                 user_label=user_label,
                 chat_id=message.chat.id,
-                config_message=cfg_msg,
-                filename=raw_name,
-                file_size=None,
-                duration=None,
-                width=None,
-                height=None,
+                config_message=probe_msg,
+                filename=final_name,
+                file_size=file_size,
+                duration=duration,
+                width=width,
+                height=height,
                 options=opts,
                 source_url=text,
+                url_info=url_info,
+                download_max_height=sel_height,
             )
 
     async def _refresh_session_message(session: DraftSession, view: str = "main") -> None:
@@ -878,6 +939,8 @@ def register_user_handlers(
             opts=session.options,
             media=session.media,
             source_is_url=bool(session.source_url),
+            url_info=session.url_info,
+            selected_dl_height=session.download_max_height,
         )
         if view == "presets":
             kb = build_presets_keyboard(session.session_id, session.options.preset_key)
@@ -891,8 +954,20 @@ def register_user_handlers(
             kb = build_extras_keyboard(session.session_id, session.options)
         elif view == "tools":
             kb = build_tools_keyboard(session.session_id)
+        elif view == "dl_menu":
+            kb = build_url_quality_keyboard(
+                session.session_id,
+                session.url_info,
+                session.download_max_height,
+            )
         else:
-            kb = build_main_config_keyboard(session.session_id, session.options)
+            kb = build_main_config_keyboard(
+                session.session_id,
+                session.options,
+                source_is_url=bool(session.source_url),
+                url_info=session.url_info,
+                selected_dl_height=session.download_max_height,
+            )
 
         with contextlib.suppress(Exception):
             await session.config_message.edit_text(summary, reply_markup=kb)
@@ -920,9 +995,27 @@ def register_user_handlers(
             await query.answer()
             return
 
-        if action in {"main", "presets", "advanced", "target", "tracks", "extras", "tools"}:
+        if action in {"main", "presets", "advanced", "target", "tracks", "extras", "tools", "dl_menu"}:
             await query.answer()
             await _refresh_session_message(session, view=action)
+            return
+
+        if action == "set_dl_res" and len(parts) >= 4:
+            with contextlib.suppress(ValueError):
+                target_h = int(parts[3])
+                session.download_max_height = target_h
+                label = f"{target_h}p"
+                if session.url_info and session.url_info.formats:
+                    for fmt in session.url_info.formats:
+                        if fmt.height == target_h:
+                            session.file_size = fmt.est_bytes
+                            session.width = fmt.width
+                            session.height = fmt.height
+                            w_str = f" (~{human_bytes(fmt.est_bytes)})" if fmt.est_bytes else ""
+                            label = f"{fmt.label}{w_str}"
+                            break
+                await query.answer(f"Calidad descarga: {label}")
+            await _refresh_session_message(session, view="dl_menu")
             return
 
         if action == "set_preset" and len(parts) >= 4:
@@ -1236,6 +1329,7 @@ def register_user_handlers(
                 options=session.options.clone(),
                 source_message=session.source_message,
                 source_url=session.source_url,
+                download_max_height=session.download_max_height,
                 expected_size=session.file_size or (500 * 1024 * 1024),
                 session_id=session.session_id,
                 keep_cached_source=True,
@@ -1244,6 +1338,43 @@ def register_user_handlers(
             )
             pos = await queue_mgr.enqueue(job)
             await query.answer(f"{tool_titles[tool_kind]} encolado (#{pos})")
+            return
+
+        if action == "download_only":
+            sessions.pop(sid, None)
+            awaiting_input.pop(session.user_id, None)
+            job_id = secrets.token_hex(4)
+            has_cache = queue_mgr.has_or_pending_cache(session.session_id)
+            job = CompressionJob(
+                job_id=job_id,
+                user_id=session.user_id,
+                user_label=session.user_label,
+                chat_id=session.chat_id,
+                status_message=session.config_message,
+                filename=session.filename,
+                options=session.options,
+                source_message=session.source_message,
+                source_url=session.source_url,
+                download_max_height=session.download_max_height,
+                expected_size=session.file_size or (500 * 1024 * 1024),
+                session_id=session.session_id if has_cache else None,
+                keep_cached_source=False,
+                action_kind="download_only",
+            )
+            pos = await queue_mgr.enqueue(job)
+            await query.answer(f"Descarga directa encolada (#{pos})")
+            res_note = (
+                f" (`{session.download_max_height}p`)"
+                if session.download_max_height
+                else ""
+            )
+            await session.config_message.edit_text(
+                f"⬇️ **Descarga Directa · En Cola (#{pos})**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{session.filename[:56]}`{res_note}\n"
+                f"└ **Trabajo:** `{job_id}`",
+                reply_markup=build_job_cancel_keyboard(job_id),
+            )
             return
 
         if action == "sample":
@@ -1274,6 +1405,7 @@ def register_user_handlers(
                 options=sample_opts,
                 source_message=session.source_message,
                 source_url=session.source_url,
+                download_max_height=session.download_max_height,
                 expected_size=session.file_size or (500 * 1024 * 1024),
                 session_id=session.session_id,
                 keep_cached_source=True,
@@ -1307,6 +1439,7 @@ def register_user_handlers(
                 options=session.options,
                 source_message=session.source_message,
                 source_url=session.source_url,
+                download_max_height=session.download_max_height,
                 expected_size=session.file_size or (500 * 1024 * 1024),
                 session_id=session.session_id if has_cache else None,
                 keep_cached_source=False,
