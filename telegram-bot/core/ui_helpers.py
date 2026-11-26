@@ -391,7 +391,7 @@ def build_url_quality_keyboard(
             )
     rows.append(
         [
-            InlineKeyboardButton("⬇️ Descargar sin comprimir", callback_data=f"cfg:{session_id}:download_only"),
+            InlineKeyboardButton("⬇️ Solo Descargar", callback_data=f"cfg:{session_id}:download_only"),
             InlineKeyboardButton("🚀 Comprimir así", callback_data=f"cfg:{session_id}:start"),
         ]
     )

@@ -310,9 +310,15 @@ def _estimate_stream_bytes(fmt: dict, duration: float | None) -> tuple[int | Non
     approx = fmt.get("filesize_approx")
     if isinstance(approx, (int, float)) and approx > 0:
         return int(approx), True
-    tbr = fmt.get("tbr") or fmt.get("vbr") or fmt.get("abr")
-    if duration and duration > 0 and isinstance(tbr, (int, float)) and tbr > 0:
-        return int((float(tbr) * 1000.0 / 8.0) * duration), True
+    protocol = str(fmt.get("protocol") or "").lower()
+    is_hls = ("m3u8" in protocol) or ("hls" in protocol)
+    # En HLS (m3u8), 'tbr' suele ser el BANDWIDTH pico del manifiesto (hasta 5-10x mayor al peso real).
+    if is_hls:
+        rate = fmt.get("vbr") or fmt.get("abr")
+    else:
+        rate = fmt.get("tbr") or fmt.get("vbr") or fmt.get("abr")
+    if duration and duration > 0 and isinstance(rate, (int, float)) and rate > 0:
+        return int((float(rate) * 1000.0 / 8.0) * duration), True
     return None, True
 
 
@@ -393,6 +399,7 @@ async def probe_url_info(url: str) -> UrlProbeInfo:
     duration = float(dur_raw) if isinstance(dur_raw, (int, float)) and dur_raw > 0 else None
 
     raw_formats = data.get("formats") or []
+    best_audio_score: tuple[int, int, int, float] = (-1, -1, -1, 0.0)
     best_audio_bytes = 0
     best_audio_approx = True
     for f in raw_formats:
@@ -402,11 +409,24 @@ async def probe_url_info(url: str) -> UrlProbeInfo:
         acodec = str(f.get("acodec") or "none").lower()
         if vcodec == "none" and acodec != "none":
             a_bytes, a_approx = _estimate_stream_bytes(f, duration)
-            if a_bytes and a_bytes > best_audio_bytes:
+            if not a_bytes:
+                continue
+            a_proto = str(f.get("protocol") or "").lower()
+            a_hls = ("m3u8" in a_proto) or ("hls" in a_proto)
+            a_ext = str(f.get("ext") or "").lower()
+            a_abr = float(f.get("abr") or f.get("tbr") or 0.0)
+            a_score = (
+                1 if not a_hls else 0,
+                1 if a_ext in {"m4a", "mp4"} else 0,
+                1 if not a_approx else 0,
+                a_abr,
+            )
+            if a_score > best_audio_score:
+                best_audio_score = a_score
                 best_audio_bytes = a_bytes
                 best_audio_approx = a_approx
 
-    grouped: dict[int, tuple[tuple[int, int, float], UrlFormatOption]] = {}
+    grouped: dict[int, tuple[tuple[int, int, int, int, int, float], UrlFormatOption]] = {}
     for f in raw_formats:
         if not isinstance(f, dict):
             continue
@@ -424,17 +444,23 @@ async def probe_url_info(url: str) -> UrlProbeInfo:
 
         v_bytes, v_approx = _estimate_stream_bytes(f, duration)
         acodec = str(f.get("acodec") or "none").lower()
+        has_audio = acodec != "none"
         total_bytes = v_bytes
         is_approx = v_approx
-        if total_bytes is not None and acodec == "none" and best_audio_bytes > 0:
+        if total_bytes is not None and not has_audio and best_audio_bytes > 0:
             total_bytes += best_audio_bytes
             is_approx = is_approx or best_audio_approx
 
+        proto = str(f.get("protocol") or "").lower()
+        is_hls = ("m3u8" in proto) or ("hls" in proto)
         ext = str(f.get("ext") or "").lower()
         tbr = float(f.get("tbr") or f.get("vbr") or 0.0)
         score = (
+            1 if not is_hls else 0,
+            1 if (total_bytes is not None and not is_approx) else 0,
             1 if ext == "mp4" else 0,
             1 if total_bytes is not None else 0,
+            fps_val or 0,
             tbr,
         )
         opt = UrlFormatOption(
@@ -529,12 +555,18 @@ async def _download_with_ytdlp(
 
     if max_height and max_height > 0:
         fmt_expr = (
+            f"bv*[height<={max_height}][ext=mp4][protocol^=http]+ba[ext=m4a][protocol^=http]/"
+            f"bv*[height<={max_height}][protocol^=http]+ba[protocol^=http]/"
             f"bv*[height<={max_height}][ext=mp4]+ba[ext=m4a]/"
             f"bv*[height<={max_height}]+ba/"
             f"b[height<={max_height}][ext=mp4]/b[height<={max_height}]/b"
         )
     else:
-        fmt_expr = "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b"
+        fmt_expr = (
+            "bv*[ext=mp4][protocol^=http]+ba[ext=m4a][protocol^=http]/"
+            "bv*[protocol^=http]+ba[protocol^=http]/"
+            "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b"
+        )
 
     dest_root = dest_dir.resolve()
     out_tmpl = str(dest_root / "%(title).70B [%(id).20B].%(ext)s")
