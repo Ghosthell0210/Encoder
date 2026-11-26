@@ -109,7 +109,7 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'requirements.txt',
     'Raíz',
-    'Dependencias Python (hydrogram, tgcrypto, aiohttp, aiosqlite, psutil)',
+    'Dependencias Python (hydrogram, tgcrypto, aiohttp, aiosqlite, psutil, yt-dlp)',
     requirementsTxt,
   ),
   makeFile(
@@ -145,7 +145,7 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'core/fast_transfer.py',
     'core/',
-    'Motor legal de descarga/subida paralela MTProto (múltiples conexiones media 20–60+ MB/s)',
+    'Motor legal de descarga/subida paralela MTProto (6×2 conexiones media optimizadas)',
     fastTransferPy,
   ),
   makeFile(
@@ -163,7 +163,7 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'core/job_log_capture.py',
     'core/',
-    'Auto-Log por trabajo con ContextVar: captura avisos no fatales/errores de Python y FFmpeg y los envía al dueño',
+    'Auto-Log por trabajo con ContextVar: filtra esperas MTProto menores y envía avisos reales al dueño',
     jobLogCapturePy,
   ),
   makeFile(
@@ -175,7 +175,7 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'core/ffmpeg_engine.py',
     'core/',
-    'Motor FFmpeg AV1 (SVT-AV1 P4/P6/P8), H.265/H.264, 10-bit, Opus/AAC/Copy, FPS, Metadatos, Trim y subs',
+    'Motor FFmpeg Pro: AV1/H.265/H.264, Anti-Engorde, HDR→SDR Auto, Auto-Crop, Deband, bwdif y Loudnorm',
     ffmpegEnginePy,
   ),
   makeFile(
@@ -205,7 +205,7 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'core/uploader.py',
     'core/',
-    'Descarga HTTP directa y subida streaming >2 GB (GoFile, Buzzheavier y enlace temporal)',
+    'Descarga universal (yt-dlp para YouTube/TikTok/redes + HTTP directo) y subida streaming >2 GB',
     uploaderPy,
   ),
   makeFile(
@@ -236,7 +236,7 @@ export const BOT_FILES: BotFileItem[] = [
   makeFile(
     'handlers/admin_handlers.py',
     'handlers/',
-    'Panel /admin con telemetría psutil, /login, /logout, /setdump, lista blanca y purga',
+    'Panel /admin con telemetría psutil, botón Actualizar Bot, /login, /logout, /setdump y purga',
     adminHandlersPy,
   ),
   makeFile('handlers/__init__.py', 'handlers/', 'Inicializador del paquete handlers', handlersInitPy),

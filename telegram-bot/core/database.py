@@ -142,6 +142,22 @@ class Database:
         # Migración segura de columnas nuevas sobre bases existentes (no pierde datos)
         await self._migrate_users_table()
 
+        # Limpiar picos imposibles de CPU (bug antiguo de doble muestreo en microsegundos)
+        await self._conn.execute(
+            """
+            UPDATE job_metrics
+            SET peak_cpu_pct = ROUND(MIN(MAX(avg_cpu_pct, 100.0), 1600.0), 1)
+            WHERE peak_cpu_pct > 1600.0;
+            """
+        )
+        await self._conn.execute(
+            """
+            UPDATE job_metrics
+            SET avg_cpu_pct = 1600.0
+            WHERE avg_cpu_pct > 1600.0;
+            """
+        )
+
         await self._conn.execute("INSERT OR IGNORE INTO stats (id) VALUES (1);")
         await self._conn.execute(
             """

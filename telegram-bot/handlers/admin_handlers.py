@@ -171,7 +171,13 @@ def register_admin_handlers(
         text, access_mode, conc, uploader, error_alerts = await _render_admin_text()
         await message.reply_text(
             text,
-            reply_markup=build_admin_keyboard(access_mode, conc, uploader, error_alerts=error_alerts),
+            reply_markup=build_admin_keyboard(
+                access_mode,
+                conc,
+                uploader,
+                error_alerts=error_alerts,
+                threads_per_job=queue_mgr.threads_per_job(),
+            ),
         )
 
     @app.on_message(filters.private & filters.command("live"))
@@ -198,7 +204,13 @@ def register_admin_handlers(
         with contextlib.suppress(Exception):
             await query.message.edit_text(
                 text,
-                reply_markup=build_admin_keyboard(access_mode, conc, uploader, error_alerts=error_alerts),
+                reply_markup=build_admin_keyboard(
+                    access_mode,
+                    conc,
+                    uploader,
+                    error_alerts=error_alerts,
+                    threads_per_job=queue_mgr.threads_per_job(),
+                ),
             )
 
     @app.on_callback_query(filters.regex(r"^live:(refresh|cancelall)$"))
@@ -517,6 +529,20 @@ def register_admin_handlers(
             await query.answer(f"Autorizados ({len(users)}): {summary}", show_alert=True)
             return
 
+        elif action == "update":
+            await query.answer("Buscando actualizaciones en GitHub...")
+            status = await query.message.reply_text("🔄 Buscando actualizaciones en GitHub...")
+            ok, msg, changed = await pull_from_github(Path.cwd())
+            if not ok:
+                await status.edit_text(f"❌ {msg}")
+                return
+            if not changed:
+                await status.edit_text(f"✅ {msg}")
+                return
+            await status.edit_text(f"✅ {msg}\n♻️ Reiniciando bot...")
+            restart_process()
+            return
+
         elif action == "refresh":
             await query.answer("Métricas actualizadas")
 
@@ -524,5 +550,11 @@ def register_admin_handlers(
         with contextlib.suppress(Exception):
             await query.message.edit_text(
                 text,
-                reply_markup=build_admin_keyboard(access_mode, conc, uploader, error_alerts=error_alerts),
+                reply_markup=build_admin_keyboard(
+                    access_mode,
+                    conc,
+                    uploader,
+                    error_alerts=error_alerts,
+                    threads_per_job=queue_mgr.threads_per_job(),
+                ),
             )

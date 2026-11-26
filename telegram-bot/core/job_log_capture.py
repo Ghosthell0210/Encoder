@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -144,6 +145,25 @@ _ACTIVE_COLLECTORS: dict[str, JobIssueCollector] = {}
 _HANDLER_INSTALLED = False
 
 
+_MTPROTO_WAIT_RE = re.compile(r"Waiting for (\d+) seconds before continuing", re.IGNORECASE)
+
+
+def _is_benign_runtime_warning(source: str, levelno: int, message: str) -> bool:
+    """Filtra micro-esperas defensivas normales de Hydrogram MTProto (<=10s)."""
+    if levelno >= logging.ERROR:
+        return False
+    m = _MTPROTO_WAIT_RE.search(message)
+    if m:
+        try:
+            if int(m.group(1)) <= 10:
+                return True
+        except ValueError:
+            pass
+    if "hydrogram.session" in source.lower() and "waiting for" in message.lower() and "second" in message.lower():
+        return True
+    return False
+
+
 class _JobContextLogHandler(logging.Handler):
     """Captura registros WARNING+ del logger raíz para el trabajo en curso."""
 
@@ -158,6 +178,8 @@ class _JobContextLogHandler(logging.Handler):
             return
         try:
             msg = record.getMessage()
+            if _is_benign_runtime_warning(record.name, record.levelno, msg):
+                return
             if record.exc_info and record.exc_info[1] is not None:
                 msg = f"{msg} ({type(record.exc_info[1]).__name__}: {record.exc_info[1]})"
             collector.add(record.levelname, record.name, msg)

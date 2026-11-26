@@ -193,7 +193,7 @@ class BotConfig:
     max_disk_gb: float = 30.0
     disk_reserve_gb: float = 2.0
     max_concurrent_jobs: int = 1
-    fast_transfer_workers: int = 10
+    fast_transfer_workers: int = 6
     cpu_auto_detected: bool = False
     ram_auto_detected: bool = False
 
@@ -305,7 +305,7 @@ class BotConfig:
             max_disk_gb=max(5.0, _env_float("MAX_DISK_GB", 30.0)),
             disk_reserve_gb=max(0.5, _env_float("DISK_RESERVE_GB", 2.0)),
             max_concurrent_jobs=max_concurrent,
-            fast_transfer_workers=max(2, min(16, _env_int("FAST_TRANSFER_WORKERS", 10))),
+            fast_transfer_workers=max(2, min(12, _env_int("FAST_TRANSFER_WORKERS", 6))),
             cpu_auto_detected=cpu_auto,
             ram_auto_detected=ram_auto,
             default_access_mode=access_mode,

@@ -12,6 +12,7 @@ import contextlib
 import logging
 import math
 import os
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,10 +28,13 @@ SpeedPreset = Literal["ultrafast", "veryfast", "fast", "medium"]
 AudioCodecName = Literal["aac", "libopus", "copy"]
 SubMode = Literal["none", "soft", "hard"]
 WatermarkPos = Literal["tl", "tr", "bl", "br"]
+HdrMode = Literal["auto", "on", "off"]
 
 MP4_SAFE_AUDIO_CODECS = {"aac", "mp3", "opus", "ac3", "eac3", "alac", "mp4a", "mp2"}
 
 _ENCODER_CACHE: dict[str, bool] = {}
+_FILTER_CACHE: dict[str, bool] = {}
+_CROPDETECT_RE = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
 
 
 async def is_encoder_available(encoder_name: str) -> bool:
@@ -51,6 +55,27 @@ async def is_encoder_available(encoder_name: str) -> bool:
     except Exception:
         available = False
     _ENCODER_CACHE[encoder_name] = available
+    return available
+
+
+async def is_filter_available(filter_name: str) -> bool:
+    """Verifica (con caché en memoria) si el binario ffmpeg incluye un filtro."""
+    if filter_name in _FILTER_CACHE:
+        return _FILTER_CACHE[filter_name]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-hide_banner",
+            "-filters",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        text = stdout.decode("utf-8", errors="replace")
+        available = bool(re.search(rf"\b{re.escape(filter_name)}\b", text))
+    except Exception:
+        available = False
+    _FILTER_CACHE[filter_name] = available
     return available
 
 
@@ -200,6 +225,13 @@ class CompressionOptions:
     meta_title: str = ""
     meta_artist: str = ""
     strip_metadata: bool = False
+    # Filtros Pro Encoder
+    hdr_to_sdr: HdrMode = "auto"
+    auto_crop: bool = False
+    av1_film_grain: bool = False
+    deband: bool = False
+    deinterlace: bool = False
+    loudnorm: bool = False
     # Renombrado personalizado del archivo final (sin extensión)
     custom_output_name: str = ""
     send_as_document: bool = False
@@ -256,6 +288,12 @@ class CompressionOptions:
             meta_title=self.meta_title,
             meta_artist=self.meta_artist,
             strip_metadata=self.strip_metadata,
+            hdr_to_sdr=self.hdr_to_sdr,
+            auto_crop=self.auto_crop,
+            av1_film_grain=self.av1_film_grain,
+            deband=self.deband,
+            deinterlace=self.deinterlace,
+            loudnorm=self.loudnorm,
             custom_output_name=self.custom_output_name,
             send_as_document=self.send_as_document,
         )
@@ -279,6 +317,12 @@ class CompressionOptions:
             "meta_title": self.meta_title,
             "meta_artist": self.meta_artist,
             "strip_metadata": self.strip_metadata,
+            "hdr_to_sdr": self.hdr_to_sdr,
+            "auto_crop": self.auto_crop,
+            "av1_film_grain": self.av1_film_grain,
+            "deband": self.deband,
+            "deinterlace": self.deinterlace,
+            "loudnorm": self.loudnorm,
             "send_as_document": self.send_as_document,
         }
 
@@ -330,6 +374,11 @@ class CompressionOptions:
             opts.meta_artist = data["meta_artist"][:96]
         if isinstance(data.get("strip_metadata"), bool):
             opts.strip_metadata = data["strip_metadata"]
+        if data.get("hdr_to_sdr") in {"auto", "on", "off"}:
+            opts.hdr_to_sdr = data["hdr_to_sdr"]
+        for bool_field in ("auto_crop", "av1_film_grain", "deband", "deinterlace", "loudnorm"):
+            if isinstance(data.get(bool_field), bool):
+                setattr(opts, bool_field, data[bool_field])
         if isinstance(data.get("send_as_document"), bool):
             opts.send_as_document = data["send_as_document"]
         return opts
@@ -453,12 +502,27 @@ def _compute_target_bitrates(
     return video_kbps, audio_kbps
 
 
-def _count_selected_audio_tracks(media: MediaInfo, opts: CompressionOptions) -> int:
+def _selected_audio_tracks(media: MediaInfo, opts: CompressionOptions):
     if not media.audio_tracks or opts.audio_mode == "none":
-        return 0
+        return []
     if opts.audio_mode == "all":
-        return len(media.audio_tracks)
-    return 1
+        return media.audio_tracks
+    if opts.audio_mode.startswith("track:"):
+        idx = int(opts.audio_mode.split(":", 1)[1])
+        return [t for t in media.audio_tracks if t.rel_index == idx]
+    return media.audio_tracks[:1]
+
+
+def _effective_audio_bitrate_k(media: MediaInfo, opts: CompressionOptions, requested_k: int) -> int:
+    """Evita inflar el bitrate de audio por encima del origen cuando el bitrate fuente es conocido."""
+    selected = _selected_audio_tracks(media, opts)
+    known = [t.bitrate_kbps for t in selected if t.bitrate_kbps > 0]
+    if not known:
+        return requested_k
+    max_src = max(known)
+    if max_src < requested_k:
+        return max(32, max_src)
+    return requested_k
 
 
 def _build_audio_args(
@@ -467,34 +531,109 @@ def _build_audio_args(
     audio_count: int,
     bitrate_k: int,
     use_mkv: bool,
-) -> list[str]:
+    apply_loudnorm: bool = False,
+) -> tuple[list[str], int]:
     if audio_count <= 0:
-        return ["-an"]
+        return ["-an"], 0
 
-    if opts.audio_codec == "copy":
+    selected = _selected_audio_tracks(media, opts)
+    audio_codec = opts.audio_codec
+
+    # -af loudnorm requiere recodificar el audio (no es compatible con copy)
+    if apply_loudnorm and audio_codec == "copy":
+        audio_codec = "libopus" if (opts.codec == "libsvtav1" or use_mkv) else "aac"
+
+    if audio_codec == "copy":
         if not use_mkv:
-            # Verificar que las pistas seleccionadas sean compatibles con MP4
-            if opts.audio_mode == "all":
-                selected = media.audio_tracks
-            elif opts.audio_mode.startswith("track:"):
-                idx = int(opts.audio_mode.split(":", 1)[1])
-                selected = [t for t in media.audio_tracks if t.rel_index == idx]
-            else:
-                selected = media.audio_tracks[:1]
             incompat = [t for t in selected if t.codec.lower() not in MP4_SAFE_AUDIO_CODECS]
             if incompat:
+                eff_k = _effective_audio_bitrate_k(media, opts, bitrate_k)
                 logger.warning(
                     "Audio '%s' no es compatible con copia directa en MP4; convirtiendo a AAC %dk.",
                     incompat[0].codec,
-                    bitrate_k,
+                    eff_k,
                 )
-                return ["-c:a", "aac", "-b:a", f"{bitrate_k}k", "-ac", "2"]
-        return ["-c:a", "copy"]
+                args = ["-c:a", "aac", "-b:a", f"{eff_k}k", "-ac", "2"]
+                if apply_loudnorm:
+                    args.extend(["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"])
+                return args, eff_k
+        src_sum = sum(t.bitrate_kbps for t in selected if t.bitrate_kbps > 0) or (bitrate_k * audio_count)
+        return ["-c:a", "copy"], src_sum
 
-    if opts.audio_codec == "libopus":
-        return ["-c:a", "libopus", "-b:a", f"{bitrate_k}k", "-vbr", "on", "-ac", "2"]
+    eff_k = _effective_audio_bitrate_k(media, opts, bitrate_k)
+    if audio_codec == "libopus":
+        args = ["-c:a", "libopus", "-b:a", f"{eff_k}k", "-vbr", "on", "-ac", "2"]
+    else:
+        args = ["-c:a", "aac", "-b:a", f"{eff_k}k", "-ac", "2"]
 
-    return ["-c:a", "aac", "-b:a", f"{bitrate_k}k", "-ac", "2"]
+    if apply_loudnorm:
+        args.extend(["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"])
+    return args, eff_k * audio_count
+
+
+async def _detect_crop_region(
+    input_path: Path,
+    duration_sec: float,
+    orig_w: int,
+    orig_h: int,
+    cancel_event: asyncio.Event,
+) -> tuple[int, int, int, int] | None:
+    """Detecta barras negras de cine muestreando 3 puntos rápidos con cropdetect."""
+    if orig_w < 128 or orig_h < 128 or duration_sec <= 0:
+        return None
+
+    fractions = (0.25, 0.50, 0.75) if duration_sec >= 8.0 else (0.4,)
+    boxes: list[tuple[int, int, int, int]] = []
+
+    for frac in fractions:
+        if cancel_event.is_set():
+            raise JobCancelledError("Compresión cancelada por el usuario.")
+        ts = max(0.0, min(duration_sec - 0.5, duration_sec * frac))
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-ss",
+            f"{ts:.2f}",
+            "-i",
+            str(input_path),
+            "-frames:v",
+            "10",
+            "-vf",
+            "cropdetect=limit=24:round=16:reset=0",
+            "-an",
+            "-sn",
+            "-f",
+            "null",
+            "NUL" if os.name == "nt" else "/dev/null",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        text = stderr.decode("utf-8", errors="replace")
+        for m in _CROPDETECT_RE.finditer(text):
+            cw, ch, cx, cy = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+            if cw >= 128 and ch >= 128 and cw <= orig_w and ch <= orig_h:
+                boxes.append((cw, ch, cx, cy))
+
+    if not boxes:
+        return None
+
+    # Caja envolvente segura (unión de los puntos detectados) para no cortar subtítulos ni escenas claras
+    min_x = min(b[2] for b in boxes)
+    min_y = min(b[3] for b in boxes)
+    max_r = max(b[2] + b[0] for b in boxes)
+    max_b = max(b[3] + b[1] for b in boxes)
+    crop_w = ((max_r - min_x) // 2) * 2
+    crop_h = ((max_b - min_y) // 2) * 2
+
+    if crop_w < 128 or crop_h < 128:
+        return None
+    if (orig_w - crop_w) < 16 and (orig_h - crop_h) < 16:
+        return None
+    return crop_w, crop_h, min_x, min_y
 
 
 async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
@@ -697,9 +836,11 @@ async def compress_video(
     on_progress: ProgressCallback | None = None,
     register_proc: Callable[[asyncio.subprocess.Process | None], None] | None = None,
     external_sub_path: Path | None = None,
+    notes_out: list[str] | None = None,
 ) -> Path:
     """Comprime el video según todas las opciones configuradas y devuelve la ruta final."""
     reg = register_proc or (lambda _p: None)
+    notes = notes_out if notes_out is not None else []
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if opts.codec == "libsvtav1" and not await is_encoder_available("libsvtav1"):
@@ -751,15 +892,61 @@ async def compress_video(
         if opts.subtitle_mode == "soft":
             input_args.extend(["-i", str(ext_sub_local)])
 
-    # ── Cadena de filtros de video (-vf) ──────────────────────────────────────
+    # ── Cadena de filtros de video (-vf) en orden óptimo ──────────────────────
     vf_parts: list[str] = []
+    effective_src_h = media.height
+
+    # [1] Desentrelazado (bwdif)
+    if opts.deinterlace and await is_filter_available("bwdif"):
+        vf_parts.append("bwdif=mode=send_frame:parity=auto:deint=all")
+        notes.append("bwdif")
+
+    # [2] Auto-Recorte de barras negras (cropdetect)
+    if opts.auto_crop:
+        crop_box = await _detect_crop_region(
+            media.path, media.duration, media.width, media.height, cancel_event
+        )
+        if crop_box is not None:
+            cw, ch, cx, cy = crop_box
+            vf_parts.append(f"crop={cw}:{ch}:{cx}:{cy}")
+            effective_src_h = ch
+            notes.append(f"Crop {cw}×{ch}")
+
+    # [3] Conversión HDR -> SDR (Auto por defecto si el origen es HDR)
+    want_tonemap = (opts.hdr_to_sdr == "on") or (opts.hdr_to_sdr == "auto" and media.is_hdr)
+    applied_tonemap = False
+    target_pix_fmt = "yuv420p10le" if (opts.bit_depth == 10 and opts.codec != "libx264") else "yuv420p"
+    if want_tonemap:
+        if await is_filter_available("zscale") and await is_filter_available("tonemap"):
+            vf_parts.extend(
+                [
+                    "zscale=transfer=linear:npl=100",
+                    "format=gbrpf32le",
+                    "zscale=p=bt709",
+                    "tonemap=tonemap=hable:desat=0",
+                    "zscale=transfer=bt709:matrix=bt709:range=tv",
+                    f"format={target_pix_fmt}",
+                ]
+            )
+            applied_tonemap = True
+            notes.append("HDR→SDR")
+        else:
+            logger.warning("Filtro zscale/tonemap no disponible en este binario FFmpeg; se omite HDR→SDR.")
+
+    # [4] Deband (suavizado de degradados oscuros)
+    if opts.deband and await is_filter_available("deband"):
+        vf_parts.append("deband=range=16:thr=0.02:thg=0.02:thb=0.02")
+        notes.append("Deband")
+
+    # [5] FPS + Escalado Lanczos
     if opts.target_fps in {24, 30, 60}:
         vf_parts.append(f"fps={opts.target_fps}")
-    if opts.max_height is not None and media.height > opts.max_height:
+    if opts.max_height is not None and effective_src_h > opts.max_height:
         vf_parts.append(f"scale=-2:{opts.max_height}:flags=lanczos")
     else:
         vf_parts.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
 
+    # [6] Subtítulos quemados (Hardsub) y Marca de agua
     if opts.subtitle_mode == "hard":
         if ext_sub_local is not None:
             vf_parts.append(f"subtitles={ext_sub_local.name}")
@@ -785,7 +972,8 @@ async def compress_video(
     vf_filter = ",".join(vf_parts)
 
     # ── Mapeo de audio y subtítulos ───────────────────────────────────────────
-    audio_count = _count_selected_audio_tracks(media, opts)
+    selected_audio = _selected_audio_tracks(media, opts)
+    audio_count = len(selected_audio)
     map_args: list[str] = ["-map", "0:v:0"]
 
     if audio_count > 0:
@@ -822,31 +1010,40 @@ async def compress_video(
     if opts.meta_artist.strip():
         meta_args.extend(["-metadata", f"artist={opts.meta_artist.strip()[:96]}"])
 
-    # ── Códec, 8-bit vs 10-bit y control estricto de hilos/RAM ────────────────
+    # ── Códec, 8-bit vs 10-bit y optimización SVT-AV1 / x265 ──────────────────
     safe_threads = max(1, threads)
     if opts.codec == "libsvtav1":
-        pix_fmt = "yuv420p10le" if opts.bit_depth == 10 else "yuv420p"
+        svt_params = [
+            "tune=0",
+            "enable-overlays=1",
+            "scd=1",
+            "scm=0",
+            f"lp={safe_threads}",
+            "keyint=10s",
+        ]
+        if opts.av1_film_grain:
+            svt_params.append("film-grain=8")
+            notes.append("Grano AV1")
         codec_base: list[str] = [
             "-c:v",
             "libsvtav1",
             "-preset",
             str(max(0, min(13, opts.av1_preset))),
             "-pix_fmt",
-            pix_fmt,
+            target_pix_fmt,
             "-threads",
             str(safe_threads),
             "-svtav1-params",
-            f"tune=0:lp={safe_threads}:keyint=10s",
+            ":".join(svt_params),
         ]
     else:
-        pix_fmt = "yuv420p10le" if (opts.bit_depth == 10 and opts.codec == "libx265") else "yuv420p"
         codec_base = [
             "-c:v",
             opts.codec,
             "-preset",
             opts.speed,
             "-pix_fmt",
-            pix_fmt,
+            target_pix_fmt,
             "-threads",
             str(safe_threads),
         ]
@@ -856,14 +1053,22 @@ async def compress_video(
     def _x265_extra(extra_pairs: list[str] | None = None) -> list[str]:
         if opts.codec != "libx265":
             return []
-        params = [f"pools={safe_threads}", "log-level=error"]
+        params = [f"pools={safe_threads}", "log-level=error", "aq-mode=3"]
         if opts.bit_depth == 10:
             params.append("profile=main10")
         if extra_pairs:
             params.extend(extra_pairs)
         return ["-x265-params", ":".join(params), "-tag:v", "hvc1"]
 
+    color_args = (
+        ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
+        if applied_tonemap
+        else []
+    )
     container_flags = ["-movflags", "+faststart"] if not use_mkv else []
+    apply_loudnorm = bool(opts.loudnorm and audio_count > 0 and await is_filter_available("loudnorm"))
+    if apply_loudnorm:
+        notes.append("Loudnorm")
 
     # ── MODO A: 2-Pass Tamaño Exacto en MB (no se aplica en Sample 15s) ───────
     if opts.target_mb is not None and opts.target_mb > 0 and not opts.sample_duration:
@@ -927,7 +1132,9 @@ async def compress_video(
             register_proc=reg,
         )
 
-        audio_args = _build_audio_args(media, opts, audio_count, audio_kbps, use_mkv)
+        audio_args, _ = _build_audio_args(
+            media, opts, audio_count, audio_kbps, use_mkv, apply_loudnorm=apply_loudnorm
+        )
 
         pass2_cmd = [
             "ffmpeg",
@@ -950,6 +1157,7 @@ async def compress_video(
             "-bufsize",
             f"{int(video_kbps * 2.0)}k",
             *pass2_extra,
+            *color_args,
             *audio_args,
             *sub_args,
             *meta_args,
@@ -970,8 +1178,22 @@ async def compress_video(
         )
         return output_path
 
-    # ── MODO B: CRF Inteligente (o Muestra 15s) ───────────────────────────────
-    audio_args = _build_audio_args(media, opts, audio_count, opts.audio_bitrate_k, use_mkv)
+    # ── MODO B: CRF Inteligente + Anti-Engorde Automático ─────────────────────
+    audio_args, est_audio_kbps = _build_audio_args(
+        media, opts, audio_count, opts.audio_bitrate_k, use_mkv, apply_loudnorm=apply_loudnorm
+    )
+
+    antibloat_args: list[str] = []
+    if not opts.sample_duration and media.duration > 0 and media.file_size > 0:
+        orig_overall_kbps = int((media.file_size * 8) / (media.duration * 1000.0))
+        if orig_overall_kbps > 150:
+            cap_kbps = int(orig_overall_kbps * 0.90) - est_audio_kbps
+            if media.video_bitrate_kbps > 120:
+                cap_kbps = min(cap_kbps, int(media.video_bitrate_kbps * 0.92))
+            if cap_kbps >= 90:
+                antibloat_args = ["-maxrate", f"{cap_kbps}k", "-bufsize", f"{cap_kbps * 2}k"]
+                notes.append(f"Anti-Engorde ≤{cap_kbps}k")
+
     label_prefix = "Muestra 15s" if opts.sample_duration else "Codificando"
 
     crf_cmd = [
@@ -990,7 +1212,9 @@ async def compress_video(
         *codec_base,
         "-crf",
         str(opts.crf),
+        *antibloat_args,
         *_x265_extra(),
+        *color_args,
         *audio_args,
         *sub_args,
         *meta_args,

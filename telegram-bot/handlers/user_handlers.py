@@ -203,7 +203,7 @@ def register_user_handlers(
         text = (
             "🎬 **HydroCompress Bot**\n"
             f"`{DIVIDER}`\n"
-            "Envíame cualquier **video**, **archivo** (hasta 2 GB) o **enlace directo `http(s)://`** para comprimirlo en **AV1 / H.265 / H.264** o usar herramientas rápidas.\n\n"
+            "Envíame cualquier **video**, **archivo** (hasta 2 GB) o **enlace** (`YouTube`, `TikTok`, `Instagram`, `X` o descarga directa) para comprimirlo en **AV1 / H.265 / H.264** o usar herramientas rápidas.\n\n"
             "⚙️ **Tu Perfil**\n"
             f"├ **Modo:** `{auto_tag}`\n"
             f"├ **Ajuste base:** {_format_saved_preset_line(opts)}\n"
@@ -998,6 +998,36 @@ def register_user_handlers(
             await _refresh_session_message(session, view="advanced")
             return
 
+        if action == "toggle_grain":
+            session.options.av1_film_grain = not session.options.av1_film_grain
+            await query.answer(
+                f"Grano AV1: {'ON' if session.options.av1_film_grain else 'OFF'}"
+            )
+            await _refresh_session_message(session, view="advanced")
+            return
+
+        if action == "toggle_crop":
+            session.options.auto_crop = not session.options.auto_crop
+            await query.answer(
+                f"Auto-Crop barras negras: {'ON' if session.options.auto_crop else 'OFF'}"
+            )
+            await _refresh_session_message(session, view="advanced")
+            return
+
+        if action == "cycle_hdr":
+            order = ("auto", "on", "off")
+            cur = session.options.hdr_to_sdr
+            nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "auto"
+            session.options.hdr_to_sdr = nxt  # type: ignore[assignment]
+            labels = {
+                "auto": "HDR→SDR: Auto (si detecta HDR)",
+                "on": "HDR→SDR: Forzado ON",
+                "off": "HDR→SDR: OFF (conservar HDR)",
+            }
+            await query.answer(labels[nxt])
+            await _refresh_session_message(session, view="advanced")
+            return
+
         if action == "set_mb" and len(parts) >= 4:
             session.options.target_mb = float(parts[3])
             await query.answer(f"Objetivo 2-Pass: {parts[3]} MB")
@@ -1091,6 +1121,24 @@ def register_user_handlers(
             await query.answer(
                 f"Limpiar metadatos: {'ON' if session.options.strip_metadata else 'OFF'}"
             )
+            await _refresh_session_message(session, view="extras")
+            return
+
+        if action == "toggle_deband":
+            session.options.deband = not session.options.deband
+            await query.answer(f"Deband: {'ON' if session.options.deband else 'OFF'}")
+            await _refresh_session_message(session, view="extras")
+            return
+
+        if action == "toggle_deint":
+            session.options.deinterlace = not session.options.deinterlace
+            await query.answer(f"Desentrelazar (bwdif): {'ON' if session.options.deinterlace else 'OFF'}")
+            await _refresh_session_message(session, view="extras")
+            return
+
+        if action == "toggle_loudnorm":
+            session.options.loudnorm = not session.options.loudnorm
+            await query.answer(f"Nivelar Audio (loudnorm): {'ON' if session.options.loudnorm else 'OFF'}")
             await _refresh_session_message(session, view="extras")
             return
 

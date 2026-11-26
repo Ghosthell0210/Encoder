@@ -760,6 +760,7 @@ class QueueManager:
                 )
                 await updater.update(text, reply_markup=cancel_kb)
 
+            encode_notes: list[str] = []
             output_path = await compress_video(
                 media=media,
                 output_dir=job_dir / "out",
@@ -769,6 +770,7 @@ class QueueManager:
                 on_progress=_on_encode_progress,
                 register_proc=_reg_proc,
                 external_sub_path=external_sub_path,
+                notes_out=encode_notes,
             )
 
             output_size = output_path.stat().st_size
@@ -851,6 +853,7 @@ class QueueManager:
                 updater=updater,
                 cancel_kb=cancel_kb,
                 metrics=metrics,
+                encode_notes=encode_notes,
             )
             outcome = "Completado con avisos" if collector.has_issues else "Completado"
 
@@ -897,6 +900,7 @@ class QueueManager:
         metrics: JobResourceMetrics | None = None,
         custom_summary: str | None = None,
         record_stats: bool = True,
+        encode_notes: list[str] | None = None,
     ) -> None:
         dump_id_raw = await self.db.get_setting("dump_chat_id", str(self.config.dump_chat_id or 0))
         dump_chat_id = int(dump_id_raw) if dump_id_raw.lstrip("-").isdigit() else 0
@@ -922,6 +926,7 @@ class QueueManager:
                 custom_caption=custom_summary,
                 record_stats=record_stats,
                 metrics=metrics,
+                encode_notes=encode_notes,
             )
         elif can_use_premium:
             await self._deliver_via_premium_account(
@@ -939,6 +944,7 @@ class QueueManager:
                 custom_caption=custom_summary,
                 record_stats=record_stats,
                 metrics=metrics,
+                encode_notes=encode_notes,
             )
         else:
             await self._deliver_via_link(
@@ -952,6 +958,7 @@ class QueueManager:
                 updater=updater,
                 cancel_kb=cancel_kb,
                 metrics=metrics,
+                encode_notes=encode_notes,
             )
 
     async def _deliver_via_premium_account(
@@ -970,6 +977,7 @@ class QueueManager:
         custom_caption: str | None = None,
         record_stats: bool = True,
         metrics: JobResourceMetrics | None = None,
+        encode_notes: list[str] | None = None,
     ) -> None:
         assert self.user_session.client is not None
         job.phase = "Subiendo (Premium)"
@@ -1005,6 +1013,11 @@ class QueueManager:
             summary_msg = custom_caption
         else:
             sign = "-" if reduction_pct >= 0 else "+"
+            notes_line = (
+                f"├ **Motor Pro:** `{' · '.join(encode_notes)}`\n"
+                if encode_notes
+                else ""
+            )
             usage_line = (
                 f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
                 if metrics is not None
@@ -1016,6 +1029,7 @@ class QueueManager:
                 f"├ **Archivo:** `{output_path.name[:72]}`\n"
                 f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
                 f"├ **Video:** `{out_media.width}×{out_media.height}` · `{job.options.codec_display_label()}` · `{human_duration(out_media.duration)}`\n"
+                f"{notes_line}"
                 f"{usage_line}"
                 f"└ **Tiempo total:** `{human_duration(elapsed_total)}`"
             )
@@ -1172,6 +1186,7 @@ class QueueManager:
         custom_caption: str | None = None,
         record_stats: bool = True,
         metrics: JobResourceMetrics | None = None,
+        encode_notes: list[str] | None = None,
     ) -> None:
         job.phase = "Subiendo a Telegram"
         job.progress_pct = 0.0
@@ -1212,6 +1227,11 @@ class QueueManager:
             summary_msg = custom_caption
         else:
             sign = "-" if reduction_pct >= 0 else "+"
+            notes_line = (
+                f"├ **Motor Pro:** `{' · '.join(encode_notes)}`\n"
+                if encode_notes
+                else ""
+            )
             usage_line = (
                 f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
                 if metrics is not None
@@ -1223,6 +1243,7 @@ class QueueManager:
                 f"├ **Archivo:** `{output_path.name[:72]}`\n"
                 f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
                 f"├ **Video:** `{out_media.width}×{out_media.height}` · `{job.options.codec_display_label()}` · `{human_duration(out_media.duration)}`\n"
+                f"{notes_line}"
                 f"{usage_line}"
                 f"└ **Tiempo total:** `{human_duration(elapsed_total)}`"
             )
@@ -1262,6 +1283,7 @@ class QueueManager:
         updater: ProgressUpdater,
         cancel_kb: Any,
         metrics: JobResourceMetrics | None = None,
+        encode_notes: list[str] | None = None,
     ) -> None:
         job.phase = "Subiendo enlace (>2 GB)"
         job.progress_pct = 0.0
@@ -1318,6 +1340,11 @@ class QueueManager:
         )
 
         sign = "-" if reduction_pct >= 0 else "+"
+        notes_line = (
+            f"├ **Motor Pro:** `{' · '.join(encode_notes)}`\n"
+            if encode_notes
+            else ""
+        )
         usage_line = (
             f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
             if metrics is not None
@@ -1330,6 +1357,7 @@ class QueueManager:
             f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
             f"├ **Video:** `{out_media.width}×{out_media.height}` · `{job.options.codec_display_label()}` · `{human_duration(out_media.duration)}`\n"
             f"├ **Proveedor:** `{result.provider}`\n"
+            f"{notes_line}"
             f"{usage_line}"
             f"└ **Tiempo total:** `{human_duration(elapsed_total)}`\n\n"
             f"📥 **Enlace:** {result.url}\n"

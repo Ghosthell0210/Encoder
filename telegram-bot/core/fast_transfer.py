@@ -5,8 +5,8 @@ con upload.GetFile de 1 MiB en paralelo para descargas y upload.SaveBigFilePart
 de 512 KiB con pipelining en paralelo para subidas), igual que Telegram Desktop y TDLib.
 
 - Escribe/lee bloques directo en disco con os.pwrite/os.pread (consumo mínimo de RAM).
-- Pipelining multi-conexión (hasta 12 conexiones × 4 bloques en vuelo en subida) para
-  saturar enlaces de alta latencia (ej. VPS Europa ↔ Telegram DC1 Miami).
+- Pipelining multi-conexión equilibrado (hasta 8 conexiones × 2 bloques en vuelo) con
+  arranque escalonado para evitar tormentas de FloodWait en enlaces de alta latencia.
 - Re-encolado automático de bloques si una conexión cae (sin abortar toda la subida).
 - Fallback transparente al método estándar de Hydrogram solo si el pool completo falla.
 """
@@ -151,7 +151,7 @@ async def fast_download_media(
     dest_path: Path,
     cancel_event: asyncio.Event,
     on_progress: ProgressCb | None = None,
-    workers: int = 10,
+    workers: int = 6,
 ) -> Path:
     """Descarga un video/documento de Telegram en paralelo (múltiples conexiones MTProto)."""
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -183,8 +183,8 @@ async def fast_download_media(
         )
 
         total_chunks = math.ceil(total_size / DOWNLOAD_CHUNK_SIZE)
-        conn_count = max(2, min(workers, total_chunks, 12))
-        in_flight_per_conn = 3
+        conn_count = max(2, min(workers, total_chunks, 8))
+        in_flight_per_conn = 2
 
         t0 = time.monotonic()
         sessions = await _open_media_pool(client, dc_id, conn_count)
@@ -209,8 +209,10 @@ async def fast_download_media(
             with contextlib.suppress(OSError):
                 os.ftruncate(fd, total_size)
 
-            async def _worker(sess: Session) -> None:
+            async def _worker(sess: Session, stagger_idx: int) -> None:
                 nonlocal downloaded_bytes, last_cb_time
+                if stagger_idx > 0:
+                    await asyncio.sleep(min(0.6, 0.05 * stagger_idx))
                 while True:
                     if cancel_event.is_set():
                         raise JobCancelledError("Descarga cancelada por el usuario.")
@@ -246,6 +248,10 @@ async def fast_download_media(
                                 await on_progress(min(cur, total_size), total_size)
                     except FloodWait as fw:
                         wait_sec = int(getattr(fw, "value", 5)) + 1
+                        if wait_sec > 10:
+                            logger.warning("FloodWait de %ss en descarga paralela", wait_sec)
+                        else:
+                            logger.debug("Pausa FloodWait de %ss en descarga paralela", wait_sec)
                         await asyncio.sleep(min(wait_sec, 30))
                         if retries < 6:
                             chunk_queue.put_nowait((offset, retries + 1))
@@ -263,9 +269,9 @@ async def fast_download_media(
                         chunk_queue.task_done()
 
             tasks = [
-                asyncio.create_task(_worker(sess))
-                for sess in sessions
-                for _ in range(in_flight_per_conn)
+                asyncio.create_task(_worker(sess, idx * in_flight_per_conn + slot))
+                for idx, sess in enumerate(sessions)
+                for slot in range(in_flight_per_conn)
             ]
 
             try:
@@ -320,20 +326,20 @@ async def _fast_upload_big_file(
     file_path: Path,
     cancel_event: asyncio.Event,
     on_progress: ProgressCb | None = None,
-    workers: int = 10,
+    workers: int = 6,
 ) -> raw.types.InputFileBig:
     """Sube un archivo >10 MiB en paralelo mediante upload.SaveBigFilePart (512 KiB).
 
-    Usa hasta 12 conexiones TCP media independientes con 4 partes en vuelo por conexión
-    (ventana de hasta 24 MiB) para maximizar la velocidad incluso con alta latencia a DC1.
+    Usa hasta 8 conexiones TCP media independientes con 2 partes en vuelo por conexión
+    para mantener alto rendimiento reduciendo pausas FloodWait de Telegram.
     """
     total_size = file_path.stat().st_size
     total_parts = math.ceil(total_size / UPLOAD_PART_SIZE)
     file_id = secrets.randbits(63)
     main_dc = await client.storage.dc_id()
 
-    conn_count = max(2, min(workers, total_parts, 12))
-    in_flight_per_conn = 4
+    conn_count = max(2, min(workers, total_parts, 8))
+    in_flight_per_conn = 2
 
     t0 = time.monotonic()
     sessions = await _open_media_pool(client, main_dc, conn_count)
@@ -356,9 +362,11 @@ async def _fast_upload_big_file(
     fd = os.open(str(file_path), os.O_RDONLY)
 
     try:
-        async def _worker(sess: Session) -> None:
+        async def _worker(sess: Session, stagger_idx: int) -> None:
             nonlocal uploaded_bytes, last_cb_time
             consecutive_errors = 0
+            if stagger_idx > 0:
+                await asyncio.sleep(min(0.6, 0.05 * stagger_idx))
 
             while True:
                 if cancel_event.is_set():
@@ -403,7 +411,10 @@ async def _fast_upload_big_file(
                         await on_progress(min(cur, total_size), total_size)
                 except FloodWait as fw:
                     wait_sec = int(getattr(fw, "value", 5)) + 1
-                    logger.warning("FloodWait de %ss en subida paralela (parte %d)", wait_sec, part_idx)
+                    if wait_sec > 10:
+                        logger.warning("FloodWait de %ss en subida paralela (parte %d)", wait_sec, part_idx)
+                    else:
+                        logger.debug("Pausa FloodWait de %ss en subida paralela (parte %d)", wait_sec, part_idx)
                     await asyncio.sleep(min(wait_sec, 30))
                     if retries < 6:
                         part_queue.put_nowait((part_idx, retries + 1))
@@ -428,9 +439,9 @@ async def _fast_upload_big_file(
                         part_queue.task_done()
 
         tasks = [
-            asyncio.create_task(_worker(sess))
-            for sess in sessions
-            for _ in range(in_flight_per_conn)
+            asyncio.create_task(_worker(sess, idx * in_flight_per_conn + slot))
+            for idx, sess in enumerate(sessions)
+            for slot in range(in_flight_per_conn)
         ]
 
         try:
@@ -477,7 +488,7 @@ async def fast_send_video_or_doc(
     send_as_doc: bool,
     cancel_event: asyncio.Event,
     on_progress: ProgressCb | None = None,
-    workers: int = 10,
+    workers: int = 6,
 ) -> Message:
     """Envía un video o documento usando subida paralela MTProto (>10 MiB) con respaldo estándar."""
     total_size = file_path.stat().st_size

@@ -186,7 +186,7 @@ def format_draft_summary(
     size_str = human_bytes(file_size) if file_size else "Al descargar"
     dur_str = human_duration(duration) if duration else "Auto"
     dim_str = f"{width}×{height}" if width and height else "Auto"
-    src_tag = "Enlace directo" if source_is_url else "Telegram"
+    src_tag = "Enlace (URL/yt-dlp)" if source_is_url else "Telegram"
 
     lines = [
         "🎬 **Configurar Compresión**",
@@ -198,8 +198,9 @@ def format_draft_summary(
     if opts.custom_output_name:
         lines.append(f"✏️ **Renombrado:** `{opts.custom_output_name[:56]}`")
     if media:
+        hdr_tag = " · HDR" if media.is_hdr else ""
         lines.append(
-            f"🔎 **Pistas:** `{len(media.audio_tracks)}` audio · `{len(media.subtitle_tracks)}` subs · `{media.video_codec.upper()}` (`{media.fps or '?'} fps`)"
+            f"🔎 **Pistas:** `{len(media.audio_tracks)}` audio · `{len(media.subtitle_tracks)}` subs · `{media.video_codec.upper()}{hdr_tag}` (`{media.fps or '?'} fps`)"
         )
 
     lines.extend(
@@ -212,6 +213,24 @@ def format_draft_summary(
             f"├ **Subtítulos:** `{_sub_mode_label(opts)}`",
         ]
     )
+    pro_tags: list[str] = []
+    if opts.hdr_to_sdr != "auto":
+        pro_tags.append(f"HDR→SDR: {opts.hdr_to_sdr.upper()}")
+    elif media and media.is_hdr:
+        pro_tags.append("HDR→SDR (Auto)")
+    if opts.auto_crop:
+        pro_tags.append("Auto-Crop")
+    if opts.codec == "libsvtav1" and opts.av1_film_grain:
+        pro_tags.append("Grano AV1")
+    if opts.deband:
+        pro_tags.append("Deband")
+    if opts.deinterlace:
+        pro_tags.append("Desentrelazar")
+    if opts.loudnorm:
+        pro_tags.append("Loudnorm")
+    if pro_tags:
+        lines.append(f"├ **Filtros Pro:** `{' · '.join(pro_tags)}`")
+
     if opts.trim_start is not None or opts.trim_end is not None:
         s = human_duration(opts.trim_start or 0.0)
         e = human_duration(opts.trim_end) if opts.trim_end else "fin"
@@ -315,6 +334,18 @@ def build_advanced_keyboard(session_id: str, opts: CompressionOptions) -> Inline
             for val in ("ultrafast", "veryfast", "fast", "medium")
         ]
 
+    bit_row = [InlineKeyboardButton(bit_label, callback_data=f"cfg:{session_id}:toggle_10bit")]
+    if opts.codec == "libsvtav1":
+        grain_lbl = "🎞 Grano AV1: ON" if opts.av1_film_grain else "🎞 Grano AV1: OFF"
+        bit_row.append(InlineKeyboardButton(grain_lbl, callback_data=f"cfg:{session_id}:toggle_grain"))
+
+    crop_lbl = "✂️ Auto-Crop: ON" if opts.auto_crop else "✂️ Auto-Crop: OFF"
+    hdr_lbl = {
+        "auto": "🌈 HDR→SDR: Auto",
+        "on": "🌈 HDR→SDR: ON",
+        "off": "🌈 HDR→SDR: OFF",
+    }.get(opts.hdr_to_sdr, "🌈 HDR→SDR: Auto")
+
     return InlineKeyboardMarkup(
         [
             [
@@ -322,9 +353,7 @@ def build_advanced_keyboard(session_id: str, opts: CompressionOptions) -> Inline
                 InlineKeyboardButton(c264, callback_data=f"cfg:{session_id}:codec:libx264"),
                 InlineKeyboardButton(cav1, callback_data=f"cfg:{session_id}:codec:libsvtav1"),
             ],
-            [
-                InlineKeyboardButton(bit_label, callback_data=f"cfg:{session_id}:toggle_10bit"),
-            ],
+            bit_row,
             [
                 _res_btn("Orig", None),
                 _res_btn("1080p", 1080),
@@ -338,6 +367,10 @@ def build_advanced_keyboard(session_id: str, opts: CompressionOptions) -> Inline
                 _fps_btn("24 fps", 24),
                 _fps_btn("30 fps", 30),
                 _fps_btn("60 fps", 60),
+            ],
+            [
+                InlineKeyboardButton(crop_lbl, callback_data=f"cfg:{session_id}:toggle_crop"),
+                InlineKeyboardButton(hdr_lbl, callback_data=f"cfg:{session_id}:cycle_hdr"),
             ],
             [
                 InlineKeyboardButton("➖ CRF -2", callback_data=f"cfg:{session_id}:crf:-2"),
@@ -487,6 +520,9 @@ def build_extras_keyboard(session_id: str, opts: CompressionOptions) -> InlineKe
         return InlineKeyboardButton(f"{mark}{label}", callback_data=f"cfg:{session_id}:wmpos:{pos}")
 
     strip_lbl = "🧼 Limpiar Meta: ON" if opts.strip_metadata else "🧼 Limpiar Meta: OFF"
+    deband_lbl = "🎨 Deband: ON" if opts.deband else "🎨 Deband: OFF"
+    deint_lbl = "📺 Desentrelazar: ON" if opts.deinterlace else "📺 Desentrelazar: OFF"
+    loud_lbl = "🔊 Nivelar Audio: ON" if opts.loudnorm else "🔊 Nivelar Audio: OFF"
 
     return InlineKeyboardMarkup(
         [
@@ -505,11 +541,16 @@ def build_extras_keyboard(session_id: str, opts: CompressionOptions) -> InlineKe
                 _pos_btn("br", "↘ Abj-Der"),
             ],
             [
-                InlineKeyboardButton("📝 Título Meta", callback_data=f"cfg:{session_id}:set_meta_title"),
-                InlineKeyboardButton("👤 Autor Meta", callback_data=f"cfg:{session_id}:set_meta_artist"),
+                InlineKeyboardButton(deband_lbl, callback_data=f"cfg:{session_id}:toggle_deband"),
+                InlineKeyboardButton(deint_lbl, callback_data=f"cfg:{session_id}:toggle_deint"),
             ],
             [
+                InlineKeyboardButton(loud_lbl, callback_data=f"cfg:{session_id}:toggle_loudnorm"),
                 InlineKeyboardButton(strip_lbl, callback_data=f"cfg:{session_id}:toggle_strip_meta"),
+            ],
+            [
+                InlineKeyboardButton("📝 Título Meta", callback_data=f"cfg:{session_id}:set_meta_title"),
+                InlineKeyboardButton("👤 Autor Meta", callback_data=f"cfg:{session_id}:set_meta_artist"),
             ],
             [InlineKeyboardButton("⬅ Volver", callback_data=f"cfg:{session_id}:main")],
         ]
@@ -569,9 +610,13 @@ def build_admin_keyboard(
     concurrent_jobs: int,
     uploader: str,
     error_alerts: bool = True,
+    threads_per_job: int | None = None,
 ) -> InlineKeyboardMarkup:
     mode_btn = "🔒 Lista Blanca" if access_mode == "private" else "🌍 Público"
-    conc_btn = "⚙️ 1 × 4 hilos" if concurrent_jobs == 1 else "⚙️ 2 × 2 hilos"
+    if threads_per_job is not None:
+        conc_btn = f"⚙️ {concurrent_jobs} × {threads_per_job} hilos"
+    else:
+        conc_btn = "⚙️ 1 trabajo" if concurrent_jobs == 1 else "⚙️ 2 en paralelo"
     up_names = {
         "gofile": "GoFile",
         "buzzheavier": "Buzzheavier",
@@ -605,7 +650,10 @@ def build_admin_keyboard(
             ],
             [
                 InlineKeyboardButton("🛑 Cancelar Cola", callback_data="adm:cancelall"),
-                InlineKeyboardButton("🔄 Actualizar", callback_data="adm:refresh"),
+                InlineKeyboardButton("⬆️ Actualizar Bot", callback_data="adm:update"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Refrescar Panel", callback_data="adm:refresh"),
             ],
         ]
     )

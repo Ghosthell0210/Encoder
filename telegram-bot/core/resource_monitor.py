@@ -127,15 +127,17 @@ def _sample_live_sync(
     total_ram = 0
     pid_metrics: dict[int, LiveProcUsage] = {}
 
+    max_sane_cpu = float(max(1, os.cpu_count() or 16) * 100)
     for pid, p in proc_by_pid.items():
         try:
-            cpu_v = float(p.cpu_percent(interval=None))
+            cpu_v = min(max_sane_cpu, max(0.0, float(p.cpu_percent(interval=None))))
             ram_v = int(p.memory_info().rss)
             total_cpu += cpu_v
             total_ram += ram_v
             pid_metrics[pid] = LiveProcUsage(cpu_pct=round(cpu_v, 1), ram_bytes=ram_v)
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
+    total_cpu = min(max_sane_cpu, total_cpu)
 
     per_job: dict[str, LiveProcUsage] = {}
     for jid, pid in job_pids.items():
@@ -197,6 +199,8 @@ class JobResourceMonitor:
         self._stop_event = asyncio.Event()
         self._root_proc = psutil.Process()
         self._tracked_procs: dict[int, psutil.Process] = {}
+        self._last_cpu_ts: dict[int, float] = {}
+        self._max_sane_cpu = float(max(1, os.cpu_count() or 16) * 100)
 
         self._peak_ram = 0
         self._sum_ram = 0
@@ -210,11 +214,15 @@ class JobResourceMonitor:
             self._watch_dirs.append(path)
 
     def start(self) -> None:
+        now = time.monotonic()
         with contextlib.suppress(psutil.Error):
             self._root_proc.cpu_percent(interval=None)
+        self._tracked_procs[self._root_proc.pid] = self._root_proc
+        self._last_cpu_ts[self._root_proc.pid] = now
         self._task = asyncio.create_task(self._sample_loop())
 
     def _collect_once(self) -> None:
+        now = time.monotonic()
         current_procs: list[psutil.Process] = [self._root_proc]
         with contextlib.suppress(psutil.Error):
             current_procs.extend(self._root_proc.children(recursive=True))
@@ -228,22 +236,37 @@ class JobResourceMonitor:
             alive_pids.add(pid)
             cached = self._tracked_procs.get(pid)
             if cached is None:
-                with contextlib.suppress(psutil.Error):
+                # Primera vez que vemos este PID (ej. FFmpeg recién creado):
+                # solo cebamos cpu_percent y medimos RAM; la CPU se leerá en el siguiente tick
+                # para evitar picos artificiales (>1000%) por medir dos veces en microsegundos.
+                try:
                     proc.cpu_percent(interval=None)
-                self._tracked_procs[pid] = proc
-                cached = proc
+                    total_ram += int(proc.memory_info().rss)
+                    self._tracked_procs[pid] = proc
+                    self._last_cpu_ts[pid] = now
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
+                continue
 
             try:
                 mem = cached.memory_info()
                 total_ram += int(mem.rss)
-                cpu_val = float(cached.cpu_percent(interval=None))
-                total_cpu += cpu_val
+                last_ts = self._last_cpu_ts.get(pid, 0.0)
+                if now - last_ts >= 0.25:
+                    cpu_val = float(cached.cpu_percent(interval=None))
+                    self._last_cpu_ts[pid] = now
+                    if 0.0 <= cpu_val <= self._max_sane_cpu:
+                        total_cpu += cpu_val
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 self._tracked_procs.pop(pid, None)
+                self._last_cpu_ts.pop(pid, None)
 
         for stale_pid in list(self._tracked_procs.keys()):
             if stale_pid not in alive_pids:
                 self._tracked_procs.pop(stale_pid, None)
+                self._last_cpu_ts.pop(stale_pid, None)
+
+        total_cpu = min(self._max_sane_cpu, total_cpu)
 
         seen_paths: set[Path] = set()
         total_disk = 0

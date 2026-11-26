@@ -13,11 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import mimetypes
+import os
 import re
 import secrets
 import shutil
+import socket
+import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -166,19 +170,130 @@ def _extract_filename_from_response(url: str, resp: aiohttp.ClientResponse) -> s
     return clean[:100]
 
 
-async def download_from_url(
+_DIRECT_MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".3gp"}
+_YTDLP_PROGRESS_RE = re.compile(
+    r"\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?\s*([\d.]+)\s*([KMG]i?B)",
+    re.IGNORECASE,
+)
+
+
+def _size_to_bytes(val: float, unit: str) -> int:
+    u = unit.lower()
+    if u.startswith("k"):
+        return int(val * 1024)
+    if u.startswith("m"):
+        return int(val * 1024 * 1024)
+    if u.startswith("g"):
+        return int(val * 1024 * 1024 * 1024)
+    return int(val)
+
+
+def _is_forbidden_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    )
+
+
+async def _validate_external_url(url: str) -> str:
+    """Valida esquema HTTP/HTTPS y bloquea destinos locales, privados o reservados."""
+    clean = url.strip()
+    parsed = urlparse(clean)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError("El enlace debe comenzar por http:// o https:// con un dominio válido.")
+
+    host = parsed.hostname.strip().lower()
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        raise RuntimeError("No se permiten enlaces hacia direcciones locales o internas.")
+
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
+        literal_ip = None
+
+    if literal_ip is not None:
+        if _is_forbidden_ip(literal_ip):
+            raise RuntimeError("No se permiten direcciones IP privadas o reservadas.")
+        return clean
+
+    try:
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo,
+            host,
+            parsed.port or (443 if parsed.scheme.lower() == "https" else 80),
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise RuntimeError(f"No se pudo resolver el dominio del enlace ({host}).") from exc
+
+    for _fam, _kind, _proto, _canon, sockaddr in infos:
+        ip_str = sockaddr[0].split("%", 1)[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+            if _is_forbidden_ip(ip_obj):
+                raise RuntimeError("El dominio resuelve a una red privada no permitida.")
+        except ValueError:
+            continue
+    return clean
+
+
+def _find_ytdlp_cmd() -> list[str] | None:
+    exe = shutil.which("yt-dlp")
+    if exe:
+        return [exe]
+    try:
+        import yt_dlp  # noqa: F401
+        return [sys.executable, "-m", "yt_dlp"]
+    except ImportError:
+        return None
+
+
+async def _probe_direct_media(url: str) -> bool:
+    """Detecta rápidamente si el enlace apunta directo a un archivo de video descargable por HTTP."""
+    path_ext = Path(unquote(urlparse(url).path)).suffix.lower()
+    if path_ext in _DIRECT_MEDIA_EXTS:
+        return True
+
+    timeout = aiohttp.ClientTimeout(total=12, sock_connect=10, sock_read=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.head(url, allow_redirects=True) as resp:
+                await _validate_external_url(str(resp.url))
+                if resp.status >= 400:
+                    return False
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                cd = (resp.headers.get("Content-Disposition") or "").lower()
+                if ctype.startswith("video/") or ctype.startswith("audio/"):
+                    return True
+                if "attachment" in cd and any(ext in cd for ext in _DIRECT_MEDIA_EXTS):
+                    return True
+                if "octet-stream" in ctype and path_ext in _DIRECT_MEDIA_EXTS:
+                    return True
+                return False
+    except RuntimeError:
+        raise
+    except Exception:
+        return path_ext in _DIRECT_MEDIA_EXTS
+
+
+async def _download_http_direct(
     url: str,
     dest_dir: Path,
     max_allowed_bytes: int,
     cancel_event: asyncio.Event,
     on_progress: TransferProgressCb | None = None,
 ) -> Path:
-    """Descarga un video desde un enlace HTTP/HTTPS en streaming controlado."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=120)
+    dest_root = dest_dir.resolve()
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, allow_redirects=True) as resp:
+            await _validate_external_url(str(resp.url))
             if resp.status >= 400:
                 raise RuntimeError(f"El enlace respondió con error HTTP {resp.status}.")
 
@@ -189,9 +304,11 @@ async def download_from_url(
                 )
 
             filename = _extract_filename_from_response(str(resp.url), resp)
-            dest_path = dest_dir / filename
-            downloaded = 0
+            dest_path = (dest_root / filename).resolve()
+            if not str(dest_path).startswith(str(dest_root) + os.sep):
+                raise RuntimeError("Nombre de archivo remoto inválido.")
 
+            downloaded = 0
             with dest_path.open("wb") as fp:
                 async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
                     if cancel_event.is_set():
@@ -206,6 +323,147 @@ async def download_from_url(
             if downloaded == 0:
                 raise RuntimeError("El enlace devolvió un archivo vacío.")
             return dest_path
+
+
+async def _download_with_ytdlp(
+    url: str,
+    dest_dir: Path,
+    max_allowed_bytes: int,
+    cancel_event: asyncio.Event,
+    on_progress: TransferProgressCb | None = None,
+) -> Path:
+    base_cmd = _find_ytdlp_cmd()
+    if base_cmd is None:
+        raise RuntimeError(
+            "Para descargar desde YouTube/TikTok/redes instala 'yt-dlp' (pip install yt-dlp) "
+            "o actualiza las dependencias con start.sh."
+        )
+
+    dest_root = dest_dir.resolve()
+    out_tmpl = str(dest_root / "%(title).70B [%(id).20B].%(ext)s")
+    cmd = [
+        *base_cmd,
+        "--no-playlist",
+        "--newline",
+        "--no-color",
+        "--no-warnings",
+        "--restrict-filenames",
+        "--max-filesize",
+        str(max_allowed_bytes),
+        "--format",
+        "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b",
+        "--merge-output-format",
+        "mp4",
+        "-o",
+        out_tmpl,
+        "--",
+        url,
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+
+    output_tail: list[str] = []
+    last_cb = 0.0
+    try:
+        assert proc.stdout is not None
+        while True:
+            if cancel_event.is_set():
+                with contextlib.suppress(ProcessLookupError):
+                    proc.terminate()
+                raise JobCancelledError("Descarga cancelada por el usuario.")
+
+            try:
+                raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=1.0)
+            except asyncio.TimeoutError:
+                if proc.returncode is not None:
+                    break
+                continue
+
+            if not raw_line:
+                break
+
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            output_tail.append(line)
+            if len(output_tail) > 20:
+                output_tail.pop(0)
+
+            m = _YTDLP_PROGRESS_RE.search(line)
+            if m and on_progress is not None:
+                now = time.monotonic()
+                pct = float(m.group(1))
+                total_bytes = _size_to_bytes(float(m.group(2)), m.group(3))
+                cur_bytes = int(total_bytes * (pct / 100.0))
+                if cur_bytes > max_allowed_bytes:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.terminate()
+                    raise RuntimeError("El video del enlace excede el espacio seguro disponible.")
+                if pct >= 99.5 or (now - last_cb) >= 0.8:
+                    last_cb = now
+                    await on_progress(cur_bytes, total_bytes)
+
+        await proc.wait()
+        if cancel_event.is_set():
+            raise JobCancelledError("Descarga cancelada por el usuario.")
+        if proc.returncode != 0:
+            err_msg = " ".join(output_tail[-4:])[:360] or f"código {proc.returncode}"
+            raise RuntimeError(f"yt-dlp no pudo descargar el enlace: {err_msg}")
+    finally:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+
+    candidates = [
+        p
+        for p in dest_root.iterdir()
+        if p.is_file()
+        and not p.name.endswith((".part", ".ytdl", ".temp"))
+        and p.stat().st_size > 0
+    ]
+    if not candidates:
+        raise RuntimeError("yt-dlp terminó sin generar ningún archivo de video.")
+
+    chosen = max(candidates, key=lambda p: p.stat().st_size).resolve()
+    if not str(chosen).startswith(str(dest_root) + os.sep):
+        raise RuntimeError("Ruta de descarga fuera del directorio permitido.")
+    return chosen
+
+
+async def download_from_url(
+    url: str,
+    dest_dir: Path,
+    max_allowed_bytes: int,
+    cancel_event: asyncio.Event,
+    on_progress: TransferProgressCb | None = None,
+) -> Path:
+    """Descarga un video desde enlace HTTP directo o plataformas (YouTube, TikTok, etc. vía yt-dlp)."""
+    safe_url = await _validate_external_url(url)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    is_direct = await _probe_direct_media(safe_url)
+    if is_direct:
+        return await _download_http_direct(
+            url=safe_url,
+            dest_dir=dest_dir,
+            max_allowed_bytes=max_allowed_bytes,
+            cancel_event=cancel_event,
+            on_progress=on_progress,
+        )
+
+    return await _download_with_ytdlp(
+        url=safe_url,
+        dest_dir=dest_dir,
+        max_allowed_bytes=max_allowed_bytes,
+        cancel_event=cancel_event,
+        on_progress=on_progress,
+    )
 
 
 class _AsyncFileStreamer:
