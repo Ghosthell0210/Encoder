@@ -203,30 +203,40 @@ def register_user_handlers(
         auto_mode = bool(user_rec.auto_mode) if user_rec else False
         return opts, auto_mode
 
-    async def _render_home_text(user_id: int) -> tuple[str, bool]:
+    async def _is_leech_mode(user_id: int) -> bool:
+        return (await db.get_setting(f"leech_mode:{user_id}", "0")) == "1"
+
+    async def _set_leech_mode(user_id: int, enabled: bool) -> None:
+        await db.set_setting(f"leech_mode:{user_id}", "1" if enabled else "0")
+
+    async def _render_home_text(user_id: int) -> tuple[str, bool, bool]:
         opts, auto_mode = await _load_user_options(user_id)
+        leech_mode = await _is_leech_mode(user_id)
         active, pending = queue_mgr.get_queue_snapshot()
         auto_tag = "ACTIVADO" if auto_mode else "Manual"
+        leech_tag = "ON (Solo descargar)" if leech_mode else "OFF (Encoder)"
         text = (
             "🎬 **HydroCompress Bot**\n"
             f"`{DIVIDER}`\n"
-            "Envíame cualquier **video**, **archivo** (hasta 2 GB) o **enlace** (`YouTube`, `TikTok`, `Instagram`, `X` o descarga directa) para comprimirlo en **AV1 / H.265 / H.264** o usar herramientas rápidas.\n\n"
+            "Envíame cualquier **video**, **archivo** (hasta 2 GB) o **enlace** (`YouTube`, `TikTok`, `Instagram`, `X` o descarga directa) para comprimirlo en **AV1 / H.265 / H.264**, usar herramientas rápidas o bajarlo sin comprimir con `/leech`.\n\n"
             "⚙️ **Tu Perfil**\n"
-            f"├ **Modo:** `{auto_tag}`\n"
+            f"├ **Modo Lotes:** `{auto_tag}`\n"
+            f"├ **Modo Leech:** `{leech_tag}`\n"
             f"├ **Ajuste base:** {_format_saved_preset_line(opts)}\n"
             f"├ **Marca de agua:** `{opts.watermark_text or 'Ninguna'}`\n"
             f"└ **Cola actual:** `{len(active)}/{queue_mgr.concurrency_limit}` activos · `{len(pending)}` en espera\n\n"
             "💡 *Usa el menú `/` abajo o los botones rápidos.*"
         )
-        return text, auto_mode
+        return text, auto_mode, leech_mode
 
     def _render_help_text(is_owner: bool) -> str:
         lines = [
             "📖 **Guía de Comandos**",
             f"`{DIVIDER}`",
             "",
-            "🎬 **Compresión y Herramientas**",
+            "🎬 **Compresión, Leech y Herramientas**",
             "├ `/start` — Menú principal interactivo",
+            "├ `/leech [url]` — Bajar enlace/archivo sin comprimir o activar **Modo Leech**",
             "├ `/auto` — Activar/desactivar **Modo Lotes** automático",
             "├ `/mediainfo` — Ficha técnica completa (responde a un video)",
             "├ `/ss` — Cuadrícula 3×3 de capturas (responde a un video)",
@@ -347,6 +357,196 @@ def register_user_handlers(
                 reply_markup=build_job_cancel_keyboard(job_id),
             )
 
+    async def _enqueue_leech_job(
+        message: Message,
+        user_id: int,
+        user_label: str,
+        filename: str,
+        file_size: int | None,
+        opts: CompressionOptions,
+        source_url: str,
+        download_max_height: int | None = None,
+        status_message: Message | None = None,
+    ) -> None:
+        job_id = secrets.token_hex(4)
+        status_msg = status_message or await message.reply_text(
+            f"⬇️ **Leech · Encolando `{job_id}`...**",
+            quote=True,
+        )
+        job = CompressionJob(
+            job_id=job_id,
+            user_id=user_id,
+            user_label=user_label,
+            chat_id=message.chat.id,
+            status_message=status_msg,
+            filename=filename,
+            options=opts,
+            source_url=source_url,
+            download_max_height=download_max_height,
+            expected_size=file_size or (500 * 1024 * 1024),
+            action_kind="download_only",
+        )
+        pos = await queue_mgr.enqueue(job)
+        res_note = f" (`{download_max_height}p`)" if download_max_height else ""
+        size_note = f" · ~`{human_bytes(file_size)}`" if file_size else ""
+        with contextlib.suppress(Exception):
+            await status_msg.edit_text(
+                f"⬇️ **Leech · En Cola (#{pos})**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{filename[:56]}`{res_note}{size_note}\n"
+                f"├ **Modo:** `Sin recomprimir`\n"
+                f"└ **Trabajo:** `{job_id}`",
+                reply_markup=build_job_cancel_keyboard(job_id),
+            )
+
+    async def _handle_url_request(
+        message: Message,
+        user_id: int,
+        user_label: str,
+        url_text: str,
+        force_leech: bool = False,
+    ) -> None:
+        _cleanup_old_sessions()
+        parsed = urlparse(url_text)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            if force_leech:
+                await message.reply_text("❌ Enlace inválido. Envía una URL que empiece por `http://` o `https://`.")
+            return
+
+        raw_name = Path(parsed.path).name or "video_enlace.mp4"
+        opts, auto_mode = await _load_user_options(user_id)
+        leech_mode = await _is_leech_mode(user_id)
+        is_leech = force_leech or leech_mode
+
+        if auto_mode and not is_leech:
+            await _enqueue_auto_job(
+                message=message,
+                user_id=user_id,
+                user_label=user_label,
+                filename=raw_name,
+                file_size=None,
+                opts=opts,
+                source_url=url_text,
+                download_max_height=opts.max_height,
+            )
+            return
+
+        probe_msg = await message.reply_text(
+            (
+                "⬇️ **Analizando enlace (Leech)...**\nConsultando archivo, resoluciones y peso..."
+                if is_leech
+                else "🔎 **Analizando enlace...**\nConsultando resoluciones y pesos disponibles..."
+            ),
+            quote=True,
+        )
+
+        url_info: UrlProbeInfo | None = None
+        probe_err = ""
+        try:
+            url_info = await probe_url_info(url_text)
+        except RuntimeError as exc:
+            err_txt = str(exc)
+            if any(
+                kw in err_txt.lower()
+                for kw in ("privada", "locales", "http://", "resolver", "reservadas")
+            ):
+                logger.warning("URL bloqueada por validación (%s): %s", url_text, err_txt)
+                with contextlib.suppress(Exception):
+                    await probe_msg.edit_text(f"❌ {err_txt}")
+                return
+            logger.warning("No se pudo pre-analizar URL %s: %s", url_text, err_txt)
+            probe_err = err_txt
+            url_info = None
+        except Exception as exc:
+            logger.exception("Fallo inesperado analizando URL %s", url_text)
+            probe_err = str(exc) or exc.__class__.__name__
+            url_info = None
+
+        sel_height: int | None = None
+        file_size: int | None = None
+        duration: float | None = None
+        width: int | None = None
+        height: int | None = None
+        final_name = raw_name
+
+        if url_info is not None:
+            final_name = url_info.filename or raw_name
+            duration = url_info.duration
+            if url_info.formats:
+                chosen_fmt = url_info.formats[0]
+                if opts.max_height:
+                    for fmt in url_info.formats:
+                        if fmt.height == opts.max_height or fmt.width == opts.max_height:
+                            chosen_fmt = fmt
+                            break
+                sel_height = chosen_fmt.height
+                file_size = chosen_fmt.est_bytes
+                width = chosen_fmt.width
+                height = chosen_fmt.height
+            elif url_info.direct_bytes:
+                file_size = url_info.direct_bytes
+
+        if is_leech:
+            has_multi_res = url_info is not None and len(url_info.formats) > 1
+            if not has_multi_res or auto_mode:
+                await _enqueue_leech_job(
+                    message=message,
+                    user_id=user_id,
+                    user_label=user_label,
+                    filename=final_name,
+                    file_size=file_size,
+                    opts=opts,
+                    source_url=url_text,
+                    download_max_height=sel_height,
+                    status_message=probe_msg,
+                )
+                return
+
+        sid = secrets.token_hex(5)
+        summary = format_draft_summary(
+            filename=final_name,
+            file_size=file_size,
+            duration=duration,
+            width=width,
+            height=height,
+            opts=opts,
+            source_is_url=True,
+            url_info=url_info,
+            selected_dl_height=sel_height,
+        )
+        if probe_err:
+            summary += f"\n⚠️ **Pre-análisis:** `{probe_err[:140]}`"
+
+        if is_leech:
+            kb = build_url_quality_keyboard(sid, url_info, sel_height)
+        else:
+            kb = build_main_config_keyboard(
+                sid,
+                opts,
+                source_is_url=True,
+                url_info=url_info,
+                selected_dl_height=sel_height,
+            )
+        with contextlib.suppress(Exception):
+            await probe_msg.edit_text(summary, reply_markup=kb)
+
+        sessions[sid] = DraftSession(
+            session_id=sid,
+            user_id=user_id,
+            user_label=user_label,
+            chat_id=message.chat.id,
+            config_message=probe_msg,
+            filename=final_name,
+            file_size=file_size,
+            duration=duration,
+            width=width,
+            height=height,
+            options=opts,
+            source_url=url_text,
+            url_info=url_info,
+            download_max_height=sel_height,
+        )
+
     # ── Comandos informativos, perfil y accesos rápidos (/mediainfo, /ss) ────
 
     @app.on_message(filters.private & filters.command("start"))
@@ -355,10 +555,14 @@ def register_user_handlers(
             return
         user_id = message.from_user.id
         is_owner = user_id == config.owner_id
-        text, auto_mode = await _render_home_text(user_id)
+        text, auto_mode, leech_mode = await _render_home_text(user_id)
         await message.reply_text(
             text,
-            reply_markup=build_start_keyboard(is_owner=is_owner, auto_mode=auto_mode),
+            reply_markup=build_start_keyboard(
+                is_owner=is_owner,
+                auto_mode=auto_mode,
+                leech_mode=leech_mode,
+            ),
         )
 
     @app.on_message(filters.private & filters.command("help"))
@@ -465,6 +669,69 @@ def register_user_handlers(
                 "Cada video volverá a abrir el panel de configuración manual."
             )
 
+    @app.on_message(filters.private & filters.command("leech"))
+    async def cmd_leech(_client: Client, message: Message) -> None:
+        if not await _check_access(message):
+            return
+        user_id = message.from_user.id
+        user_label = _format_user_label(message.from_user)
+        raw_text = (message.text or "").strip()
+        parts = raw_text.split(maxsplit=1)
+        target_url: str | None = None
+
+        if len(parts) >= 2 and parts[1].strip():
+            match = re.search(r"https?://\S+", parts[1].strip(), re.IGNORECASE)
+            if not match:
+                await message.reply_text(
+                    "⬇️ **Uso de `/leech`**\n"
+                    f"`{DIVIDER}`\n"
+                    "├ `/leech https://...` — Descarga directa sin recomprimir (muestra selector de calidad si hay varias)\n"
+                    "├ Responde `/leech` a un enlace enviado antes\n"
+                    "└ `/leech` (solo) — Activa o desactiva el **Modo Leech** para tus próximos enlaces"
+                )
+                return
+            target_url = match.group(0)
+        elif message.reply_to_message:
+            reply_txt = (
+                message.reply_to_message.text
+                or message.reply_to_message.caption
+                or ""
+            ).strip()
+            match = re.search(r"https?://\S+", reply_txt, re.IGNORECASE)
+            if match:
+                target_url = match.group(0)
+
+        if target_url:
+            await _handle_url_request(
+                message=message,
+                user_id=user_id,
+                user_label=user_label,
+                url_text=target_url,
+                force_leech=True,
+            )
+            return
+
+        currently_on = await _is_leech_mode(user_id)
+        new_state = not currently_on
+        await _set_leech_mode(user_id, new_state)
+        if new_state:
+            await message.reply_text(
+                "⬇️ **Modo Leech ACTIVADO**\n"
+                f"`{DIVIDER}`\n"
+                "Los enlaces que envíes ahora se descargarán **sin recomprimir**.\n"
+                "├ Si hay varias resoluciones (ej. YouTube), podrás elegir calidad y peso antes de bajar.\n"
+                "├ Si es un archivo o enlace directo, se enviará tal cual.\n"
+                "└ Los videos reenviados de Telegram siguen abriendo el Encoder normal.\n\n"
+                "💡 *Vuelve a escribir `/leech` para regresar al modo Encoder por defecto.*"
+            )
+        else:
+            await message.reply_text(
+                "🎬 **Modo Leech DESACTIVADO (Modo Encoder)**\n"
+                f"`{DIVIDER}`\n"
+                "Los enlaces volverán a abrir el panel de compresión.\n"
+                "💡 *Aún puedes usar `/leech <enlace>` cuando quieras bajar algo puntual sin comprimir.*"
+            )
+
     @app.on_message(filters.private & filters.command("setwatermark"))
     async def cmd_setwatermark(_client: Client, message: Message) -> None:
         if not await _check_access(message):
@@ -526,7 +793,9 @@ def register_user_handlers(
 
     # ── Callbacks del Menú Principal (/start) ─────────────────────────────────
 
-    @app.on_callback_query(filters.regex(r"^home:(main|queue|stats|help|toggle_auto)$"))
+    @app.on_callback_query(
+        filters.regex(r"^home:(main|queue|stats|help|toggle_auto|toggle_leech)$")
+    )
     async def cb_home(_client: Client, query: CallbackQuery) -> None:
         user_id = query.from_user.id
         if not await db.is_authorized(user_id, config.owner_id):
@@ -540,21 +809,45 @@ def register_user_handlers(
             _, cur = await _load_user_options(user_id)
             await db.set_auto_mode(user_id, not cur)
             await query.answer(f"Modo Lotes: {'ON' if not cur else 'OFF'}")
-            text, auto_mode = await _render_home_text(user_id)
+            text, auto_mode, leech_mode = await _render_home_text(user_id)
             with contextlib.suppress(Exception):
                 await query.message.edit_text(
                     text,
-                    reply_markup=build_start_keyboard(is_owner=is_owner, auto_mode=auto_mode),
+                    reply_markup=build_start_keyboard(
+                        is_owner=is_owner,
+                        auto_mode=auto_mode,
+                        leech_mode=leech_mode,
+                    ),
+                )
+            return
+
+        if action == "toggle_leech":
+            cur_leech = await _is_leech_mode(user_id)
+            await _set_leech_mode(user_id, not cur_leech)
+            await query.answer(f"Modo Leech: {'ON' if not cur_leech else 'OFF'}")
+            text, auto_mode, leech_mode = await _render_home_text(user_id)
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(
+                    text,
+                    reply_markup=build_start_keyboard(
+                        is_owner=is_owner,
+                        auto_mode=auto_mode,
+                        leech_mode=leech_mode,
+                    ),
                 )
             return
 
         if action == "main":
             await query.answer()
-            text, auto_mode = await _render_home_text(user_id)
+            text, auto_mode, leech_mode = await _render_home_text(user_id)
             with contextlib.suppress(Exception):
                 await query.message.edit_text(
                     text,
-                    reply_markup=build_start_keyboard(is_owner=is_owner, auto_mode=auto_mode),
+                    reply_markup=build_start_keyboard(
+                        is_owner=is_owner,
+                        auto_mode=auto_mode,
+                        leech_mode=leech_mode,
+                    ),
                 )
             return
 
@@ -680,6 +973,7 @@ def register_user_handlers(
                 "help",
                 "id",
                 "auto",
+                "leech",
                 "mediainfo",
                 "ss",
                 "setwatermark",
@@ -827,117 +1121,12 @@ def register_user_handlers(
         if URL_REGEX.match(text):
             if not await _check_access(message):
                 return
-            _cleanup_old_sessions()
-            parsed = urlparse(text)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                return
-
-            raw_name = Path(parsed.path).name or "video_enlace.mp4"
-            opts, auto_mode = await _load_user_options(user_id)
-
-            if auto_mode:
-                await _enqueue_auto_job(
-                    message=message,
-                    user_id=user_id,
-                    user_label=user_label,
-                    filename=raw_name,
-                    file_size=None,
-                    opts=opts,
-                    source_url=text,
-                    download_max_height=opts.max_height,
-                )
-                return
-
-            probe_msg = await message.reply_text(
-                "🔎 **Analizando enlace...**\nConsultando resoluciones y pesos disponibles...",
-                quote=True,
-            )
-
-            url_info: UrlProbeInfo | None = None
-            probe_err = ""
-            try:
-                url_info = await probe_url_info(text)
-            except RuntimeError as exc:
-                err_txt = str(exc)
-                if any(
-                    kw in err_txt.lower()
-                    for kw in ("privada", "locales", "http://", "resolver", "reservadas")
-                ):
-                    logger.warning("URL bloqueada por validación (%s): %s", text, err_txt)
-                    with contextlib.suppress(Exception):
-                        await probe_msg.edit_text(f"❌ {err_txt}")
-                    return
-                logger.warning("No se pudo pre-analizar URL %s: %s", text, err_txt)
-                probe_err = err_txt
-                url_info = None
-            except Exception as exc:
-                logger.exception("Fallo inesperado analizando URL %s", text)
-                probe_err = str(exc) or exc.__class__.__name__
-                url_info = None
-
-            sel_height: int | None = None
-            file_size: int | None = None
-            duration: float | None = None
-            width: int | None = None
-            height: int | None = None
-            final_name = raw_name
-
-            if url_info is not None:
-                final_name = url_info.filename or raw_name
-                duration = url_info.duration
-                if url_info.formats:
-                    chosen_fmt = url_info.formats[0]
-                    if opts.max_height:
-                        for fmt in url_info.formats:
-                            if fmt.height == opts.max_height or fmt.width == opts.max_height:
-                                chosen_fmt = fmt
-                                break
-                    sel_height = chosen_fmt.height
-                    file_size = chosen_fmt.est_bytes
-                    width = chosen_fmt.width
-                    height = chosen_fmt.height
-                elif url_info.direct_bytes:
-                    file_size = url_info.direct_bytes
-
-            sid = secrets.token_hex(5)
-            summary = format_draft_summary(
-                filename=final_name,
-                file_size=file_size,
-                duration=duration,
-                width=width,
-                height=height,
-                opts=opts,
-                source_is_url=True,
-                url_info=url_info,
-                selected_dl_height=sel_height,
-            )
-            if probe_err:
-                summary += f"\n⚠️ **Pre-análisis:** `{probe_err[:140]}`"
-            kb = build_main_config_keyboard(
-                sid,
-                opts,
-                source_is_url=True,
-                url_info=url_info,
-                selected_dl_height=sel_height,
-            )
-            with contextlib.suppress(Exception):
-                await probe_msg.edit_text(summary, reply_markup=kb)
-
-            sessions[sid] = DraftSession(
-                session_id=sid,
+            await _handle_url_request(
+                message=message,
                 user_id=user_id,
                 user_label=user_label,
-                chat_id=message.chat.id,
-                config_message=probe_msg,
-                filename=final_name,
-                file_size=file_size,
-                duration=duration,
-                width=width,
-                height=height,
-                options=opts,
-                source_url=text,
-                url_info=url_info,
-                download_max_height=sel_height,
+                url_text=text,
+                force_leech=False,
             )
 
     async def _refresh_session_message(session: DraftSession, view: str = "main") -> None:

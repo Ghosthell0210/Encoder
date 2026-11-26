@@ -93,15 +93,23 @@ class ProgressUpdater:
 
 # ── Teclado del Menú Principal (/start) ──────────────────────────────────────
 
-def build_start_keyboard(is_owner: bool, auto_mode: bool) -> InlineKeyboardMarkup:
+def build_start_keyboard(
+    is_owner: bool,
+    auto_mode: bool,
+    leech_mode: bool = False,
+) -> InlineKeyboardMarkup:
     auto_label = "⚡ Modo Lotes: ON" if auto_mode else "⚡ Modo Lotes: OFF"
+    leech_label = "⬇️ Leech: ON" if leech_mode else "⬇️ Leech: OFF"
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(auto_label, callback_data="home:toggle_auto"),
-            InlineKeyboardButton("📋 Ver Cola", callback_data="home:queue"),
+            InlineKeyboardButton(leech_label, callback_data="home:toggle_leech"),
         ],
         [
+            InlineKeyboardButton("📋 Ver Cola", callback_data="home:queue"),
             InlineKeyboardButton("📊 Estadísticas", callback_data="home:stats"),
+        ],
+        [
             InlineKeyboardButton("📖 Comandos", callback_data="home:help"),
         ],
     ]

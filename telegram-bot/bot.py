@@ -44,6 +44,7 @@ logger = logging.getLogger("hydrocompress")
 USER_BOT_COMMANDS: list[BotCommand] = [
     BotCommand("start", "Inicio rápido y menú principal"),
     BotCommand("help", "Guía de uso y lista de comandos"),
+    BotCommand("leech", "Modo Leech o /leech <url> (bajar sin comprimir)"),
     BotCommand("auto", "Activar o desactivar Modo Lotes automático"),
     BotCommand("mediainfo", "Ficha técnica MediaInfo (responde a un video)"),
     BotCommand("ss", "Cuadrícula 3×3 de capturas (responde a un video)"),

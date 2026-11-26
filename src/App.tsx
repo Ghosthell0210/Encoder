@@ -672,6 +672,7 @@ export default function App() {
                 <tbody className="divide-y divide-[#1F2937] text-xs">
                   {[
                     ['/start', 'Autorizados', 'Guía de uso: AV1 (P4/P6/P8), H.265/H.264, Opus, FPS, Metadatos, Remux y Muestra 15s'],
+                    ['/leech [url]', 'Autorizados', 'Descargar enlaces/archivos sin recomprimir o activar/desactivar el Modo Leech'],
                     ['/auto', 'Autorizados', 'Activar/desactivar Modo Lotes (encola videos automáticamente con tu ajuste guardado)'],
                     ['/mediainfo', 'Autorizados', 'Responder a un video para obtener su ficha técnica completa (HDR, bitrates, pistas)'],
                     ['/ss', 'Autorizados', 'Responder a un video para generar su cuadrícula 3×3 de capturas con timestamps'],

@@ -531,32 +531,42 @@ class QueueManager:
 
             input_size = input_path.stat().st_size
 
-            # 2. Inspección completa con ffprobe
-            job.phase = "Analizando"
-            job.progress_pct = 0.0
-            await updater.update(
-                f"🔍 **Analizando Video**\n"
-                f"`{DIVIDER}`\n"
-                f"├ **Archivo:** `{input_path.name[:56]}`\n"
-                f"└ **Peso:** `{human_bytes(input_size)}`",
-                reply_markup=cancel_kb,
-                force=True,
-            )
-            media: MediaInfo = await probe_media(input_path)
-            if job.on_media_probed is not None:
-                with contextlib.suppress(Exception):
-                    await job.on_media_probed(media)
-
-            # ── Descarga directa sin recomprimir ──────────────────────────────
+            # ── Descarga directa sin recomprimir (Leech) ──────────────────────
             if job.action_kind == "download_only":
+                media: MediaInfo
+                try:
+                    media = await probe_media(input_path)
+                except Exception:
+                    media = MediaInfo(
+                        path=input_path,
+                        file_size=input_size,
+                        duration=0.0,
+                        width=0,
+                        height=0,
+                        video_codec="",
+                        fps=0.0,
+                        bitrate_kbps=0,
+                    )
+                is_video_file = (
+                    media.width > 0
+                    and media.height > 0
+                    and input_path.suffix.lower() in {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"}
+                )
+                if not is_video_file:
+                    job.options.send_as_document = True
                 elapsed_total = time.time() - (job.started_at or time.time())
                 metrics = await monitor.stop()
+                media_line = (
+                    f"├ **Video:** `{media.width}×{media.height}` · `{media.video_codec.upper()}` · `{human_duration(media.duration)}`\n"
+                    if is_video_file
+                    else "├ **Tipo:** `Archivo directo (Documento)`\n"
+                )
                 dl_summary = (
-                    f"⬇️ **Descarga Completada**\n"
+                    f"⬇️ **Leech / Descarga Completada**\n"
                     f"`{DIVIDER}`\n"
                     f"├ **Archivo:** `{input_path.name[:72]}`\n"
                     f"├ **Peso:** `{human_bytes(input_size)}`\n"
-                    f"├ **Video:** `{media.width}×{media.height}` · `{media.video_codec.upper()}` · `{human_duration(media.duration)}`\n"
+                    f"{media_line}"
                     f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
                     f"└ **Tiempo total:** `{human_duration(elapsed_total)}`"
                 )
@@ -577,6 +587,22 @@ class QueueManager:
                 )
                 outcome = "Completado con avisos" if collector.has_issues else "Completado"
                 return
+
+            # 2. Inspección completa con ffprobe
+            job.phase = "Analizando"
+            job.progress_pct = 0.0
+            await updater.update(
+                f"🔍 **Analizando Video**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{input_path.name[:56]}`\n"
+                f"└ **Peso:** `{human_bytes(input_size)}`",
+                reply_markup=cancel_kb,
+                force=True,
+            )
+            media = await probe_media(input_path)
+            if job.on_media_probed is not None:
+                with contextlib.suppress(Exception):
+                    await job.on_media_probed(media)
 
             # ── Despacho de Herramientas Rápidas ──────────────────────────────
             if job.action_kind == "mediainfo":

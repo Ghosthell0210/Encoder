@@ -285,10 +285,21 @@ async def _probe_direct_head(url: str) -> tuple[bool, int | None, str]:
                 fname = _extract_filename_from_response(str(resp.url), resp)
                 is_direct = (
                     path_ext in _DIRECT_MEDIA_EXTS
-                    or ctype.startswith("video/")
-                    or ctype.startswith("audio/")
-                    or ("attachment" in cd and any(ext in cd for ext in _DIRECT_MEDIA_EXTS))
-                    or ("octet-stream" in ctype and path_ext in _DIRECT_MEDIA_EXTS)
+                    or ctype.startswith(("video/", "audio/", "application/x-matroska"))
+                    or ("attachment" in cd and not ctype.startswith("text/"))
+                    or (
+                        not ctype.startswith("text/")
+                        and ctype.startswith(
+                            (
+                                "application/octet-stream",
+                                "application/zip",
+                                "application/x-rar",
+                                "application/x-7z-compressed",
+                                "application/pdf",
+                            )
+                        )
+                        and (cl_val is not None and cl_val > 65536 or "attachment" in cd or "." in Path(fname).name)
+                    )
                 )
                 return is_direct, cl_val, fname
     except RuntimeError:
