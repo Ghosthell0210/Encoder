@@ -361,7 +361,6 @@ async def probe_url_info(url: str) -> UrlProbeInfo:
         *base_cmd,
         "--dump-single-json",
         "--no-playlist",
-        "--no-warnings",
         "--no-color",
         "--skip-download",
         "--",
@@ -379,14 +378,25 @@ async def probe_url_info(url: str) -> UrlProbeInfo:
             proc.kill()
         with contextlib.suppress(Exception):
             await proc.wait()
+        logger.warning("yt-dlp probe timeout (>25s) para URL: %s", safe_url)
         raise RuntimeError("Tiempo agotado al inspeccionar el enlace.")
 
+    stderr_txt = stderr.decode("utf-8", errors="replace").strip()
     if proc.returncode != 0:
-        err_msg = stderr.decode("utf-8", errors="replace").strip()[:280]
+        err_msg = stderr_txt[:280]
+        logger.error("yt-dlp probe falló (rc=%s) para %s: %s", proc.returncode, safe_url, stderr_txt[:500])
         raise RuntimeError(f"No se pudo analizar el enlace: {err_msg or f'código {proc.returncode}'}")
 
+    if stderr_txt:
+        logger.warning("yt-dlp probe avisos para %s: %s", safe_url, stderr_txt[:500])
+
     raw_json = stdout.decode("utf-8", errors="replace").strip()
-    data = json.loads(raw_json)
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        logger.error("yt-dlp devolvió JSON inválido para %s: %s (inicio=%r)", safe_url, exc, raw_json[:200])
+        raise RuntimeError("La respuesta del analizador de enlaces no fue válida.") from exc
+
     if isinstance(data.get("entries"), list) and data["entries"]:
         first = data["entries"][0]
         if isinstance(first, dict):
@@ -482,6 +492,19 @@ async def probe_url_info(url: str) -> UrlProbeInfo:
     top_bytes, _ = _estimate_stream_bytes(data, duration)
     if top_bytes is None and formats_sorted:
         top_bytes = formats_sorted[0].est_bytes
+
+    fmt_dbg = ", ".join(
+        f"{o.label}:{(o.est_bytes // (1024 * 1024)) if o.est_bytes else '?'}MiB({'~' if o.is_approx else '='})"
+        for o in formats_sorted[:5]
+    )
+    logger.info(
+        "URL probe OK (%s) | dur=%ss | formatos=%d/%d | %s",
+        safe_url[:80],
+        int(duration) if duration else "?",
+        len(formats_sorted),
+        len(raw_formats),
+        fmt_dbg or "sin formatos",
+    )
 
     return UrlProbeInfo(
         url=safe_url,
@@ -641,6 +664,7 @@ async def _download_with_ytdlp(
             raise JobCancelledError("Descarga cancelada por el usuario.")
         if proc.returncode != 0:
             err_msg = " ".join(output_tail[-4:])[:360] or f"código {proc.returncode}"
+            logger.error("yt-dlp descarga falló (rc=%s) para %s: %s", proc.returncode, url, "\n".join(output_tail[-8:]))
             raise RuntimeError(f"yt-dlp no pudo descargar el enlace: {err_msg}")
     finally:
         if proc.returncode is None:

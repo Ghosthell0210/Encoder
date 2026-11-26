@@ -5,6 +5,7 @@ Muestra 15s, subtítulos externos, /mediainfo y /ss."""
 from __future__ import annotations
 
 import contextlib
+import logging
 import re
 import secrets
 import time
@@ -39,6 +40,8 @@ from core.ui_helpers import (
 )
 from core.uploader import UrlProbeInfo, probe_url_info
 from core.user_session import UserSessionManager
+
+logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".flv", ".ts", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
@@ -851,6 +854,7 @@ def register_user_handlers(
             )
 
             url_info: UrlProbeInfo | None = None
+            probe_err = ""
             try:
                 url_info = await probe_url_info(text)
             except RuntimeError as exc:
@@ -859,11 +863,16 @@ def register_user_handlers(
                     kw in err_txt.lower()
                     for kw in ("privada", "locales", "http://", "resolver", "reservadas")
                 ):
+                    logger.warning("URL bloqueada por validación (%s): %s", text, err_txt)
                     with contextlib.suppress(Exception):
                         await probe_msg.edit_text(f"❌ {err_txt}")
                     return
+                logger.warning("No se pudo pre-analizar URL %s: %s", text, err_txt)
+                probe_err = err_txt
                 url_info = None
-            except Exception:
+            except Exception as exc:
+                logger.exception("Fallo inesperado analizando URL %s", text)
+                probe_err = str(exc) or exc.__class__.__name__
                 url_info = None
 
             sel_height: int | None = None
@@ -902,6 +911,8 @@ def register_user_handlers(
                 url_info=url_info,
                 selected_dl_height=sel_height,
             )
+            if probe_err:
+                summary += f"\n⚠️ **Pre-análisis:** `{probe_err[:140]}`"
             kb = build_main_config_keyboard(
                 sid,
                 opts,
