@@ -49,6 +49,55 @@ async def _run_git(cwd: Path, *args: str) -> tuple[int, str, str]:
     )
 
 
+async def _sync_requirements(repo_root: Path) -> bool:
+    req_file = repo_root / "requirements.txt"
+    if not req_file.is_file():
+        return True
+
+    attempts = [
+        [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "-r", str(req_file)],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--quiet",
+            "--break-system-packages",
+            "-r",
+            str(req_file),
+        ],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--quiet",
+            "--user",
+            "-r",
+            str(req_file),
+        ],
+    ]
+    for cmd in attempts:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(repo_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, err = await proc.communicate()
+            if proc.returncode == 0:
+                logger.info("Dependencias Python sincronizadas tras actualizar.")
+                return True
+            logger.debug("pip install falló (%s): %s", proc.returncode, err.decode("utf-8", errors="replace")[:200])
+        except Exception as exc:
+            logger.debug("Error ejecutando pip install: %s", exc)
+    logger.warning("No se pudo ejecutar pip install -r requirements.txt automáticamente tras actualizar.")
+    return False
+
+
 async def pull_from_github(repo_root: Path) -> tuple[bool, str, bool]:
     """Sincroniza el código con GitHub.
 
@@ -100,6 +149,7 @@ async def pull_from_github(repo_root: Path) -> tuple[bool, str, bool]:
 
     changed = bool(after_sha and after_sha != before_sha)
     if changed:
+        await _sync_requirements(repo_root)
         return True, f"Actualizado a `{commit_msg}`.", True
     return True, f"Ya estabas en la última versión (`{commit_msg}`).", False
 

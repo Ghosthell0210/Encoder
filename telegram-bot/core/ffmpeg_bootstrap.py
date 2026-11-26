@@ -8,16 +8,24 @@ libx265 y libass) y extrae únicamente ffmpeg y ffprobe en ./bin/.
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import logging
 import os
 import platform
 import shutil
 import stat
+import subprocess
+import sys
 import tarfile
+import threading
 import urllib.request
 from pathlib import Path
 
 logger = logging.getLogger("hydrocompress.ffmpeg_bootstrap")
+
+YTDLP_BIN_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+_YTDLP_LOCK = threading.Lock()
 
 # Compilados estáticos GPL con libx264, libx265, libass, aac y ffprobe
 STATIC_URLS: dict[str, list[str]] = {
@@ -138,3 +146,95 @@ def ensure_ffmpeg(bin_dir: Path) -> tuple[str, str]:
 
     logger.info("FFmpeg estático instalado automáticamente sin root en: %s", bin_dir)
     return ff, fp
+
+
+def _local_ytdlp_cmd(local_bin: Path) -> list[str]:
+    resolved = str(local_bin.resolve())
+    try:
+        with local_bin.open("rb") as fp:
+            magic = fp.read(4)
+        if magic[:2] in {b"#!", b"PK"}:
+            return [sys.executable, resolved]
+    except OSError:
+        pass
+    return [resolved]
+
+
+def _detect_ytdlp(bin_dir: Path) -> list[str] | None:
+    if importlib.util.find_spec("yt_dlp") is not None:
+        return [sys.executable, "-m", "yt_dlp"]
+    local_bin = bin_dir / "yt-dlp"
+    if local_bin.is_file():
+        return _local_ytdlp_cmd(local_bin)
+    exe = shutil.which("yt-dlp")
+    if exe:
+        return [exe]
+    return None
+
+
+def ensure_ytdlp(bin_dir: Path | None = None) -> list[str] | None:
+    """Garantiza que yt-dlp esté disponible (pip o binario zipapp rootless en ./bin)."""
+    target_bin = bin_dir or Path("bin")
+    _prepend_bin_to_path(target_bin)
+
+    cmd = _detect_ytdlp(target_bin)
+    if cmd is not None:
+        return cmd
+
+    with _YTDLP_LOCK:
+        cmd = _detect_ytdlp(target_bin)
+        if cmd is not None:
+            return cmd
+
+        logger.info("yt-dlp no encontrado; instalando automáticamente...")
+        pip_attempts = [
+            [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "yt-dlp"],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--quiet",
+                "--upgrade",
+                "--break-system-packages",
+                "yt-dlp",
+            ],
+            [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "--user", "yt-dlp"],
+        ]
+        for pip_cmd in pip_attempts:
+            try:
+                res = subprocess.run(
+                    pip_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=180,
+                    check=False,
+                )
+                if res.returncode == 0:
+                    importlib.invalidate_caches()
+                    cmd = _detect_ytdlp(target_bin)
+                    if cmd is not None:
+                        logger.info("yt-dlp instalado automáticamente vía pip.")
+                        return cmd
+            except Exception as exc:
+                logger.debug("Intento pip para yt-dlp falló: %s", exc)
+
+        # Fallback sin pip: zipapp oficial standalone en ./bin/yt-dlp
+        try:
+            target_bin.mkdir(parents=True, exist_ok=True)
+            tmp_path = target_bin / "yt-dlp.tmp"
+            final_path = target_bin / "yt-dlp"
+            req = urllib.request.Request(
+                YTDLP_BIN_URL,
+                headers={"User-Agent": "HydroCompress-Bot/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp, tmp_path.open("wb") as out:
+                shutil.copyfileobj(resp, out)
+            tmp_path.chmod(tmp_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            tmp_path.replace(final_path)
+            _prepend_bin_to_path(target_bin)
+            logger.info("yt-dlp standalone instalado automáticamente sin root en: %s", final_path)
+            return _local_ytdlp_cmd(final_path)
+        except Exception as exc:
+            logger.warning("No se pudo auto-instalar yt-dlp: %s", exc)
+            return None

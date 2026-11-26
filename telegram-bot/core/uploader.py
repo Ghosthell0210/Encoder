@@ -32,6 +32,7 @@ import aiohttp
 from aiohttp import web
 
 from config import BotConfig
+from core.ffmpeg_bootstrap import ensure_ytdlp
 from core.ffmpeg_engine import JobCancelledError
 
 logger = logging.getLogger(__name__)
@@ -242,17 +243,6 @@ async def _validate_external_url(url: str) -> str:
     return clean
 
 
-def _find_ytdlp_cmd() -> list[str] | None:
-    exe = shutil.which("yt-dlp")
-    if exe:
-        return [exe]
-    try:
-        import yt_dlp  # noqa: F401
-        return [sys.executable, "-m", "yt_dlp"]
-    except ImportError:
-        return None
-
-
 async def _probe_direct_media(url: str) -> bool:
     """Detecta rápidamente si el enlace apunta directo a un archivo de video descargable por HTTP."""
     path_ext = Path(unquote(urlparse(url).path)).suffix.lower()
@@ -332,11 +322,11 @@ async def _download_with_ytdlp(
     cancel_event: asyncio.Event,
     on_progress: TransferProgressCb | None = None,
 ) -> Path:
-    base_cmd = _find_ytdlp_cmd()
+    base_cmd = await asyncio.to_thread(ensure_ytdlp, Path("bin"))
     if base_cmd is None:
         raise RuntimeError(
-            "Para descargar desde YouTube/TikTok/redes instala 'yt-dlp' (pip install yt-dlp) "
-            "o actualiza las dependencias con start.sh."
+            "No se pudo instalar automáticamente 'yt-dlp'. "
+            "Verifica la salida a internet del servidor o ejecuta 'pip install yt-dlp'."
         )
 
     dest_root = dest_dir.resolve()

@@ -24,7 +24,7 @@ from hydrogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefa
 from config import BotConfig
 from core.console_commands import console_command_loop
 from core.database import Database
-from core.ffmpeg_bootstrap import ensure_ffmpeg
+from core.ffmpeg_bootstrap import ensure_ffmpeg, ensure_ytdlp
 from core.ffmpeg_engine import is_encoder_available
 from core.job_log_capture import install_job_log_handler
 from core.logger_setup import setup_logging
@@ -116,8 +116,10 @@ async def main() -> None:
     install_job_log_handler()
     logger.info("Registro rotativo y Auto-Log por trabajo activos en: %s", log_file)
 
-    # Instala ffmpeg y ffprobe estáticos en ./bin sin root si el Egg no los trae
+    # Instala ffmpeg/ffprobe y yt-dlp automáticamente sin root si faltan
     ensure_ffmpeg(config.bin_dir)
+    ytdlp_cmd = await asyncio.to_thread(ensure_ytdlp, config.bin_dir)
+    logger.info("Soporte yt-dlp (YouTube/TikTok/redes): %s", "DISPONIBLE" if ytdlp_cmd else "NO disponible")
     av1_ok = await is_encoder_available("libsvtav1")
     logger.info("Soporte AV1 (libsvtav1): %s", "DISPONIBLE" if av1_ok else "NO encontrado en este FFmpeg")
     _check_tgcrypto()
