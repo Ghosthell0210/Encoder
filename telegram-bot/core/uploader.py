@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 CHUNK_SIZE = 1024 * 1024  # 1 MiB streaming chunks
 
 TransferProgressCb = Callable[[int, int], Awaitable[None]]
+TransferStageCb = Callable[[str], Awaitable[None]]
 
 
 @dataclass(slots=True)
@@ -902,6 +903,7 @@ async def _exec_ytdlp_download(
     cancel_event: asyncio.Event,
     on_progress: TransferProgressCb | None,
     impersonate_chrome: bool = False,
+    on_stage: TransferStageCb | None = None,
 ) -> tuple[int, list[str], bool]:
     out_tmpl = str(dest_root / "%(title).70B [%(id).20B].%(ext)s")
     cmd = [
@@ -934,6 +936,7 @@ async def _exec_ytdlp_download(
 
     output_tail: list[str] = []
     saw_max_filesize = False
+    last_stage = ""
     last_cb = 0.0
     try:
         assert proc.stdout is not None
@@ -962,6 +965,17 @@ async def _exec_ytdlp_download(
             output_tail.append(line)
             if len(output_tail) > 20:
                 output_tail.pop(0)
+
+            if on_stage is not None:
+                new_stage = ""
+                if line.startswith("[Merger]"):
+                    new_stage = "merging"
+                elif line.startswith(("[Fixup", "[VideoRemuxer]", "[ExtractAudio]")):
+                    new_stage = "remuxing"
+                if new_stage and new_stage != last_stage:
+                    last_stage = new_stage
+                    with contextlib.suppress(Exception):
+                        await on_stage(new_stage)
 
             m = _YTDLP_PROGRESS_RE.search(line)
             if m and on_progress is not None:
@@ -1007,6 +1021,7 @@ async def _download_with_ytdlp(
     on_progress: TransferProgressCb | None = None,
     max_height: int | None = None,
     expect_video: bool = False,
+    on_stage: TransferStageCb | None = None,
 ) -> Path:
     base_cmd = await asyncio.to_thread(ensure_ytdlp, Path("bin"))
     if base_cmd is None:
@@ -1041,6 +1056,7 @@ async def _download_with_ytdlp(
         cancel_event=cancel_event,
         on_progress=on_progress,
         impersonate_chrome=False,
+        on_stage=on_stage,
     )
     joined_tail = " ".join(output_tail[-6:])
     if rc != 0 and _looks_like_cloudflare_block(joined_tail):
@@ -1056,6 +1072,7 @@ async def _download_with_ytdlp(
                 cancel_event=cancel_event,
                 on_progress=on_progress,
                 impersonate_chrome=True,
+                on_stage=on_stage,
             )
             saw_max_filesize = saw_max_filesize or saw_retry_limit
             joined_tail = " ".join(output_tail[-6:])
@@ -1154,6 +1171,7 @@ async def download_from_url(
     gofile_token: str = "",
     max_ytdlp_bytes: int | None = None,
     expect_video: bool = False,
+    on_stage: TransferStageCb | None = None,
 ) -> Path:
     """Descarga un archivo/video desde servidor nativo, HTTP directo o yt-dlp."""
     safe_url = await _validate_external_url(url)
@@ -1197,6 +1215,7 @@ async def download_from_url(
         on_progress=on_progress,
         max_height=max_height,
         expect_video=expect_video,
+        on_stage=on_stage,
     )
 
 

@@ -547,6 +547,15 @@ class QueueManager:
 
             # ── Descarga directa sin recomprimir (Leech) ──────────────────────
             if job.action_kind == "download_only":
+                job.phase = "Verificando archivo"
+                await updater.update(
+                    f"🔍 **Verificando Archivo Descargado**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Archivo:** `{input_path.name[:56]}`\n"
+                    f"└ **Peso:** `{human_bytes(input_size)}` · Preparando envío...",
+                    reply_markup=cancel_kb,
+                    force=True,
+                )
                 media: MediaInfo
                 try:
                     media = await probe_media(input_path)
@@ -1084,8 +1093,23 @@ class QueueManager:
         encode_notes: list[str] | None = None,
     ) -> None:
         assert self.user_session.client is not None
-        job.phase = "Subiendo (Premium)"
+        job.phase = "Preparando subida (Premium)"
         job.progress_pct = 0.0
+
+        await updater.update(
+            f"⭐ **Preparando Subida (Premium)**\n"
+            f"`{DIVIDER}`\n"
+            f"├ **Archivo:** `{output_path.name[:56]}`\n"
+            f"└ **Peso:** `{human_bytes(output_size)}` · Generando miniatura y conectando sesión...",
+            reply_markup=cancel_kb,
+            force=True,
+        )
+
+        thumb_path = await self._prepare_thumbnail(
+            job.user_id, output_path, out_media.duration, job_dir
+        )
+
+        job.phase = "Subiendo (Premium)"
         up_start = time.monotonic()
 
         async def _up_progress(current: int, total: int) -> None:
@@ -1104,10 +1128,6 @@ class QueueManager:
                 f"└ **Velocidad:** `{human_bytes(speed_bps)}/s` · **ETA:** `{human_duration(eta)}`",
                 reply_markup=cancel_kb,
             )
-
-        thumb_path = await self._prepare_thumbnail(
-            job.user_id, output_path, out_media.duration, job_dir
-        )
         orig_caption = (
             safe_caption(job.source_message.caption)
             if job.source_message and job.source_message.caption
@@ -1235,6 +1255,26 @@ class QueueManager:
                 reply_markup=cancel_kb,
             )
 
+        async def _dl_stage(stage: str) -> None:
+            if stage == "merging":
+                job.phase = "Fusionando pistas"
+                await updater.update(
+                    f"🔄 **Fusionando Video y Audio**\n"
+                    f"`{DIVIDER}`\n"
+                    f"└ Uniendo pistas descargadas en el contenedor final...",
+                    reply_markup=cancel_kb,
+                    force=True,
+                )
+            elif stage == "remuxing":
+                job.phase = "Ensamblando video"
+                await updater.update(
+                    f"🔄 **Ensamblando Video Descargado**\n"
+                    f"`{DIVIDER}`\n"
+                    f"└ Empaquetando segmentos en el archivo final...",
+                    reply_markup=cancel_kb,
+                    force=True,
+                )
+
         if job.source_url:
             effective_free = await asyncio.to_thread(self._effective_free_bytes)
             max_allow_merge = int(effective_free * 0.48)
@@ -1257,6 +1297,7 @@ class QueueManager:
                 gofile_token=self.config.gofile_token,
                 max_ytdlp_bytes=max_allow_merge,
                 expect_video=job.expect_video or (job.action_kind != "download_only"),
+                on_stage=_dl_stage,
             )
 
         assert job.source_message is not None
@@ -1307,8 +1348,23 @@ class QueueManager:
         metrics: JobResourceMetrics | None = None,
         encode_notes: list[str] | None = None,
     ) -> None:
-        job.phase = "Subiendo a Telegram"
+        job.phase = "Preparando subida"
         job.progress_pct = 0.0
+
+        await updater.update(
+            f"📦 **Preparando Subida a Telegram**\n"
+            f"`{DIVIDER}`\n"
+            f"├ **Archivo:** `{output_path.name[:56]}`\n"
+            f"└ **Peso:** `{human_bytes(output_size)}` · Generando miniatura y conectando subida...",
+            reply_markup=cancel_kb,
+            force=True,
+        )
+
+        thumb_path = await self._prepare_thumbnail(
+            job.user_id, output_path, out_media.duration, job_dir
+        )
+
+        job.phase = "Subiendo a Telegram"
         up_start = time.monotonic()
 
         async def _up_progress(current: int, total: int) -> None:
@@ -1327,10 +1383,6 @@ class QueueManager:
                 f"└ **Velocidad:** `{human_bytes(speed_bps)}/s` · **ETA:** `{human_duration(eta)}`",
                 reply_markup=cancel_kb,
             )
-
-        thumb_path = await self._prepare_thumbnail(
-            job.user_id, output_path, out_media.duration, job_dir
-        )
 
         video_caption = (
             ""
