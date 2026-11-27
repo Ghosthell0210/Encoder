@@ -335,16 +335,70 @@ def _estimate_stream_bytes(fmt: dict, duration: float | None) -> tuple[int | Non
     approx = fmt.get("filesize_approx")
     if isinstance(approx, (int, float)) and approx > 0:
         return int(approx), True
+    if not duration or duration <= 0:
+        return None, True
+
     protocol = str(fmt.get("protocol") or "").lower()
     is_hls = ("m3u8" in protocol) or ("hls" in protocol)
-    # En HLS (m3u8), 'tbr' suele ser el BANDWIDTH pico del manifiesto (hasta 5-10x mayor al peso real).
+    vcodec = str(fmt.get("vcodec") or "none").lower()
+    is_video = vcodec != "none"
+
+    vbr = fmt.get("vbr")
+    abr = fmt.get("abr")
+    tbr = fmt.get("tbr")
+
+    rate: float | None = None
     if is_hls:
-        rate = fmt.get("vbr") or fmt.get("abr")
+        if is_video:
+            if isinstance(vbr, (int, float)) and vbr > 0:
+                rate = float(vbr) + (float(abr) if isinstance(abr, (int, float)) and abr > 0 else 0.0)
+            elif isinstance(tbr, (int, float)) and tbr > 0:
+                # En HLS sin vbr explícito (ej. Twitch VODs), tbr trae el BANDWIDTH del manifiesto.
+                # Ignorar solo picos absurdos (>35 Mbps en <=1080p o >80 Mbps total) de manifiestos inflados.
+                h_raw = fmt.get("height")
+                h_num = int(h_raw) if isinstance(h_raw, (int, float)) else 0
+                tbr_val = float(tbr)
+                if tbr_val <= 80000 and not (0 < h_num <= 1080 and tbr_val > 35000):
+                    rate = tbr_val
+        else:
+            raw_a = abr or tbr
+            if isinstance(raw_a, (int, float)) and raw_a > 0:
+                rate = float(raw_a)
     else:
-        rate = fmt.get("tbr") or fmt.get("vbr") or fmt.get("abr")
-    if duration and duration > 0 and isinstance(rate, (int, float)) and rate > 0:
-        return int((float(rate) * 1000.0 / 8.0) * duration), True
+        raw_r = tbr or vbr or abr
+        if isinstance(raw_r, (int, float)) and raw_r > 0:
+            rate = float(raw_r)
+
+    if rate and rate > 0:
+        return int((rate * 1000.0 / 8.0) * duration), True
     return None, True
+
+
+async def _fill_missing_direct_format_sizes(
+    items: list[tuple[UrlFormatOption, str | None]],
+) -> None:
+    """Consulta Content-Length vía HEAD rápido para formatos MP4/directos sin peso (ej. Twitch Clips)."""
+    missing = [(opt, fmt_url) for opt, fmt_url in items if opt.est_bytes is None and fmt_url]
+    if not missing:
+        return
+
+    timeout = aiohttp.ClientTimeout(total=3.0, sock_connect=2.0, sock_read=2.0)
+
+    async def _head_one(session: aiohttp.ClientSession, opt: UrlFormatOption, fmt_url: str) -> None:
+        with contextlib.suppress(Exception):
+            await _validate_external_url(fmt_url)
+            async with session.head(fmt_url, allow_redirects=True) as resp:
+                if resp.status < 400:
+                    cl_raw = resp.headers.get("Content-Length")
+                    if cl_raw and cl_raw.isdigit() and int(cl_raw) > 0:
+                        opt.est_bytes = int(cl_raw)
+                        opt.is_approx = False
+
+    with contextlib.suppress(Exception):
+        async with aiohttp.ClientSession(
+            timeout=timeout, headers={"User-Agent": CHROME_UA}
+        ) as session:
+            await asyncio.gather(*(_head_one(session, opt, u) for opt, u in missing[:6]))
 
 
 def _format_res_label(width: int | None, height: int) -> str:
@@ -506,7 +560,7 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
                 best_audio_bytes = a_bytes
                 best_audio_approx = a_approx
 
-    grouped: dict[int, tuple[tuple[int, int, int, int, int, float], UrlFormatOption, str]] = {}
+    grouped: dict[int, tuple[tuple[int, int, int, int, int, float], UrlFormatOption, str, str | None]] = {}
     for f in raw_formats:
         if not isinstance(f, dict):
             continue
@@ -535,6 +589,12 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
         is_hls = ("m3u8" in proto) or ("hls" in proto)
         ext = str(f.get("ext") or "").lower()
         tbr = float(f.get("tbr") or f.get("vbr") or 0.0)
+        fmt_direct_url: str | None = None
+        if not is_hls and has_audio:
+            raw_f_url = str(f.get("url") or "").strip()
+            if raw_f_url.startswith(("http://", "https://")):
+                fmt_direct_url = raw_f_url
+
         score = (
             1 if not is_hls else 0,
             1 if (total_bytes is not None and not is_approx) else 0,
@@ -553,9 +613,10 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
         )
         prev = grouped.get(h_val)
         if prev is None or score > prev[0]:
-            grouped[h_val] = (score, opt, ext)
+            grouped[h_val] = (score, opt, ext, fmt_direct_url)
 
     sorted_items = sorted(grouped.items(), key=lambda kv: kv[0], reverse=True)[:7]
+    await _fill_missing_direct_format_sizes([(item[1][1], item[1][3]) for item in sorted_items])
     formats_sorted = [item[1][1] for item in sorted_items]
     top_ext = sorted_items[0][1][2] if sorted_items else "mp4"
     disp_ext = "webm" if top_ext == "webm" else "mp4"
@@ -850,6 +911,12 @@ async def _exec_ytdlp_download(
         "--no-color",
         "--no-warnings",
         "--restrict-filenames",
+        "--concurrent-fragments",
+        "6",
+        "--retries",
+        "5",
+        "--fragment-retries",
+        "5",
         "--max-filesize",
         str(max_allowed_bytes),
         "--format",
