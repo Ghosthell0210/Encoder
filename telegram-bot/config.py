@@ -8,6 +8,7 @@ Calibrado por defecto para panel.plugged.host (Egg Python Generic Pelican/Pterod
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -143,6 +144,43 @@ def _detect_cgroup_ram_gb() -> float | None:
     return None
 
 
+def _dir_bytes_simple(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    stack = [str(path)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def _detect_disk_gb(work_dir: Path, links_dir: Path) -> float | None:
+    """Detecta el espacio real disponible en disco (GiB) para el presupuesto del bot."""
+    try:
+        usage = shutil.disk_usage(work_dir)
+    except OSError:
+        return None
+    if usage.total <= 0:
+        return None
+    used_by_bot = _dir_bytes_simple(work_dir) + _dir_bytes_simple(links_dir)
+    avail_bytes = int(usage.free) + used_by_bot
+    if avail_bytes < 2 * (1024**3):
+        return None
+    return round(avail_bytes / (1024**3), 1)
+
+
 def _interactive_setup_env(base_dir: Path) -> None:
     """Si faltan credenciales y hay consola interactiva (Pelican/Pterodactyl), las pide y guarda .env."""
     env_path = Path.cwd() / ".env" if Path.cwd().exists() else base_dir / ".env"
@@ -162,7 +200,7 @@ def _interactive_setup_env(base_dir: Path) -> None:
             "AUTO_DETECT_RESOURCES=true",
             "MAX_CPU_THREADS=5",
             "MAX_RAM_GB=4",
-            "MAX_DISK_GB=30",
+            "MAX_DISK_GB=auto",
             "DISK_RESERVE_GB=2.0",
             "MAX_CONCURRENT_JOBS=1",
             "ACCESS_MODE=private",
@@ -196,6 +234,7 @@ class BotConfig:
     fast_transfer_workers: int = 6
     cpu_auto_detected: bool = False
     ram_auto_detected: bool = False
+    disk_auto_detected: bool = False
 
     # Acceso inicial (private = solo dueño + lista blanca | public = abierto)
     default_access_mode: str = "private"
@@ -291,6 +330,16 @@ class BotConfig:
             max_ram_gb = max(0.5, _env_float("MAX_RAM_GB", 4.0))
             ram_auto = False
 
+        raw_disk_env = os.getenv("MAX_DISK_GB", "").strip().lower()
+        explicit_disk = bool(raw_disk_env) and raw_disk_env not in {"auto", "30", "30.0"}
+        detected_disk = _detect_disk_gb(work_dir, links_dir) if (auto_detect and not explicit_disk) else None
+        if detected_disk is not None:
+            max_disk_gb = max(5.0, detected_disk)
+            disk_auto = True
+        else:
+            max_disk_gb = max(5.0, _env_float("MAX_DISK_GB", 30.0))
+            disk_auto = False
+
         max_concurrent = max(1, min(2, _env_int("MAX_CONCURRENT_JOBS", 1)))
 
         return cls(
@@ -302,12 +351,13 @@ class BotConfig:
             dump_chat_id=_env_int("DUMP_CHAT_ID", 0),
             max_cpu_threads=max_threads,
             max_ram_gb=max_ram_gb,
-            max_disk_gb=max(5.0, _env_float("MAX_DISK_GB", 30.0)),
+            max_disk_gb=max_disk_gb,
             disk_reserve_gb=max(0.5, _env_float("DISK_RESERVE_GB", 2.0)),
             max_concurrent_jobs=max_concurrent,
             fast_transfer_workers=max(2, min(12, _env_int("FAST_TRANSFER_WORKERS", 6))),
             cpu_auto_detected=cpu_auto,
             ram_auto_detected=ram_auto,
+            disk_auto_detected=disk_auto,
             default_access_mode=access_mode,
             large_file_uploader=uploader,
             gofile_token=_env_str("GOFILE_TOKEN"),

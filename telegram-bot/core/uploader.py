@@ -474,7 +474,6 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
 
     title = str(data.get("title") or "video_enlace").strip()
     safe_stem = "".join(c if c.isalnum() or c in " -_." else "_" for c in title).strip(" .")
-    filename = f"{(safe_stem or 'video_enlace')[:84]}.mp4"
     dur_raw = data.get("duration")
     duration = float(dur_raw) if isinstance(dur_raw, (int, float)) and dur_raw > 0 else None
 
@@ -495,9 +494,10 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
             a_hls = ("m3u8" in a_proto) or ("hls" in a_proto)
             a_ext = str(f.get("ext") or "").lower()
             a_abr = float(f.get("abr") or f.get("tbr") or 0.0)
+            a_is_webm = a_ext == "webm" or "opus" in acodec or "vorbis" in acodec
             a_score = (
                 1 if not a_hls else 0,
-                1 if a_ext in {"m4a", "mp4"} else 0,
+                1 if a_is_webm else 0,
                 1 if not a_approx else 0,
                 a_abr,
             )
@@ -506,7 +506,7 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
                 best_audio_bytes = a_bytes
                 best_audio_approx = a_approx
 
-    grouped: dict[int, tuple[tuple[int, int, int, int, int, float], UrlFormatOption]] = {}
+    grouped: dict[int, tuple[tuple[int, int, int, int, int, float], UrlFormatOption, str]] = {}
     for f in raw_formats:
         if not isinstance(f, dict):
             continue
@@ -538,7 +538,7 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
         score = (
             1 if not is_hls else 0,
             1 if (total_bytes is not None and not is_approx) else 0,
-            1 if ext == "mp4" else 0,
+            1 if ext == "webm" else 0,
             1 if total_bytes is not None else 0,
             fps_val or 0,
             tbr,
@@ -553,11 +553,13 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
         )
         prev = grouped.get(h_val)
         if prev is None or score > prev[0]:
-            grouped[h_val] = (score, opt)
+            grouped[h_val] = (score, opt, ext)
 
-    formats_sorted = [
-        item[1] for _, item in sorted(grouped.items(), key=lambda kv: kv[0], reverse=True)
-    ][:7]
+    sorted_items = sorted(grouped.items(), key=lambda kv: kv[0], reverse=True)[:7]
+    formats_sorted = [item[1][1] for item in sorted_items]
+    top_ext = sorted_items[0][1][2] if sorted_items else "mp4"
+    disp_ext = "webm" if top_ext == "webm" else "mp4"
+    filename = f"{(safe_stem or 'video_enlace')[:84]}.{disp_ext}"
 
     top_bytes, _ = _estimate_stream_bytes(data, duration)
     if top_bytes is None and formats_sorted:
@@ -775,6 +777,61 @@ async def _download_http_direct(
         raise
 
 
+_YTDLP_VIDEO_EXTS = {".webm", ".mkv", ".mp4", ".mov", ".m4v", ".avi", ".ts", ".flv"}
+_YTDLP_AUDIO_EXTS = {".m4a", ".opus", ".mp3", ".aac", ".ogg", ".oga", ".wav", ".flac"}
+_YTDLP_SPLIT_FORMAT_RE = re.compile(r"\.f\d+\.[a-z0-9]{2,5}$", re.IGNORECASE)
+
+
+async def _file_has_video_stream(file_path: Path) -> bool | None:
+    """Verifica con ffprobe si el archivo contiene una pista de video real (excluye carátulas)."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_streams",
+        str(file_path),
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError:
+        return None
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        return None
+
+    if proc.returncode != 0:
+        return False
+    try:
+        payload = json.loads(stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return None
+
+    for stream in payload.get("streams") or []:
+        if not isinstance(stream, dict):
+            continue
+        if stream.get("codec_type") != "video":
+            continue
+        disp = stream.get("disposition") or {}
+        if int(disp.get("attached_pic") or 0) != 0:
+            continue
+        w = int(stream.get("width") or 0)
+        h = int(stream.get("height") or 0)
+        if w > 0 and h > 0:
+            return True
+    return False
+
+
 async def _exec_ytdlp_download(
     base_cmd: list[str],
     url: str,
@@ -784,7 +841,7 @@ async def _exec_ytdlp_download(
     cancel_event: asyncio.Event,
     on_progress: TransferProgressCb | None,
     impersonate_chrome: bool = False,
-) -> tuple[int, list[str]]:
+) -> tuple[int, list[str], bool]:
     out_tmpl = str(dest_root / "%(title).70B [%(id).20B].%(ext)s")
     cmd = [
         *base_cmd,
@@ -797,8 +854,6 @@ async def _exec_ytdlp_download(
         str(max_allowed_bytes),
         "--format",
         fmt_expr,
-        "--merge-output-format",
-        "mp4",
     ]
     if impersonate_chrome:
         cmd.extend(["--impersonate", "chrome"])
@@ -811,6 +866,7 @@ async def _exec_ytdlp_download(
     )
 
     output_tail: list[str] = []
+    saw_max_filesize = False
     last_cb = 0.0
     try:
         assert proc.stdout is not None
@@ -833,6 +889,9 @@ async def _exec_ytdlp_download(
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
+            low_line = line.lower()
+            if "max-filesize" in low_line:
+                saw_max_filesize = True
             output_tail.append(line)
             if len(output_tail) > 20:
                 output_tail.pop(0)
@@ -854,13 +913,23 @@ async def _exec_ytdlp_download(
         await proc.wait()
         if cancel_event.is_set():
             raise JobCancelledError("Descarga cancelada por el usuario.")
-        return proc.returncode or 0, output_tail
+        return proc.returncode or 0, output_tail, saw_max_filesize
     finally:
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
             with contextlib.suppress(Exception):
                 await proc.wait()
+
+
+def _cleanup_dir_files(dest_root: Path, keep: Path | None = None) -> None:
+    keep_res = keep.resolve() if keep is not None else None
+    for item in dest_root.iterdir():
+        if keep_res is not None and item.resolve() == keep_res:
+            continue
+        if item.is_file():
+            with contextlib.suppress(OSError):
+                item.unlink()
 
 
 async def _download_with_ytdlp(
@@ -870,6 +939,7 @@ async def _download_with_ytdlp(
     cancel_event: asyncio.Event,
     on_progress: TransferProgressCb | None = None,
     max_height: int | None = None,
+    expect_video: bool = False,
 ) -> Path:
     base_cmd = await asyncio.to_thread(ensure_ytdlp, Path("bin"))
     if base_cmd is None:
@@ -880,21 +950,22 @@ async def _download_with_ytdlp(
 
     if max_height and max_height > 0:
         fmt_expr = (
-            f"bv*[height<={max_height}][ext=mp4][protocol^=http]+ba[ext=m4a][protocol^=http]/"
+            f"bv*[height<={max_height}][ext=webm][protocol^=http]+ba[ext=webm][protocol^=http]/"
+            f"bv*[height<={max_height}][ext=webm]+ba[ext=webm]/"
             f"bv*[height<={max_height}][protocol^=http]+ba[protocol^=http]/"
-            f"bv*[height<={max_height}][ext=mp4]+ba[ext=m4a]/"
             f"bv*[height<={max_height}]+ba/"
-            f"b[height<={max_height}][ext=mp4]/b[height<={max_height}]/b"
+            f"b[height<={max_height}][ext=webm]/b[height<={max_height}][ext=mp4]/b[height<={max_height}]/b"
         )
     else:
         fmt_expr = (
-            "bv*[ext=mp4][protocol^=http]+ba[ext=m4a][protocol^=http]/"
+            "bv*[ext=webm][protocol^=http]+ba[ext=webm][protocol^=http]/"
+            "bv*[ext=webm]+ba[ext=webm]/"
             "bv*[protocol^=http]+ba[protocol^=http]/"
-            "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b"
+            "bv*+ba/b[ext=webm]/b[ext=mp4]/b"
         )
 
     dest_root = dest_dir.resolve()
-    rc, output_tail = await _exec_ytdlp_download(
+    rc, output_tail, saw_max_filesize = await _exec_ytdlp_download(
         base_cmd=base_cmd,
         url=url,
         dest_root=dest_root,
@@ -909,7 +980,7 @@ async def _download_with_ytdlp(
         curl_ready = has_curl_cffi() or await asyncio.to_thread(ensure_curl_cffi)
         if curl_ready:
             logger.info("yt-dlp recibió bloqueo 403/anti-bot; reintentando con --impersonate chrome: %s", url[:80])
-            rc, output_tail = await _exec_ytdlp_download(
+            rc, output_tail, saw_retry_limit = await _exec_ytdlp_download(
                 base_cmd=base_cmd,
                 url=url,
                 dest_root=dest_root,
@@ -919,9 +990,11 @@ async def _download_with_ytdlp(
                 on_progress=on_progress,
                 impersonate_chrome=True,
             )
+            saw_max_filesize = saw_max_filesize or saw_retry_limit
             joined_tail = " ".join(output_tail[-6:])
 
     if rc != 0:
+        _cleanup_dir_files(dest_root)
         err_msg = " ".join(output_tail[-4:])[:360] or f"código {rc}"
         logger.error("yt-dlp descarga falló (rc=%s) para %s: %s", rc, url, "\n".join(output_tail[-8:]))
         if _looks_like_cloudflare_block(joined_tail):
@@ -930,20 +1003,78 @@ async def _download_with_ytdlp(
             )
         raise RuntimeError(f"yt-dlp no pudo descargar el enlace: {err_msg}")
 
-    candidates = [
+    all_files = [p for p in dest_root.iterdir() if p.is_file()]
+    part_files = [
         p
-        for p in dest_root.iterdir()
-        if p.is_file()
-        and not p.name.endswith((".part", ".ytdl", ".temp"))
+        for p in all_files
+        if ".part" in p.name or p.name.endswith((".ytdl", ".temp"))
+    ]
+    completed = [
+        p
+        for p in all_files
+        if p not in part_files
+        and p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}
         and p.stat().st_size > 0
     ]
-    if not candidates:
-        raise RuntimeError("yt-dlp terminó sin generar ningún archivo de video.")
 
-    chosen = max(candidates, key=lambda p: p.stat().st_size).resolve()
-    if not str(chosen).startswith(str(dest_root) + os.sep):
+    if not completed:
+        _cleanup_dir_files(dest_root)
+        if saw_max_filesize or part_files:
+            raise RuntimeError(
+                f"La descarga superó el límite de espacio seguro ({max_allowed_bytes / (1024**3):.1f} GiB) "
+                "y quedó incompleta. Prueba una resolución menor (ej. 1080p o 720p)."
+            )
+        raise RuntimeError("yt-dlp terminó sin generar ningún archivo descargable.")
+
+    video_candidates = sorted(
+        (p for p in completed if p.suffix.lower() in _YTDLP_VIDEO_EXTS),
+        key=lambda p: p.stat().st_size,
+        reverse=True,
+    )
+    chosen_video: Path | None = None
+    for cand in video_candidates:
+        has_vid = await _file_has_video_stream(cand)
+        if has_vid is True:
+            chosen_video = cand
+            break
+        if has_vid is None and not _YTDLP_SPLIT_FORMAT_RE.search(cand.name):
+            chosen_video = cand
+            break
+
+    if chosen_video is not None:
+        chosen = chosen_video.resolve()
+        if not str(chosen).startswith(str(dest_root) + os.sep):
+            raise RuntimeError("Ruta de descarga fuera del directorio permitido.")
+        _cleanup_dir_files(dest_root, keep=chosen)
+        return chosen
+
+    # No hubo video válido: proteger contra .m4a / .opus / .webm solo-audio huérfano
+    largest_other = max(completed, key=lambda p: p.stat().st_size).resolve()
+    has_split_tag = any(_YTDLP_SPLIT_FORMAT_RE.search(p.name) for p in completed)
+    looks_like_failed_video = (
+        expect_video
+        or bool(part_files)
+        or saw_max_filesize
+        or (max_height is not None and max_height > 0)
+        or has_split_tag
+        or largest_other.suffix.lower() in _YTDLP_VIDEO_EXTS
+    )
+    if looks_like_failed_video:
+        _cleanup_dir_files(dest_root)
+        if saw_max_filesize or part_files:
+            raise RuntimeError(
+                f"La pista de video superó el margen de disco seguro (~{max_allowed_bytes / (1024**3):.1f} GiB) "
+                "o quedó incompleta (.part); se abortó para no subir solo el audio. Prueba una resolución menor (ej. 1080p o 720p)."
+            )
+        raise RuntimeError(
+            "yt-dlp no pudo obtener una pista de video válida (solo quedó audio suelto sin video). "
+            "Intenta otra calidad o revisa el enlace."
+        )
+
+    if not str(largest_other).startswith(str(dest_root) + os.sep):
         raise RuntimeError("Ruta de descarga fuera del directorio permitido.")
-    return chosen
+    _cleanup_dir_files(dest_root, keep=largest_other)
+    return largest_other
 
 
 async def download_from_url(
@@ -954,6 +1085,8 @@ async def download_from_url(
     on_progress: TransferProgressCb | None = None,
     max_height: int | None = None,
     gofile_token: str = "",
+    max_ytdlp_bytes: int | None = None,
+    expect_video: bool = False,
 ) -> Path:
     """Descarga un archivo/video desde servidor nativo, HTTP directo o yt-dlp."""
     safe_url = await _validate_external_url(url)
@@ -988,13 +1121,15 @@ async def download_from_url(
             on_progress=on_progress,
         )
 
+    ytdlp_limit = max_ytdlp_bytes if max_ytdlp_bytes is not None else max_allowed_bytes
     return await _download_with_ytdlp(
         url=safe_url,
         dest_dir=dest_dir,
-        max_allowed_bytes=max_allowed_bytes,
+        max_allowed_bytes=ytdlp_limit,
         cancel_event=cancel_event,
         on_progress=on_progress,
         max_height=max_height,
+        expect_video=expect_video,
     )
 
 

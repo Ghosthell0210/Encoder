@@ -176,8 +176,9 @@ async def main() -> None:
     me = await app.get_me()
     cpu_tag = " auto" if config.cpu_auto_detected else ""
     ram_tag = " auto" if config.ram_auto_detected else ""
+    disk_tag = " auto" if config.disk_auto_detected else ""
     logger.info(
-        "Bot iniciado como @%s (ID: %s) | Presupuesto: %s%% CPU (%s hilos%s) · %.1f GiB RAM%s · %.0f GiB Disco | Cuenta: %s",
+        "Bot iniciado como @%s (ID: %s) | Presupuesto: %s%% CPU (%s hilos%s) · %.1f GiB RAM%s · %.1f GiB Disco%s | Cuenta: %s",
         me.username,
         me.id,
         config.max_cpu_threads * 100,
@@ -186,6 +187,7 @@ async def main() -> None:
         config.max_ram_gb,
         ram_tag,
         config.max_disk_gb,
+        disk_tag,
         user_session.status_label(),
     )
 

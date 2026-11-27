@@ -118,6 +118,7 @@ class CompressionJob:
     keep_cached_source: bool = False
     user_label: str = ""
     action_kind: ActionKind = "compress"
+    expect_video: bool = False
     on_media_probed: Callable[[MediaInfo], Awaitable[None]] | None = None
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -311,32 +312,36 @@ class QueueManager:
         cache_dir = self.config.work_dir / "_cache" / session_id
         shutil.rmtree(cache_dir, ignore_errors=True)
 
+    def _effective_free_bytes(self) -> int:
+        """Calcula el espacio realmente usable respetando disco físico y presupuesto."""
+        usage = shutil.disk_usage(self.config.work_dir)
+        reserve_bytes = int(self.config.disk_reserve_gb * (1024**3))
+        max_bot_bytes = int(self.config.max_disk_gb * (1024**3))
+        used_by_bot = fast_dir_bytes(self.config.work_dir) + fast_dir_bytes(self.config.links_dir)
+        available_in_budget = max_bot_bytes - used_by_bot - reserve_bytes
+        available_os = usage.free - reserve_bytes
+        return max(0, min(available_in_budget, available_os))
+
     def check_disk_budget(
         self,
         incoming_bytes: int,
         already_cached: bool = False,
         light_tool: bool = False,
+        needs_merge: bool = False,
     ) -> tuple[bool, str]:
         """Verifica espacio libre real del sistema y presupuesto de disco del contenedor."""
-        usage = shutil.disk_usage(self.config.work_dir)
-        reserve_bytes = int(self.config.disk_reserve_gb * (1024**3))
-        max_bot_bytes = int(self.config.max_disk_gb * (1024**3))
-        used_by_bot = fast_dir_bytes(self.config.work_dir) + fast_dir_bytes(self.config.links_dir)
-
         if light_tool:
-            factor = 0.2 if already_cached else 1.15
+            factor = 0.2 if already_cached else (2.05 if needs_merge else 1.15)
         else:
             factor = 1.15 if already_cached else 2.2
 
         estimated_need = max(int(incoming_bytes * factor), 150 * 1024 * 1024)
-        available_in_budget = max_bot_bytes - used_by_bot - reserve_bytes
-        available_os = usage.free - reserve_bytes
-        effective_free = min(available_in_budget, available_os)
+        effective_free = self._effective_free_bytes()
 
         if effective_free < estimated_need:
             return (
                 False,
-                f"Espacio temporal insuficiente (disponible: {human_bytes(max(0, effective_free))}, "
+                f"Espacio temporal insuficiente (disponible: {human_bytes(effective_free)}, "
                 f"necesario aprox.: {human_bytes(estimated_need)}). Espera a que terminen otros trabajos o ejecuta /purge.",
             )
         return True, ""
@@ -512,8 +517,17 @@ class QueueManager:
                 "extract_opus",
                 "extract_mp3",
             }
+            needs_merge = (
+                job.action_kind == "download_only"
+                and bool(job.source_url)
+                and job.expect_video
+            )
             ok_disk, disk_msg = await asyncio.to_thread(
-                self.check_disk_budget, job.expected_size, already_cached, light_tool
+                self.check_disk_budget,
+                job.expected_size,
+                already_cached,
+                light_tool,
+                needs_merge,
             )
             if not ok_disk:
                 outcome = "Sin espacio"
@@ -536,7 +550,12 @@ class QueueManager:
                 media: MediaInfo
                 try:
                     media = await probe_media(input_path)
-                except Exception:
+                except Exception as exc:
+                    if job.expect_video:
+                        logger.warning("Leech esperaba video pero ffprobe falló (%s): %s", input_path.name, exc)
+                        raise RuntimeError(
+                            "El archivo descargado no contiene una pista de video válida (posible audio huérfano o descarga incompleta)."
+                        ) from exc
                     media = MediaInfo(
                         path=input_path,
                         file_size=input_size,
@@ -552,14 +571,32 @@ class QueueManager:
                     and media.height > 0
                     and input_path.suffix.lower() in {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"}
                 )
-                if not is_video_file:
-                    job.options.send_as_document = True
+                if job.expect_video and not is_video_file:
+                    raise RuntimeError(
+                        "El archivo descargado no contiene una pista de video válida."
+                    )
+                # Entregar siempre /leech como Documento intacto (listo para Reproductor MX)
+                job.options.send_as_document = True
                 elapsed_total = time.time() - (job.started_at or time.time())
                 metrics = await monitor.stop()
+                is_audio_only = input_path.suffix.lower() in {
+                    ".m4a",
+                    ".mp3",
+                    ".opus",
+                    ".aac",
+                    ".ogg",
+                    ".oga",
+                    ".wav",
+                    ".flac",
+                }
                 media_line = (
-                    f"├ **Video:** `{media.width}×{media.height}` · `{media.video_codec.upper()}` · `{human_duration(media.duration)}`\n"
+                    f"├ **Video:** `{media.width}×{media.height}` · `{media.video_codec.upper()}` · `{human_duration(media.duration)}` (`Documento`)\n"
                     if is_video_file
-                    else "├ **Tipo:** `Archivo directo (Documento)`\n"
+                    else (
+                        "├ **Tipo:** `Audio directo (Documento)`\n"
+                        if is_audio_only
+                        else "├ **Tipo:** `Archivo directo (Documento)`\n"
+                    )
                 )
                 dl_summary = (
                     f"⬇️ **Leech / Descarga Completada**\n"
@@ -1199,15 +1236,27 @@ class QueueManager:
             )
 
         if job.source_url:
-            max_allow = int((self.config.max_disk_gb - self.config.disk_reserve_gb) * (1024**3) * 0.48)
+            effective_free = await asyncio.to_thread(self._effective_free_bytes)
+            max_allow_merge = int(effective_free * 0.48)
+            max_allow_single = (
+                int(effective_free * 0.85)
+                if job.action_kind == "download_only"
+                else max_allow_merge
+            )
+            if max_allow_merge < 50 * 1024 * 1024:
+                raise RuntimeError(
+                    f"Espacio libre insuficiente para descargar ({human_bytes(effective_free)} disponibles). Ejecuta /purge."
+                )
             return await download_from_url(
                 url=job.source_url,
                 dest_dir=dest_dir,
-                max_allowed_bytes=max_allow,
+                max_allowed_bytes=max_allow_single,
                 cancel_event=job.cancel_event,
                 on_progress=_dl_progress,
                 max_height=job.download_max_height,
                 gofile_token=self.config.gofile_token,
+                max_ytdlp_bytes=max_allow_merge,
+                expect_video=job.expect_video or (job.action_kind != "download_only"),
             )
 
         assert job.source_message is not None

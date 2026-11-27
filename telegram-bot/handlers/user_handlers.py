@@ -368,6 +368,7 @@ def register_user_handlers(
         source_url: str,
         download_max_height: int | None = None,
         status_message: Message | None = None,
+        expect_video: bool = False,
     ) -> None:
         job_id = secrets.token_hex(4)
         status_msg = status_message or await message.reply_text(
@@ -386,6 +387,7 @@ def register_user_handlers(
             download_max_height=download_max_height,
             expected_size=file_size or (500 * 1024 * 1024),
             action_kind="download_only",
+            expect_video=expect_video,
         )
         pos = await queue_mgr.enqueue(job)
         res_note = f" (`{download_max_height}p`)" if download_max_height else ""
@@ -505,6 +507,7 @@ def register_user_handlers(
                     source_url=url_text,
                     download_max_height=sel_height,
                     status_message=probe_msg,
+                    expect_video=bool(url_info and url_info.formats),
                 )
                 return
 
@@ -1566,6 +1569,7 @@ def register_user_handlers(
                 session_id=session.session_id if has_cache else None,
                 keep_cached_source=False,
                 action_kind="download_only",
+                expect_video=bool(session.url_info and session.url_info.formats),
             )
             pos = await queue_mgr.enqueue(job)
             await query.answer(f"Descarga directa encolada (#{pos})")
