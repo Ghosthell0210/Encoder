@@ -1189,8 +1189,9 @@ class QueueManager:
             job.progress_detail = f"{human_bytes(speed_bps)}/s"
             eta = ((total - current) / max(speed_bps, 1.0)) if total > current else 0.0
             bar_str = progress_bar(pct) if total > 0 else f"Descargados {human_bytes(current)}"
+            dl_title = "⬇️ **Descargando Archivo (Leech)**" if job.action_kind == "download_only" else "⬇️ **Descargando Video**"
             await updater.update(
-                f"⬇️ **Descargando Video**\n"
+                f"{dl_title}\n"
                 f"`{bar_str}`\n"
                 f"├ **Progreso:** `{human_bytes(current)}` / `{human_bytes(total) if total else 'Desc.'}`\n"
                 f"└ **Velocidad:** `{human_bytes(speed_bps)}/s` · **ETA:** `{human_duration(eta)}`",
@@ -1206,6 +1207,7 @@ class QueueManager:
                 cancel_event=job.cancel_event,
                 on_progress=_dl_progress,
                 max_height=job.download_max_height,
+                gofile_token=self.config.gofile_token,
             )
 
         assert job.source_message is not None

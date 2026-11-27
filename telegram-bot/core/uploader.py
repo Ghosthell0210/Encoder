@@ -33,8 +33,14 @@ import aiohttp
 from aiohttp import web
 
 from config import BotConfig
-from core.ffmpeg_bootstrap import ensure_ytdlp
+from core.ffmpeg_bootstrap import ensure_curl_cffi, ensure_ytdlp, has_curl_cffi
 from core.ffmpeg_engine import JobCancelledError
+from core.host_extractors import (
+    CHROME_UA,
+    HostExtractionError,
+    identify_file_host,
+    resolve_host_download,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,16 +184,24 @@ class DirectLinkStore:
         return count
 
 
-def _extract_filename_from_response(url: str, resp: aiohttp.ClientResponse) -> str:
-    cd = resp.headers.get("Content-Disposition", "")
+def _extract_filename_from_response(
+    url: str,
+    headers_map: Any,
+    fallback_name: str | None = None,
+) -> str:
+    cd = headers_map.get("Content-Disposition", "") if headers_map else ""
     match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";\r\n]+)"?', cd, flags=re.IGNORECASE)
     if match:
         raw = unquote(match.group(1).strip())
+    elif fallback_name:
+        raw = fallback_name
     else:
         path = unquote(urlparse(url).path)
-        raw = Path(path).name or "video_url.mp4"
+        raw = Path(path).name or "archivo_url.bin"
 
-    clean = "".join(c if c.isalnum() or c in " -_." else "_" for c in raw).strip(" .")
+    clean = "".join(c if c.isalnum() or c in " -_.()[]" else "_" for c in raw).strip(" .")
+    if not clean:
+        clean = "archivo_url.bin"
     if "." not in clean:
         clean += ".mp4"
     return clean[:100]
@@ -282,7 +296,7 @@ async def _probe_direct_head(url: str) -> tuple[bool, int | None, str]:
                 cd = (resp.headers.get("Content-Disposition") or "").lower()
                 cl_raw = resp.headers.get("Content-Length")
                 cl_val = int(cl_raw) if cl_raw and cl_raw.isdigit() and int(cl_raw) > 0 else None
-                fname = _extract_filename_from_response(str(resp.url), resp)
+                fname = _extract_filename_from_response(str(resp.url), resp.headers)
                 is_direct = (
                     path_ext in _DIRECT_MEDIA_EXTS
                     or ctype.startswith(("video/", "audio/", "application/x-matroska"))
@@ -341,13 +355,69 @@ def _format_res_label(width: int | None, height: int) -> str:
     return f"{height}p"
 
 
-async def probe_url_info(url: str) -> UrlProbeInfo:
+async def _run_ytdlp_probe(
+    base_cmd: list[str],
+    safe_url: str,
+    impersonate_chrome: bool = False,
+) -> tuple[int, bytes, bytes]:
+    cmd = [*base_cmd, "--dump-single-json", "--no-playlist", "--no-color", "--skip-download"]
+    if impersonate_chrome:
+        cmd.extend(["--impersonate", "chrome"])
+    cmd.extend(["--", safe_url])
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=25.0)
+        return proc.returncode or 0, stdout, stderr
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        logger.warning("yt-dlp probe timeout (>25s) para URL: %s", safe_url)
+        raise RuntimeError("Tiempo agotado al inspeccionar el enlace.")
+
+
+def _looks_like_cloudflare_block(err_text: str) -> bool:
+    low = err_text.lower()
+    return any(
+        tok in low
+        for tok in ("cloudflare", "403", "impersonat", "anti-bot", "challenge", "captcha")
+    )
+
+
+async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
     """Inspecciona un enlace antes de descargarlo para conocer resoluciones y pesos disponibles."""
     safe_url = await _validate_external_url(url)
+
+    if identify_file_host(safe_url) is not None:
+        resolved = await resolve_host_download(
+            safe_url,
+            _validate_external_url,
+            gofile_token=gofile_token,
+        )
+        if resolved is not None:
+            clean_name = "".join(
+                c if c.isalnum() or c in " -_.()[]" else "_"
+                for c in (resolved.filename or "archivo_enlace.bin")
+            ).strip(" .") or "archivo_enlace.bin"
+            return UrlProbeInfo(
+                url=safe_url,
+                title=Path(clean_name).stem,
+                filename=clean_name[:100],
+                duration=None,
+                is_direct=True,
+                direct_bytes=resolved.file_size,
+                formats=[],
+            )
+
     is_direct, direct_bytes, direct_name = await _probe_direct_head(safe_url)
     if is_direct:
         clean_name = "".join(
-            c if c.isalnum() or c in " -_." else "_" for c in direct_name
+            c if c.isalnum() or c in " -_.()[]" else "_" for c in direct_name
         ).strip(" .") or "video_enlace.mp4"
         if "." not in clean_name:
             clean_name += ".mp4"
@@ -368,35 +438,24 @@ async def probe_url_info(url: str) -> UrlProbeInfo:
             "Verifica la salida a internet del servidor o ejecuta 'pip install yt-dlp'."
         )
 
-    cmd = [
-        *base_cmd,
-        "--dump-single-json",
-        "--no-playlist",
-        "--no-color",
-        "--skip-download",
-        "--",
-        safe_url,
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=25.0)
-    except asyncio.TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        logger.warning("yt-dlp probe timeout (>25s) para URL: %s", safe_url)
-        raise RuntimeError("Tiempo agotado al inspeccionar el enlace.")
-
+    rc, stdout, stderr = await _run_ytdlp_probe(base_cmd, safe_url, impersonate_chrome=False)
     stderr_txt = stderr.decode("utf-8", errors="replace").strip()
-    if proc.returncode != 0:
+    if rc != 0 and _looks_like_cloudflare_block(stderr_txt):
+        curl_ready = has_curl_cffi() or await asyncio.to_thread(ensure_curl_cffi)
+        if curl_ready:
+            logger.info("Reintentando pre-análisis yt-dlp con --impersonate chrome: %s", safe_url[:80])
+            rc, stdout, stderr = await _run_ytdlp_probe(base_cmd, safe_url, impersonate_chrome=True)
+            stderr_txt = stderr.decode("utf-8", errors="replace").strip()
+
+    if rc != 0:
         err_msg = stderr_txt[:280]
-        logger.error("yt-dlp probe falló (rc=%s) para %s: %s", proc.returncode, safe_url, stderr_txt[:500])
-        raise RuntimeError(f"No se pudo analizar el enlace: {err_msg or f'código {proc.returncode}'}")
+        logger.error("yt-dlp probe falló (rc=%s) para %s: %s", rc, safe_url, stderr_txt[:500])
+        if _looks_like_cloudflare_block(stderr_txt):
+            raise RuntimeError(
+                "El servidor bloqueó la inspección con Cloudflare/Captcha (HTTP 403). "
+                "Si es un enlace directo o de descarga web, verifica que no exija verificación manual."
+            )
+        raise RuntimeError(f"No se pudo analizar el enlace: {err_msg or f'código {rc}'}")
 
     if stderr_txt:
         logger.warning("yt-dlp probe avisos para %s: %s", safe_url, stderr_txt[:500])
@@ -528,81 +587,204 @@ async def probe_url_info(url: str) -> UrlProbeInfo:
     )
 
 
+def _check_unexpected_html_stream(ctype: str, first_chunk: bytes) -> None:
+    if "text/html" not in ctype:
+        return
+    preview = first_chunk[:4096].decode("utf-8", errors="replace").lower()
+    if any(m in preview for m in ("cf-turnstile", "challenges.cloudflare.com", "just a moment", "captcha")):
+        raise HostExtractionError(
+            "El servidor activó un desafío JavaScript / Captcha de Cloudflare que no puede "
+            "resolverse automáticamente; genera un enlace directo o usa otro servidor."
+        )
+    if "password" in preview or "contraseña" in preview:
+        raise HostExtractionError("El servidor solicita contraseña para descargar este archivo.")
+    raise HostExtractionError(
+        "El servidor devolvió una página HTML en lugar del archivo (posible enlace expirado, cuota o bloqueo anti-bot)."
+    )
+
+
+async def _stream_with_curl_cffi(
+    url: str,
+    dest_root: Path,
+    max_allowed_bytes: int,
+    cancel_event: asyncio.Event,
+    on_progress: TransferProgressCb | None,
+    headers: dict[str, str] | None = None,
+    cookies: dict[str, str] | None = None,
+    forced_filename: str | None = None,
+) -> Path:
+    from curl_cffi.requests import AsyncSession
+
+    req_headers = {"User-Agent": CHROME_UA, **(headers or {})}
+    async with AsyncSession(impersonate="chrome", timeout=None) as session:
+        async with session.stream(
+            "GET",
+            url,
+            headers=req_headers,
+            cookies=cookies or None,
+            allow_redirects=True,
+        ) as resp:
+            await _validate_external_url(str(resp.url))
+            if resp.status_code >= 400:
+                if resp.status_code in {403, 503}:
+                    raise HostExtractionError(
+                        f"El servidor bloqueó la descarga (HTTP {resp.status_code}, posible Cloudflare o enlace expirado)."
+                    )
+                raise RuntimeError(f"El enlace respondió con error HTTP {resp.status_code}.")
+
+            cl_raw = resp.headers.get("Content-Length")
+            total = int(cl_raw) if cl_raw and cl_raw.isdigit() else 0
+            if total > 0 and total > max_allowed_bytes:
+                raise RuntimeError(
+                    f"El archivo remoto ({total / (1024**3):.2f} GiB) excede el margen de disco seguro."
+                )
+
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            filename = _extract_filename_from_response(
+                str(resp.url), resp.headers, fallback_name=forced_filename
+            )
+            dest_path = (dest_root / filename).resolve()
+            if not str(dest_path).startswith(str(dest_root) + os.sep):
+                raise RuntimeError("Nombre de archivo remoto inválido.")
+
+            downloaded = 0
+            last_cb = 0.0
+            first_checked = False
+            try:
+                with dest_path.open("wb") as fp:
+                    async for chunk in resp.aiter_content():
+                        if cancel_event.is_set():
+                            raise JobCancelledError("Descarga cancelada por el usuario.")
+                        if not chunk:
+                            continue
+                        if not first_checked:
+                            first_checked = True
+                            _check_unexpected_html_stream(ctype, chunk)
+                        fp.write(chunk)
+                        downloaded += len(chunk)
+                        if downloaded > max_allowed_bytes:
+                            raise RuntimeError("La descarga excedió el límite de espacio libre seguro.")
+                        if on_progress:
+                            now = time.monotonic()
+                            if (total > 0 and downloaded >= total) or (now - last_cb) >= 0.7:
+                                last_cb = now
+                                await on_progress(downloaded, total)
+            except Exception:
+                dest_path.unlink(missing_ok=True)
+                raise
+
+            if downloaded == 0:
+                dest_path.unlink(missing_ok=True)
+                raise RuntimeError("El enlace devolvió un archivo vacío.")
+            if on_progress:
+                await on_progress(downloaded, total or downloaded)
+            return dest_path
+
+
 async def _download_http_direct(
     url: str,
     dest_dir: Path,
     max_allowed_bytes: int,
     cancel_event: asyncio.Event,
     on_progress: TransferProgressCb | None = None,
+    headers: dict[str, str] | None = None,
+    cookies: dict[str, str] | None = None,
+    prefer_curl_cffi: bool = False,
+    forced_filename: str | None = None,
 ) -> Path:
+    dest_root = dest_dir.resolve()
+    if prefer_curl_cffi and (has_curl_cffi() or await asyncio.to_thread(ensure_curl_cffi)):
+        return await _stream_with_curl_cffi(
+            url=url,
+            dest_root=dest_root,
+            max_allowed_bytes=max_allowed_bytes,
+            cancel_event=cancel_event,
+            on_progress=on_progress,
+            headers=headers,
+            cookies=cookies,
+            forced_filename=forced_filename,
+        )
+
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=120)
-    dest_root = dest_dir.resolve()
+    req_headers = {"User-Agent": CHROME_UA, **(headers or {})}
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, allow_redirects=True) as resp:
-            await _validate_external_url(str(resp.url))
-            if resp.status >= 400:
-                raise RuntimeError(f"El enlace respondió con error HTTP {resp.status}.")
+    try:
+        async with aiohttp.ClientSession(
+            timeout=timeout, headers=req_headers, cookies=cookies
+        ) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                await _validate_external_url(str(resp.url))
+                if resp.status in {403, 503} and (
+                    has_curl_cffi() or await asyncio.to_thread(ensure_curl_cffi)
+                ):
+                    logger.info("HTTP %s con aiohttp; reintentando descarga directa con curl-cffi...", resp.status)
+                    return await _stream_with_curl_cffi(
+                        url=url,
+                        dest_root=dest_root,
+                        max_allowed_bytes=max_allowed_bytes,
+                        cancel_event=cancel_event,
+                        on_progress=on_progress,
+                        headers=headers,
+                        cookies=cookies,
+                        forced_filename=forced_filename,
+                    )
+                if resp.status >= 400:
+                    raise RuntimeError(f"El enlace respondió con error HTTP {resp.status}.")
 
-            total = int(resp.headers.get("Content-Length") or 0)
-            if total > 0 and total > max_allowed_bytes:
-                raise RuntimeError(
-                    f"El archivo remoto ({total / (1024**3):.2f} GiB) excede el margen de disco seguro."
+                total = int(resp.headers.get("Content-Length") or 0)
+                if total > 0 and total > max_allowed_bytes:
+                    raise RuntimeError(
+                        f"El archivo remoto ({total / (1024**3):.2f} GiB) excede el margen de disco seguro."
+                    )
+
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                filename = _extract_filename_from_response(
+                    str(resp.url), resp.headers, fallback_name=forced_filename
                 )
+                dest_path = (dest_root / filename).resolve()
+                if not str(dest_path).startswith(str(dest_root) + os.sep):
+                    raise RuntimeError("Nombre de archivo remoto inválido.")
 
-            filename = _extract_filename_from_response(str(resp.url), resp)
-            dest_path = (dest_root / filename).resolve()
-            if not str(dest_path).startswith(str(dest_root) + os.sep):
-                raise RuntimeError("Nombre de archivo remoto inválido.")
+                downloaded = 0
+                first_checked = False
+                try:
+                    with dest_path.open("wb") as fp:
+                        async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                            if cancel_event.is_set():
+                                raise JobCancelledError("Descarga cancelada por el usuario.")
+                            if not chunk:
+                                continue
+                            if not first_checked:
+                                first_checked = True
+                                _check_unexpected_html_stream(ctype, chunk)
+                            fp.write(chunk)
+                            downloaded += len(chunk)
+                            if downloaded > max_allowed_bytes:
+                                raise RuntimeError("La descarga excedió el límite de espacio libre seguro.")
+                            if on_progress:
+                                await on_progress(downloaded, total)
+                except Exception:
+                    dest_path.unlink(missing_ok=True)
+                    raise
 
-            downloaded = 0
-            with dest_path.open("wb") as fp:
-                async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
-                    if cancel_event.is_set():
-                        raise JobCancelledError("Descarga cancelada por el usuario.")
-                    fp.write(chunk)
-                    downloaded += len(chunk)
-                    if downloaded > max_allowed_bytes:
-                        raise RuntimeError("La descarga excedió el límite de espacio libre seguro.")
-                    if on_progress:
-                        await on_progress(downloaded, total)
-
-            if downloaded == 0:
-                raise RuntimeError("El enlace devolvió un archivo vacío.")
-            return dest_path
+                if downloaded == 0:
+                    dest_path.unlink(missing_ok=True)
+                    raise RuntimeError("El enlace devolvió un archivo vacío.")
+                return dest_path
+    except HostExtractionError:
+        raise
 
 
-async def _download_with_ytdlp(
+async def _exec_ytdlp_download(
+    base_cmd: list[str],
     url: str,
-    dest_dir: Path,
+    dest_root: Path,
     max_allowed_bytes: int,
+    fmt_expr: str,
     cancel_event: asyncio.Event,
-    on_progress: TransferProgressCb | None = None,
-    max_height: int | None = None,
-) -> Path:
-    base_cmd = await asyncio.to_thread(ensure_ytdlp, Path("bin"))
-    if base_cmd is None:
-        raise RuntimeError(
-            "No se pudo instalar automáticamente 'yt-dlp'. "
-            "Verifica la salida a internet del servidor o ejecuta 'pip install yt-dlp'."
-        )
-
-    if max_height and max_height > 0:
-        fmt_expr = (
-            f"bv*[height<={max_height}][ext=mp4][protocol^=http]+ba[ext=m4a][protocol^=http]/"
-            f"bv*[height<={max_height}][protocol^=http]+ba[protocol^=http]/"
-            f"bv*[height<={max_height}][ext=mp4]+ba[ext=m4a]/"
-            f"bv*[height<={max_height}]+ba/"
-            f"b[height<={max_height}][ext=mp4]/b[height<={max_height}]/b"
-        )
-    else:
-        fmt_expr = (
-            "bv*[ext=mp4][protocol^=http]+ba[ext=m4a][protocol^=http]/"
-            "bv*[protocol^=http]+ba[protocol^=http]/"
-            "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b"
-        )
-
-    dest_root = dest_dir.resolve()
+    on_progress: TransferProgressCb | None,
+    impersonate_chrome: bool = False,
+) -> tuple[int, list[str]]:
     out_tmpl = str(dest_root / "%(title).70B [%(id).20B].%(ext)s")
     cmd = [
         *base_cmd,
@@ -617,11 +799,10 @@ async def _download_with_ytdlp(
         fmt_expr,
         "--merge-output-format",
         "mp4",
-        "-o",
-        out_tmpl,
-        "--",
-        url,
     ]
+    if impersonate_chrome:
+        cmd.extend(["--impersonate", "chrome"])
+    cmd.extend(["-o", out_tmpl, "--", url])
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -673,16 +854,81 @@ async def _download_with_ytdlp(
         await proc.wait()
         if cancel_event.is_set():
             raise JobCancelledError("Descarga cancelada por el usuario.")
-        if proc.returncode != 0:
-            err_msg = " ".join(output_tail[-4:])[:360] or f"código {proc.returncode}"
-            logger.error("yt-dlp descarga falló (rc=%s) para %s: %s", proc.returncode, url, "\n".join(output_tail[-8:]))
-            raise RuntimeError(f"yt-dlp no pudo descargar el enlace: {err_msg}")
+        return proc.returncode or 0, output_tail
     finally:
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
             with contextlib.suppress(Exception):
                 await proc.wait()
+
+
+async def _download_with_ytdlp(
+    url: str,
+    dest_dir: Path,
+    max_allowed_bytes: int,
+    cancel_event: asyncio.Event,
+    on_progress: TransferProgressCb | None = None,
+    max_height: int | None = None,
+) -> Path:
+    base_cmd = await asyncio.to_thread(ensure_ytdlp, Path("bin"))
+    if base_cmd is None:
+        raise RuntimeError(
+            "No se pudo instalar automáticamente 'yt-dlp'. "
+            "Verifica la salida a internet del servidor o ejecuta 'pip install yt-dlp'."
+        )
+
+    if max_height and max_height > 0:
+        fmt_expr = (
+            f"bv*[height<={max_height}][ext=mp4][protocol^=http]+ba[ext=m4a][protocol^=http]/"
+            f"bv*[height<={max_height}][protocol^=http]+ba[protocol^=http]/"
+            f"bv*[height<={max_height}][ext=mp4]+ba[ext=m4a]/"
+            f"bv*[height<={max_height}]+ba/"
+            f"b[height<={max_height}][ext=mp4]/b[height<={max_height}]/b"
+        )
+    else:
+        fmt_expr = (
+            "bv*[ext=mp4][protocol^=http]+ba[ext=m4a][protocol^=http]/"
+            "bv*[protocol^=http]+ba[protocol^=http]/"
+            "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b"
+        )
+
+    dest_root = dest_dir.resolve()
+    rc, output_tail = await _exec_ytdlp_download(
+        base_cmd=base_cmd,
+        url=url,
+        dest_root=dest_root,
+        max_allowed_bytes=max_allowed_bytes,
+        fmt_expr=fmt_expr,
+        cancel_event=cancel_event,
+        on_progress=on_progress,
+        impersonate_chrome=False,
+    )
+    joined_tail = " ".join(output_tail[-6:])
+    if rc != 0 and _looks_like_cloudflare_block(joined_tail):
+        curl_ready = has_curl_cffi() or await asyncio.to_thread(ensure_curl_cffi)
+        if curl_ready:
+            logger.info("yt-dlp recibió bloqueo 403/anti-bot; reintentando con --impersonate chrome: %s", url[:80])
+            rc, output_tail = await _exec_ytdlp_download(
+                base_cmd=base_cmd,
+                url=url,
+                dest_root=dest_root,
+                max_allowed_bytes=max_allowed_bytes,
+                fmt_expr=fmt_expr,
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+                impersonate_chrome=True,
+            )
+            joined_tail = " ".join(output_tail[-6:])
+
+    if rc != 0:
+        err_msg = " ".join(output_tail[-4:])[:360] or f"código {rc}"
+        logger.error("yt-dlp descarga falló (rc=%s) para %s: %s", rc, url, "\n".join(output_tail[-8:]))
+        if _looks_like_cloudflare_block(joined_tail):
+            raise RuntimeError(
+                "El servidor bloqueó la descarga con un desafío Cloudflare / Captcha que requiere navegador completo."
+            )
+        raise RuntimeError(f"yt-dlp no pudo descargar el enlace: {err_msg}")
 
     candidates = [
         p
@@ -707,10 +953,30 @@ async def download_from_url(
     cancel_event: asyncio.Event,
     on_progress: TransferProgressCb | None = None,
     max_height: int | None = None,
+    gofile_token: str = "",
 ) -> Path:
-    """Descarga un video desde enlace HTTP directo o plataformas (YouTube, TikTok, etc. vía yt-dlp)."""
+    """Descarga un archivo/video desde servidor nativo, HTTP directo o yt-dlp."""
     safe_url = await _validate_external_url(url)
     dest_dir.mkdir(parents=True, exist_ok=True)
+
+    if identify_file_host(safe_url) is not None:
+        resolved = await resolve_host_download(
+            safe_url,
+            _validate_external_url,
+            gofile_token=gofile_token,
+        )
+        if resolved is not None:
+            return await _download_http_direct(
+                url=resolved.direct_url,
+                dest_dir=dest_dir,
+                max_allowed_bytes=max_allowed_bytes,
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+                headers=resolved.headers,
+                cookies=resolved.cookies,
+                prefer_curl_cffi=resolved.use_curl_cffi,
+                forced_filename=resolved.filename,
+            )
 
     is_direct = await _probe_direct_media(safe_url)
     if is_direct:

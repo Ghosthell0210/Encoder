@@ -20,6 +20,7 @@ import loggerSetupPy from '../../telegram-bot/core/logger_setup.py?raw';
 import mediaProbePy from '../../telegram-bot/core/media_probe.py?raw';
 import mediaToolsPy from '../../telegram-bot/core/media_tools.py?raw';
 import ffmpegEnginePy from '../../telegram-bot/core/ffmpeg_engine.py?raw';
+import hostExtractorsPy from '../../telegram-bot/core/host_extractors.py?raw';
 import uploaderPy from '../../telegram-bot/core/uploader.py?raw';
 import userSessionPy from '../../telegram-bot/core/user_session.py?raw';
 import uiHelpersPy from '../../telegram-bot/core/ui_helpers.py?raw';
@@ -203,9 +204,15 @@ export const BOT_FILES: BotFileItem[] = [
     resourceMonitorPy,
   ),
   makeFile(
+    'core/host_extractors.py',
+    'core/',
+    'Extractores nativos MediaFire, Pixeldrain, GoFile, Buzzheavier y Google Drive con bypass TLS curl-cffi',
+    hostExtractorsPy,
+  ),
+  makeFile(
     'core/uploader.py',
     'core/',
-    'Descarga universal (yt-dlp para YouTube/TikTok/redes + HTTP directo) y subida streaming >2 GB',
+    'Descarga universal (hosts nativos, yt-dlp con impersonación TLS y HTTP streaming) y subida >2 GB',
     uploaderPy,
   ),
   makeFile(

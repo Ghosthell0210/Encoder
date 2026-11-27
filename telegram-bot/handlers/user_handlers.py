@@ -38,6 +38,7 @@ from core.ui_helpers import (
     human_bytes,
     human_duration,
 )
+from core.host_extractors import HostExtractionError
 from core.uploader import UrlProbeInfo, probe_url_info
 from core.user_session import UserSessionManager
 
@@ -443,7 +444,12 @@ def register_user_handlers(
         url_info: UrlProbeInfo | None = None
         probe_err = ""
         try:
-            url_info = await probe_url_info(url_text)
+            url_info = await probe_url_info(url_text, gofile_token=config.gofile_token)
+        except HostExtractionError as exc:
+            logger.warning("Servidor de archivos bloqueado o no disponible (%s): %s", url_text, exc)
+            with contextlib.suppress(Exception):
+                await probe_msg.edit_text(f"❌ {exc}")
+            return
         except RuntimeError as exc:
             err_txt = str(exc)
             if any(

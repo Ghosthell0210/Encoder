@@ -26,6 +26,7 @@ logger = logging.getLogger("hydrocompress.ffmpeg_bootstrap")
 
 YTDLP_BIN_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
 _YTDLP_LOCK = threading.Lock()
+_CURL_CFFI_LOCK = threading.Lock()
 
 # Compilados estáticos GPL con libx264, libx265, libass, aac y ffprobe
 STATIC_URLS: dict[str, list[str]] = {
@@ -238,3 +239,55 @@ def ensure_ytdlp(bin_dir: Path | None = None) -> list[str] | None:
         except Exception as exc:
             logger.warning("No se pudo auto-instalar yt-dlp: %s", exc)
             return None
+
+
+def has_curl_cffi() -> bool:
+    """Indica si curl_cffi está disponible para impersonación TLS anti-Cloudflare."""
+    return importlib.util.find_spec("curl_cffi") is not None
+
+
+def ensure_curl_cffi() -> bool:
+    """Instala automáticamente curl-cffi sin root si falta en el entorno."""
+    if has_curl_cffi():
+        return True
+
+    with _CURL_CFFI_LOCK:
+        if has_curl_cffi():
+            return True
+
+        logger.info("curl-cffi no encontrado; instalando automáticamente para bypass TLS...")
+        pip_attempts = [
+            [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "curl-cffi"],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--quiet",
+                "--upgrade",
+                "--break-system-packages",
+                "curl-cffi",
+            ],
+            [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "--user", "curl-cffi"],
+        ]
+        for pip_cmd in pip_attempts:
+            try:
+                res = subprocess.run(
+                    pip_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=180,
+                    check=False,
+                )
+                if res.returncode == 0:
+                    importlib.invalidate_caches()
+                    if has_curl_cffi():
+                        logger.info("curl-cffi instalado automáticamente vía pip.")
+                        return True
+            except Exception as exc:
+                logger.debug("Intento pip para curl-cffi falló: %s", exc)
+
+        logger.warning(
+            "No se pudo auto-instalar curl-cffi; el bypass TLS anti-Cloudflare quedará limitado."
+        )
+        return False
