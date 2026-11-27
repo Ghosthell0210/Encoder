@@ -25,8 +25,9 @@ import socket
 import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Literal
 from urllib.parse import unquote, urlparse
 
 import aiohttp
@@ -68,6 +69,14 @@ class UrlFormatOption:
 
 
 @dataclass(slots=True)
+class UrlAudioOption:
+    code: str
+    label: str
+    is_original: bool = False
+    est_bytes: int | None = None
+
+
+@dataclass(slots=True)
 class UrlProbeInfo:
     url: str
     title: str
@@ -76,6 +85,9 @@ class UrlProbeInfo:
     is_direct: bool
     direct_bytes: int | None
     formats: list[UrlFormatOption]
+    audio_languages: list[UrlAudioOption] = field(default_factory=list)
+    has_subtitles: bool = False
+    subtitle_langs: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -410,6 +422,37 @@ def _format_res_label(width: int | None, height: int) -> str:
     return f"{height}p"
 
 
+_LANG_NAMES: dict[str, str] = {
+    "es": "Español",
+    "es-419": "Esp (Latam)",
+    "es-es": "Esp (España)",
+    "en": "Inglés",
+    "en-us": "Inglés (US)",
+    "en-gb": "Inglés (UK)",
+    "pt": "Portugués",
+    "pt-br": "Portugués (BR)",
+    "ja": "Japonés",
+    "fr": "Francés",
+    "de": "Alemán",
+    "it": "Italiano",
+    "ko": "Coreano",
+    "zh": "Chino",
+    "ru": "Ruso",
+    "hi": "Hindi",
+    "ar": "Árabe",
+    "id": "Indonesio",
+    "tr": "Turco",
+    "pl": "Polaco",
+}
+
+
+def _friendly_lang_label(code: str, is_original: bool = False) -> str:
+    norm = code.strip().lower().replace("_", "-")
+    base = norm.split("-", 1)[0]
+    name = _LANG_NAMES.get(norm) or _LANG_NAMES.get(base) or code.upper()
+    return f"{name} (Orig)" if is_original else name
+
+
 async def _run_ytdlp_probe(
     base_cmd: list[str],
     safe_url: str,
@@ -533,9 +576,11 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
     duration = float(dur_raw) if isinstance(dur_raw, (int, float)) and dur_raw > 0 else None
 
     raw_formats = data.get("formats") or []
+    default_doc_lang = str(data.get("language") or "").strip().lower()
     best_audio_score: tuple[int, int, int, float] = (-1, -1, -1, 0.0)
     best_audio_bytes = 0
     best_audio_approx = True
+    audio_lang_map: dict[str, tuple[tuple[int, int, int, float], UrlAudioOption]] = {}
     for f in raw_formats:
         if not isinstance(f, dict):
             continue
@@ -543,8 +588,6 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
         acodec = str(f.get("acodec") or "none").lower()
         if vcodec == "none" and acodec != "none":
             a_bytes, a_approx = _estimate_stream_bytes(f, duration)
-            if not a_bytes:
-                continue
             a_proto = str(f.get("protocol") or "").lower()
             a_hls = ("m3u8" in a_proto) or ("hls" in a_proto)
             a_ext = str(f.get("ext") or "").lower()
@@ -553,13 +596,65 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
             a_score = (
                 1 if not a_hls else 0,
                 1 if a_is_webm else 0,
-                1 if not a_approx else 0,
+                1 if (a_bytes and not a_approx) else 0,
                 a_abr,
             )
-            if a_score > best_audio_score:
+
+            raw_lang = str(f.get("language") or "").strip()
+            if raw_lang and raw_lang.lower() not in {"none", "und", "zxx"}:
+                lang_norm = raw_lang.lower()
+                lang_pref_val = f.get("language_preference")
+                fmt_note = str(f.get("format_note") or "").lower()
+                is_orig = (
+                    (isinstance(lang_pref_val, (int, float)) and lang_pref_val > 0)
+                    or "original" in fmt_note
+                    or (bool(default_doc_lang) and lang_norm == default_doc_lang)
+                )
+                prev_lang = audio_lang_map.get(lang_norm)
+                cand_opt = UrlAudioOption(
+                    code=raw_lang,
+                    label=_friendly_lang_label(raw_lang, is_original=is_orig),
+                    is_original=is_orig,
+                    est_bytes=a_bytes,
+                )
+                if prev_lang is None or a_score > prev_lang[0]:
+                    if prev_lang is not None and prev_lang[1].is_original and not is_orig:
+                        cand_opt.is_original = True
+                        cand_opt.label = _friendly_lang_label(raw_lang, is_original=True)
+                    audio_lang_map[lang_norm] = (a_score, cand_opt)
+
+            if a_bytes and a_score > best_audio_score:
                 best_audio_score = a_score
                 best_audio_bytes = a_bytes
                 best_audio_approx = a_approx
+
+    audio_languages: list[UrlAudioOption] = []
+    if len(audio_lang_map) >= 2:
+        lang_prio = {"es": 0, "es-419": 0, "en": 1, "pt": 2, "ja": 3}
+        audio_languages = sorted(
+            (item[1] for item in audio_lang_map.values()),
+            key=lambda opt: (
+                0 if opt.is_original else 1,
+                lang_prio.get(opt.code.lower(), lang_prio.get(opt.code.lower().split("-", 1)[0], 9)),
+                opt.label.lower(),
+            ),
+        )[:12]
+
+    raw_subs = data.get("subtitles") or {}
+    subtitle_langs: list[str] = []
+    if isinstance(raw_subs, dict):
+        subtitle_langs = sorted(
+            (
+                str(k).strip()
+                for k in raw_subs.keys()
+                if str(k).strip() and str(k).strip().lower() != "live_chat"
+            ),
+            key=lambda code: (
+                0 if code.lower().startswith("es") else (1 if code.lower().startswith("en") else 2),
+                code.lower(),
+            ),
+        )
+    has_subtitles = bool(subtitle_langs)
 
     grouped: dict[int, tuple[tuple[int, int, int, int, int, float], UrlFormatOption, str, str | None]] = {}
     for f in raw_formats:
@@ -632,11 +727,13 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
         for o in formats_sorted[:5]
     )
     logger.info(
-        "URL probe OK (%s) | dur=%ss | formatos=%d/%d | %s",
+        "URL probe OK (%s) | dur=%ss | formatos=%d/%d | audios=%d | subs=%d | %s",
         safe_url[:80],
         int(duration) if duration else "?",
         len(formats_sorted),
         len(raw_formats),
+        len(audio_languages),
+        len(subtitle_langs),
         fmt_dbg or "sin formatos",
     )
 
@@ -648,6 +745,9 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
         is_direct=False,
         direct_bytes=top_bytes,
         formats=formats_sorted,
+        audio_languages=audio_languages,
+        has_subtitles=has_subtitles,
+        subtitle_langs=subtitle_langs,
     )
 
 
@@ -904,6 +1004,7 @@ async def _exec_ytdlp_download(
     on_progress: TransferProgressCb | None,
     impersonate_chrome: bool = False,
     on_stage: TransferStageCb | None = None,
+    extra_args: list[str] | None = None,
 ) -> tuple[int, list[str], bool]:
     out_tmpl = str(dest_root / "%(title).70B [%(id).20B].%(ext)s")
     cmd = [
@@ -924,6 +1025,8 @@ async def _exec_ytdlp_download(
         "--format",
         fmt_expr,
     ]
+    if extra_args:
+        cmd.extend(extra_args)
     if impersonate_chrome:
         cmd.extend(["--impersonate", "chrome"])
     cmd.extend(["-o", out_tmpl, "--", url])
@@ -970,7 +1073,7 @@ async def _exec_ytdlp_download(
                 new_stage = ""
                 if line.startswith("[Merger]"):
                     new_stage = "merging"
-                elif line.startswith(("[Fixup", "[VideoRemuxer]", "[ExtractAudio]")):
+                elif line.startswith(("[Fixup", "[VideoRemuxer]", "[ExtractAudio]", "[EmbedSubtitle]")):
                     new_stage = "remuxing"
                 if new_stage and new_stage != last_stage:
                     last_stage = new_stage
@@ -1013,6 +1116,68 @@ def _cleanup_dir_files(dest_root: Path, keep: Path | None = None) -> None:
                 item.unlink()
 
 
+_YTDLP_SIDECAR_EXTS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".vtt",
+    ".srt",
+    ".ass",
+    ".ssa",
+    ".ttml",
+    ".srv1",
+    ".srv2",
+    ".srv3",
+    ".lrc",
+    ".description",
+}
+
+
+def _build_ytdlp_format_expr(
+    max_height: int | None,
+    audio_lang: str | None,
+    audio_only_format: Literal["opus", "mp3"] | None,
+) -> str:
+    clean_lang = (audio_lang or "").strip()
+    if audio_only_format is not None:
+        if clean_lang:
+            base_lang = clean_lang.split("-", 1)[0]
+            return (
+                f"ba[language={clean_lang}][ext=webm]/ba[language={clean_lang}]/"
+                f"ba[language^={base_lang}][ext=webm]/ba[language^={base_lang}]/"
+                "ba[ext=webm]/ba/b"
+            )
+        return "ba[ext=webm]/ba/b"
+
+    vh = f"[height<={max_height}]" if (max_height and max_height > 0) else ""
+    if clean_lang:
+        base_lang = clean_lang.split("-", 1)[0]
+        return (
+            f"bv*{vh}[ext=webm]+ba[language={clean_lang}][ext=webm]/"
+            f"bv*{vh}[ext=webm]+ba[language={clean_lang}]/"
+            f"bv*{vh}+ba[language={clean_lang}]/"
+            f"bv*{vh}+ba[language^={base_lang}]/"
+            f"bv*{vh}[ext=webm][protocol^=http]+ba[ext=webm][protocol^=http]/"
+            f"bv*{vh}[ext=webm]+ba[ext=webm]/"
+            f"bv*{vh}+ba/b{vh}[ext=webm]/b{vh}[ext=mp4]/b{vh}/b"
+        )
+    if vh:
+        return (
+            f"bv*{vh}[ext=webm][protocol^=http]+ba[ext=webm][protocol^=http]/"
+            f"bv*{vh}[ext=webm]+ba[ext=webm]/"
+            f"bv*{vh}[protocol^=http]+ba[protocol^=http]/"
+            f"bv*{vh}+ba/"
+            f"b{vh}[ext=webm]/b{vh}[ext=mp4]/b{vh}/b"
+        )
+    return (
+        "bv*[ext=webm][protocol^=http]+ba[ext=webm][protocol^=http]/"
+        "bv*[ext=webm]+ba[ext=webm]/"
+        "bv*[protocol^=http]+ba[protocol^=http]/"
+        "bv*+ba/b[ext=webm]/b[ext=mp4]/b"
+    )
+
+
 async def _download_with_ytdlp(
     url: str,
     dest_dir: Path,
@@ -1022,6 +1187,10 @@ async def _download_with_ytdlp(
     max_height: int | None = None,
     expect_video: bool = False,
     on_stage: TransferStageCb | None = None,
+    audio_lang: str | None = None,
+    embed_subs: bool = False,
+    sub_langs: str | None = None,
+    audio_only_format: Literal["opus", "mp3"] | None = None,
 ) -> Path:
     base_cmd = await asyncio.to_thread(ensure_ytdlp, Path("bin"))
     if base_cmd is None:
@@ -1030,20 +1199,14 @@ async def _download_with_ytdlp(
             "Verifica la salida a internet del servidor o ejecuta 'pip install yt-dlp'."
         )
 
-    if max_height and max_height > 0:
-        fmt_expr = (
-            f"bv*[height<={max_height}][ext=webm][protocol^=http]+ba[ext=webm][protocol^=http]/"
-            f"bv*[height<={max_height}][ext=webm]+ba[ext=webm]/"
-            f"bv*[height<={max_height}][protocol^=http]+ba[protocol^=http]/"
-            f"bv*[height<={max_height}]+ba/"
-            f"b[height<={max_height}][ext=webm]/b[height<={max_height}][ext=mp4]/b[height<={max_height}]/b"
-        )
-    else:
-        fmt_expr = (
-            "bv*[ext=webm][protocol^=http]+ba[ext=webm][protocol^=http]/"
-            "bv*[ext=webm]+ba[ext=webm]/"
-            "bv*[protocol^=http]+ba[protocol^=http]/"
-            "bv*+ba/b[ext=webm]/b[ext=mp4]/b"
+    fmt_expr = _build_ytdlp_format_expr(max_height, audio_lang, audio_only_format)
+    extra_args: list[str] = []
+    if audio_only_format is not None:
+        extra_args.extend(["--extract-audio", "--audio-format", audio_only_format, "--audio-quality", "0"])
+    elif embed_subs:
+        sub_expr = (sub_langs or "es.*,es,en.*,en").strip()
+        extra_args.extend(
+            ["--write-subs", "--sub-langs", sub_expr, "--embed-subs", "--remux-video", "mkv"]
         )
 
     dest_root = dest_dir.resolve()
@@ -1057,6 +1220,7 @@ async def _download_with_ytdlp(
         on_progress=on_progress,
         impersonate_chrome=False,
         on_stage=on_stage,
+        extra_args=extra_args or None,
     )
     joined_tail = " ".join(output_tail[-6:])
     if rc != 0 and _looks_like_cloudflare_block(joined_tail):
@@ -1073,6 +1237,7 @@ async def _download_with_ytdlp(
                 on_progress=on_progress,
                 impersonate_chrome=True,
                 on_stage=on_stage,
+                extra_args=extra_args or None,
             )
             saw_max_filesize = saw_max_filesize or saw_retry_limit
             joined_tail = " ".join(output_tail[-6:])
@@ -1097,7 +1262,7 @@ async def _download_with_ytdlp(
         p
         for p in all_files
         if p not in part_files
-        and p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}
+        and p.suffix.lower() not in _YTDLP_SIDECAR_EXTS
         and p.stat().st_size > 0
     ]
 
@@ -1109,6 +1274,20 @@ async def _download_with_ytdlp(
                 "y quedó incompleta. Prueba una resolución menor (ej. 1080p o 720p)."
             )
         raise RuntimeError("yt-dlp terminó sin generar ningún archivo descargable.")
+
+    if audio_only_format is not None:
+        if saw_max_filesize or part_files:
+            _cleanup_dir_files(dest_root)
+            raise RuntimeError("La descarga de audio quedó incompleta o superó el margen de disco.")
+        audio_cands = sorted(
+            (p for p in completed if p.suffix.lower() == f".{audio_only_format}" or p.suffix.lower() in _YTDLP_AUDIO_EXTS),
+            key=lambda p: (0 if p.suffix.lower() == f".{audio_only_format}" else 1, -p.stat().st_size),
+        )
+        chosen_audio = (audio_cands[0] if audio_cands else max(completed, key=lambda p: p.stat().st_size)).resolve()
+        if not str(chosen_audio).startswith(str(dest_root) + os.sep):
+            raise RuntimeError("Ruta de descarga fuera del directorio permitido.")
+        _cleanup_dir_files(dest_root, keep=chosen_audio)
+        return chosen_audio
 
     video_candidates = sorted(
         (p for p in completed if p.suffix.lower() in _YTDLP_VIDEO_EXTS),
@@ -1172,6 +1351,10 @@ async def download_from_url(
     max_ytdlp_bytes: int | None = None,
     expect_video: bool = False,
     on_stage: TransferStageCb | None = None,
+    audio_lang: str | None = None,
+    embed_subs: bool = False,
+    sub_langs: str | None = None,
+    audio_only_format: Literal["opus", "mp3"] | None = None,
 ) -> Path:
     """Descarga un archivo/video desde servidor nativo, HTTP directo o yt-dlp."""
     safe_url = await _validate_external_url(url)
@@ -1216,6 +1399,10 @@ async def download_from_url(
         max_height=max_height,
         expect_video=expect_video,
         on_stage=on_stage,
+        audio_lang=audio_lang,
+        embed_subs=embed_subs,
+        sub_langs=sub_langs,
+        audio_only_format=audio_only_format,
     )
 
 

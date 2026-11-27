@@ -192,6 +192,42 @@ def _resolve_selected_url_format(
     return url_info.formats[0]
 
 
+def _audio_lang_short_label(
+    url_info: UrlProbeInfo | None,
+    selected_audio_lang: str | None,
+) -> str:
+    if not url_info or not url_info.audio_languages:
+        return "Auto"
+    if not selected_audio_lang:
+        orig = next((a for a in url_info.audio_languages if a.is_original), None)
+        return orig.label if orig else "Auto"
+    for opt in url_info.audio_languages:
+        if opt.code.lower() == selected_audio_lang.lower():
+            return opt.label
+    return selected_audio_lang.upper()
+
+
+def _over2gb_button(
+    session_id: str,
+    over_2gb_mode: str,
+    can_split_over_2gb: bool,
+) -> InlineKeyboardButton:
+    if not can_split_over_2gb:
+        return InlineKeyboardButton(
+            "📦 >2 GB: 🔗 Enlace (disco justo)",
+            callback_data=f"cfg:{session_id}:over2gb_info",
+        )
+    labels = {
+        "auto": "📦 >2 GB: ❓ Preguntar",
+        "split": "📦 >2 GB: 📱 Partes (<1.9 GB)",
+        "link": "📦 >2 GB: 🔗 Enlace",
+    }
+    return InlineKeyboardButton(
+        labels.get(over_2gb_mode, labels["auto"]),
+        callback_data=f"cfg:{session_id}:cycle_over2gb",
+    )
+
+
 def format_draft_summary(
     filename: str,
     file_size: int | None,
@@ -203,6 +239,11 @@ def format_draft_summary(
     source_is_url: bool = False,
     url_info: UrlProbeInfo | None = None,
     selected_dl_height: int | None = None,
+    selected_audio_lang: str | None = None,
+    embed_subs: bool = False,
+    over_2gb_mode: str = "auto",
+    show_over_2gb: bool = False,
+    can_split_over_2gb: bool = True,
 ) -> str:
     codec_label = opts.codec_display_label()
     res_label = f"{opts.max_height}p" if opts.max_height else "Original"
@@ -238,17 +279,30 @@ def format_draft_summary(
         f"├ **Origen:** `{src_tag}` · **Peso:** `{size_str}`",
         f"└ **Duración:** `{dur_str}` · **Resolución:** `{dim_str}`",
     ]
-    if source_is_url and url_info and url_info.formats:
-        avail_parts = [
-            f"{f.label} ({_format_url_weight(f.est_bytes, f.is_approx)})"
-            for f in url_info.formats[:5]
-        ]
-        if chosen_fmt is not None:
-            fps_note = f" · {chosen_fmt.fps}fps" if chosen_fmt.fps else ""
-            lines.append(
-                f"📥 **Descarga elegida:** `{chosen_fmt.label}{fps_note}` (`{_format_url_weight(chosen_fmt.est_bytes, chosen_fmt.is_approx)}`)"
-            )
-        lines.append(f"📊 **Calidades URL:** `{' · '.join(avail_parts)}`")
+    if source_is_url and url_info:
+        if url_info.formats:
+            avail_parts = [
+                f"{f.label} ({_format_url_weight(f.est_bytes, f.is_approx)})"
+                for f in url_info.formats[:5]
+            ]
+            if chosen_fmt is not None:
+                fps_note = f" · {chosen_fmt.fps}fps" if chosen_fmt.fps else ""
+                lines.append(
+                    f"📥 **Descarga elegida:** `{chosen_fmt.label}{fps_note}` (`{_format_url_weight(chosen_fmt.est_bytes, chosen_fmt.is_approx)}`)"
+                )
+            lines.append(f"📊 **Calidades URL:** `{' · '.join(avail_parts)}`")
+        if len(url_info.audio_languages) >= 2:
+            aud_lbl = _audio_lang_short_label(url_info, selected_audio_lang)
+            lines.append(f"🔊 **Idioma Audio URL:** `{aud_lbl}` ({len(url_info.audio_languages)} disponibles)")
+        if embed_subs and url_info.has_subtitles:
+            lines.append("💬 **Subtítulos Leech:** `Incrustados (MKV · Reproductor MX)`")
+    if show_over_2gb:
+        mode_labels = {
+            "auto": "Preguntar al terminar" if can_split_over_2gb else "Enlace directo (disco justo)",
+            "split": "Partes Telegram (<1.9 GB)" if can_split_over_2gb else "Enlace directo (disco justo)",
+            "link": "Enlace directo (>2 GB)",
+        }
+        lines.append(f"📦 **Entrega >2 GB:** `{mode_labels.get(over_2gb_mode, 'Enlace')}`")
 
     if opts.custom_output_name:
         lines.append(f"✏️ **Renombrado:** `{opts.custom_output_name[:56]}`")
@@ -315,6 +369,11 @@ def build_main_config_keyboard(
     source_is_url: bool = False,
     url_info: UrlProbeInfo | None = None,
     selected_dl_height: int | None = None,
+    selected_audio_lang: str | None = None,
+    embed_subs: bool = False,
+    over_2gb_mode: str = "auto",
+    show_over_2gb: bool = False,
+    can_split_over_2gb: bool = True,
 ) -> InlineKeyboardMarkup:
     doc_label = "📄 Envío: Doc" if opts.send_as_document else "🎞 Envío: Video"
     rows: list[list[InlineKeyboardButton]] = []
@@ -344,6 +403,29 @@ def build_main_config_keyboard(
             rows.append(
                 [InlineKeyboardButton(dl_txt, callback_data=f"cfg:{session_id}:download_only")]
             )
+
+        url_extra_row: list[InlineKeyboardButton] = []
+        if url_info and len(url_info.audio_languages) >= 2:
+            aud_lbl = _audio_lang_short_label(url_info, selected_audio_lang)
+            url_extra_row.append(
+                InlineKeyboardButton(
+                    f"🔊 Audio: {aud_lbl[:18]}",
+                    callback_data=f"cfg:{session_id}:aud_menu",
+                )
+            )
+        if url_info and url_info.has_subtitles:
+            sub_lbl = "💬 Subs: ON (MKV)" if embed_subs else "💬 Subs: OFF"
+            url_extra_row.append(
+                InlineKeyboardButton(
+                    sub_lbl,
+                    callback_data=f"cfg:{session_id}:toggle_url_subs",
+                )
+            )
+        if url_extra_row:
+            rows.append(url_extra_row)
+
+    if show_over_2gb:
+        rows.append([_over2gb_button(session_id, over_2gb_mode, can_split_over_2gb)])
 
     rows.extend(
         [
@@ -380,6 +462,11 @@ def build_url_quality_keyboard(
     session_id: str,
     url_info: UrlProbeInfo | None,
     selected_dl_height: int | None,
+    selected_audio_lang: str | None = None,
+    embed_subs: bool = False,
+    over_2gb_mode: str = "auto",
+    show_over_2gb: bool = False,
+    can_split_over_2gb: bool = True,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     chosen = _resolve_selected_url_format(url_info, selected_dl_height)
@@ -397,13 +484,72 @@ def build_url_quality_keyboard(
                     )
                 ]
             )
+
+    extra_row: list[InlineKeyboardButton] = []
+    if url_info and len(url_info.audio_languages) >= 2:
+        aud_lbl = _audio_lang_short_label(url_info, selected_audio_lang)
+        extra_row.append(
+            InlineKeyboardButton(
+                f"🔊 Audio: {aud_lbl[:18]}",
+                callback_data=f"cfg:{session_id}:aud_menu",
+            )
+        )
+    if url_info and url_info.has_subtitles:
+        sub_lbl = "💬 Subs: ON (MKV)" if embed_subs else "💬 Subs: OFF"
+        extra_row.append(
+            InlineKeyboardButton(sub_lbl, callback_data=f"cfg:{session_id}:toggle_url_subs")
+        )
+    if extra_row:
+        rows.append(extra_row)
+
+    rows.append(
+        [
+            InlineKeyboardButton("🎵 Solo Opus", callback_data=f"cfg:{session_id}:url_audio:opus"),
+            InlineKeyboardButton("🎵 Solo MP3", callback_data=f"cfg:{session_id}:url_audio:mp3"),
+        ]
+    )
+    if show_over_2gb:
+        rows.append([_over2gb_button(session_id, over_2gb_mode, can_split_over_2gb)])
+
     rows.append(
         [
             InlineKeyboardButton("⬇️ Solo Descargar", callback_data=f"cfg:{session_id}:download_only"),
             InlineKeyboardButton("🚀 Comprimir así", callback_data=f"cfg:{session_id}:start"),
         ]
     )
-    rows.append([InlineKeyboardButton("⬅ Volver al panel", callback_data=f"cfg:{session_id}:main")])
+    rows.append([InlineKeyboardButton("⬅ Panel Encoder", callback_data=f"cfg:{session_id}:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_url_audio_lang_keyboard(
+    session_id: str,
+    url_info: UrlProbeInfo | None,
+    selected_audio_lang: str | None,
+    back_view: str = "dl_menu",
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                f"{'✓ ' if not selected_audio_lang else ''}🔊 Auto / Original",
+                callback_data=f"cfg:{session_id}:set_aud_lang:auto",
+            )
+        ]
+    ]
+    if url_info and url_info.audio_languages:
+        langs = url_info.audio_languages
+        for i in range(0, len(langs), 2):
+            row: list[InlineKeyboardButton] = []
+            for opt in langs[i : i + 2]:
+                is_sel = bool(selected_audio_lang and opt.code.lower() == selected_audio_lang.lower())
+                mark = "✓ " if is_sel else ""
+                row.append(
+                    InlineKeyboardButton(
+                        f"{mark}{opt.label[:20]}",
+                        callback_data=f"cfg:{session_id}:set_aud_lang:{opt.code}",
+                    )
+                )
+            rows.append(row)
+    rows.append([InlineKeyboardButton("⬅ Volver", callback_data=f"cfg:{session_id}:{back_view}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -683,6 +829,7 @@ def build_tools_keyboard(session_id: str) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton("🔎 MediaInfo Técnico", callback_data=f"cfg:{session_id}:tool:mediainfo"),
+                InlineKeyboardButton("✂️ Dividir (<1.9 GB)", callback_data=f"cfg:{session_id}:tool:split_parts"),
             ],
             [
                 InlineKeyboardButton("🖼 Cuadrícula 3×3", callback_data=f"cfg:{session_id}:tool:screenshots_grid"),
@@ -724,6 +871,31 @@ def build_large_file_link_keyboard(
             ]
         )
     return InlineKeyboardMarkup(rows)
+
+
+def build_over2gb_choice_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📱 Enviar en Partes (<1.9 GB)",
+                    callback_data=f"over2gb:split:{token}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔗 Subir por Enlace (>2 GB)",
+                    callback_data=f"over2gb:link:{token}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✖ Cancelar y liberar disco",
+                    callback_data=f"over2gb:cancel:{token}",
+                ),
+            ],
+        ]
+    )
 
 
 def build_admin_keyboard(

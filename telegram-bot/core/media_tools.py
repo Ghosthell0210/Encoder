@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
 from core.ffmpeg_engine import JobCancelledError, _terminate_process
 from core.job_log_capture import record_current_job_ffmpeg_line
-from core.media_probe import MediaInfo
+from core.media_probe import MediaInfo, probe_audio_duration
 
 MP4_COMPATIBLE_AUDIO = {"aac", "mp3", "opus", "ac3", "eac3", "alac", "mp4a", "mp2"}
 MP4_COMPATIBLE_VIDEO = {"h264", "hevc", "h265", "av1", "mpeg4", "vp9"}
@@ -356,3 +357,140 @@ async def extract_audio(
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise RuntimeError(f"No se pudo extraer el audio en formato {ext.upper()}.")
     return output_path
+
+
+async def _run_ffmpeg_segment(
+    src_path: Path,
+    out_dir: Path,
+    ext: str,
+    seg_time: float,
+    cancel_event: asyncio.Event,
+    register_proc: Callable[[asyncio.subprocess.Process | None], None],
+    label: str,
+) -> list[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if ext == ".mkv":
+        map_args = ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?"]
+    else:
+        map_args = ["-map", "0:v:0", "-map", "0:a?", "-sn"]
+
+    pattern = str(out_dir / f"seg_%03d{ext}")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-i",
+        str(src_path),
+        *map_args,
+        "-c",
+        "copy",
+        "-f",
+        "segment",
+        "-segment_time",
+        f"{max(5.0, seg_time):.2f}",
+        "-reset_timestamps",
+        "1",
+        "-avoid_negative_ts",
+        "make_zero",
+        pattern,
+    ]
+    await _run_simple_ffmpeg(cmd, cancel_event, register_proc, label)
+    parts = sorted(
+        (p for p in out_dir.glob(f"seg_*{ext}") if p.is_file() and p.stat().st_size > 0),
+        key=lambda p: p.name,
+    )
+    if not parts:
+        raise RuntimeError("No se pudo generar ningún segmento del video.")
+    return parts
+
+
+async def split_video_for_telegram(
+    source_path: Path,
+    duration: float,
+    out_dir: Path,
+    cancel_event: asyncio.Event,
+    register_proc: Callable[[asyncio.subprocess.Process | None], None],
+    max_part_bytes: int = 1990 * 1024 * 1024,
+    target_part_bytes: int = 1820 * 1024 * 1024,
+    custom_name: str = "",
+    delete_source_after: bool = False,
+) -> list[Path]:
+    """Divide un video grande sin recomprimir (-c copy) en partes reproducibles <1.90 GiB."""
+    total_size = source_path.stat().st_size
+    if total_size <= max_part_bytes:
+        return [source_path]
+
+    dur = duration if duration > 1.0 else await probe_audio_duration(source_path)
+    if dur <= 2.0:
+        raise RuntimeError("No se pudo determinar la duración del video para dividirlo por segmentos.")
+
+    ext = source_path.suffix.lower()
+    if ext not in {".mp4", ".mkv", ".webm", ".mov"}:
+        ext = ".mkv"
+
+    n_parts = max(2, math.ceil(total_size / max(target_part_bytes, 1)))
+    seg_time = max(15.0, dur / n_parts)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = out_dir / "_raw"
+    raw_parts = await _run_ffmpeg_segment(
+        src_path=source_path,
+        out_dir=raw_dir,
+        ext=ext,
+        seg_time=seg_time,
+        cancel_event=cancel_event,
+        register_proc=register_proc,
+        label="Dividir video (-c copy)",
+    )
+
+    # Verificar que ningún segmento VBR haya excedido el tope de Telegram; subdividir si hace falta.
+    checked_parts: list[Path] = []
+    for idx, part in enumerate(raw_parts):
+        p_size = part.stat().st_size
+        if p_size <= max_part_bytes:
+            checked_parts.append(part)
+            continue
+
+        p_dur = await probe_audio_duration(part)
+        if p_dur <= 5.0:
+            raise RuntimeError(
+                f"Una escena quedó en {p_size / (1024**2):.0f} MiB y no pudo subdividirse más."
+            )
+        sub_n = max(2, math.ceil(p_size / max(int(target_part_bytes * 0.9), 1)))
+        sub_seg_time = max(5.0, p_dur / sub_n)
+        sub_dir = out_dir / f"_sub_{idx:03d}"
+        sub_parts = await _run_ffmpeg_segment(
+            src_path=part,
+            out_dir=sub_dir,
+            ext=ext,
+            seg_time=sub_seg_time,
+            cancel_event=cancel_event,
+            register_proc=register_proc,
+            label=f"Subdividir parte {idx + 1}",
+        )
+        oversized = [sp for sp in sub_parts if sp.stat().st_size > max_part_bytes]
+        if oversized:
+            raise RuntimeError(
+                f"Un tramo del video supera el límite de Telegram ({oversized[0].stat().st_size / (1024**2):.0f} MiB) incluso tras subdividir."
+            )
+        checked_parts.extend(sub_parts)
+        with contextlib.suppress(OSError):
+            part.unlink()
+
+    if delete_source_after and source_path.exists():
+        with contextlib.suppress(OSError):
+            source_path.unlink()
+
+    stem = _safe_stem(custom_name.strip() or source_path.stem)[:80]
+    total_count = len(checked_parts)
+    pad_w = max(2, len(str(total_count)))
+    final_parts: list[Path] = []
+    for i, part in enumerate(checked_parts, start=1):
+        final_name = f"{stem}_Parte_{i:0{pad_w}d}_de_{total_count:0{pad_w}d}{ext}"
+        dest_part = out_dir / final_name
+        part.replace(dest_part)
+        final_parts.append(dest_part)
+
+    return final_parts

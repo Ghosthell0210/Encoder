@@ -4,13 +4,16 @@ Muestra 15s, subtítulos externos, /mediainfo y /ss."""
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
 import secrets
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 from hydrogram import Client, filters
@@ -33,6 +36,7 @@ from core.ui_helpers import (
     build_target_size_keyboard,
     build_tools_keyboard,
     build_tracks_keyboard,
+    build_url_audio_lang_keyboard,
     build_url_quality_keyboard,
     format_draft_summary,
     human_bytes,
@@ -49,6 +53,7 @@ SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 URL_REGEX = re.compile(r"^https?://\S+$", re.IGNORECASE)
 VALID_TOOL_KINDS: set[str] = {
     "mediainfo",
+    "split_parts",
     "screenshots_grid",
     "screenshots_hd",
     "remux_mp4",
@@ -75,6 +80,10 @@ class DraftSession:
     source_url: str | None = None
     url_info: UrlProbeInfo | None = None
     download_max_height: int | None = None
+    selected_audio_lang: str | None = None
+    embed_subs: bool = False
+    over_2gb_mode: Literal["auto", "link", "split"] = "auto"
+    url_menu_return_to: str = "main"
     media: MediaInfo | None = None
     created_at: float = field(default_factory=time.time)
 
@@ -358,6 +367,32 @@ def register_user_handlers(
                 reply_markup=build_job_cancel_keyboard(job_id),
             )
 
+    def _resolve_sub_langs(url_info: UrlProbeInfo | None) -> str | None:
+        if not url_info or not url_info.subtitle_langs:
+            return None
+        if any(c.lower().startswith(("es", "en")) for c in url_info.subtitle_langs):
+            return "es.*,es,en.*,en"
+        return ",".join(url_info.subtitle_langs[:3])
+
+    async def _compute_over_2gb_flags(session: DraftSession) -> tuple[bool, bool]:
+        est_size = (
+            session.file_size
+            or (session.url_info.direct_bytes if session.url_info else None)
+            or 0
+        )
+        tg_limit = await queue_mgr.effective_tg_limit_bytes(session.user_id)
+        if est_size <= tg_limit:
+            return False, True
+        already_cached = queue_mgr.has_cached_source(session.session_id)
+        needs_merge = bool(session.url_info and session.url_info.formats)
+        can_split = await asyncio.to_thread(
+            queue_mgr.can_split_for_bytes,
+            est_size,
+            already_cached,
+            needs_merge,
+        )
+        return True, can_split
+
     async def _enqueue_leech_job(
         message: Message,
         user_id: int,
@@ -369,6 +404,11 @@ def register_user_handlers(
         download_max_height: int | None = None,
         status_message: Message | None = None,
         expect_video: bool = False,
+        audio_lang: str | None = None,
+        embed_subs: bool = False,
+        sub_langs: str | None = None,
+        source_is_direct: bool = False,
+        over_2gb_mode: Literal["auto", "link", "split"] = "auto",
     ) -> None:
         job_id = secrets.token_hex(4)
         status_msg = status_message or await message.reply_text(
@@ -388,16 +428,23 @@ def register_user_handlers(
             expected_size=file_size or (500 * 1024 * 1024),
             action_kind="download_only",
             expect_video=expect_video,
+            audio_lang=audio_lang,
+            embed_subs=embed_subs,
+            sub_langs=sub_langs,
+            source_is_direct=source_is_direct,
+            over_2gb_mode=over_2gb_mode,
         )
         pos = await queue_mgr.enqueue(job)
         res_note = f" (`{download_max_height}p`)" if download_max_height else ""
         size_note = f" · ~`{human_bytes(file_size)}`" if file_size else ""
+        subs_note = " · `Subs MKV`" if embed_subs else ""
+        lang_note = f" · `Audio {audio_lang}`" if audio_lang else ""
         with contextlib.suppress(Exception):
             await status_msg.edit_text(
                 f"⬇️ **Leech · En Cola (#{pos})**\n"
                 f"`{DIVIDER}`\n"
                 f"├ **Archivo:** `{filename[:56]}`{res_note}{size_note}\n"
-                f"├ **Modo:** `Sin recomprimir`\n"
+                f"├ **Modo:** `Sin recomprimir`{lang_note}{subs_note}\n"
                 f"└ **Trabajo:** `{job_id}`",
                 reply_markup=build_job_cancel_keyboard(job_id),
             )
@@ -494,9 +541,35 @@ def register_user_handlers(
             elif url_info.direct_bytes:
                 file_size = url_info.direct_bytes
 
+        tg_limit = await queue_mgr.effective_tg_limit_bytes(user_id)
+        est_for_2gb = file_size or (url_info.direct_bytes if url_info else None) or 0
+        show_over_2gb = est_for_2gb > tg_limit
+        can_split_over_2gb = (
+            await asyncio.to_thread(
+                queue_mgr.can_split_for_bytes,
+                est_for_2gb,
+                False,
+                bool(url_info and url_info.formats),
+            )
+            if show_over_2gb
+            else True
+        )
+        initial_over_2gb: Literal["auto", "link", "split"] = (
+            "link" if (show_over_2gb and not can_split_over_2gb) else "auto"
+        )
+
         if is_leech:
-            has_multi_res = url_info is not None and len(url_info.formats) > 1
-            if not has_multi_res or auto_mode:
+            has_choices = (
+                url_info is not None
+                and not url_info.is_direct
+                and (
+                    len(url_info.formats) > 1
+                    or len(url_info.audio_languages) >= 2
+                    or url_info.has_subtitles
+                    or (show_over_2gb and can_split_over_2gb)
+                )
+            )
+            if not has_choices or auto_mode:
                 await _enqueue_leech_job(
                     message=message,
                     user_id=user_id,
@@ -508,6 +581,8 @@ def register_user_handlers(
                     download_max_height=sel_height,
                     status_message=probe_msg,
                     expect_video=bool(url_info and url_info.formats),
+                    source_is_direct=bool(url_info and url_info.is_direct),
+                    over_2gb_mode=initial_over_2gb,
                 )
                 return
 
@@ -522,12 +597,22 @@ def register_user_handlers(
             source_is_url=True,
             url_info=url_info,
             selected_dl_height=sel_height,
+            over_2gb_mode=initial_over_2gb,
+            show_over_2gb=show_over_2gb,
+            can_split_over_2gb=can_split_over_2gb,
         )
         if probe_err:
             summary += f"\n⚠️ **Pre-análisis:** `{probe_err[:140]}`"
 
         if is_leech:
-            kb = build_url_quality_keyboard(sid, url_info, sel_height)
+            kb = build_url_quality_keyboard(
+                sid,
+                url_info,
+                sel_height,
+                over_2gb_mode=initial_over_2gb,
+                show_over_2gb=show_over_2gb,
+                can_split_over_2gb=can_split_over_2gb,
+            )
         else:
             kb = build_main_config_keyboard(
                 sid,
@@ -535,6 +620,9 @@ def register_user_handlers(
                 source_is_url=True,
                 url_info=url_info,
                 selected_dl_height=sel_height,
+                over_2gb_mode=initial_over_2gb,
+                show_over_2gb=show_over_2gb,
+                can_split_over_2gb=can_split_over_2gb,
             )
         with contextlib.suppress(Exception):
             await probe_msg.edit_text(summary, reply_markup=kb)
@@ -554,6 +642,8 @@ def register_user_handlers(
             source_url=url_text,
             url_info=url_info,
             download_max_height=sel_height,
+            over_2gb_mode=initial_over_2gb,
+            url_menu_return_to="dl_menu" if is_leech else "main",
         )
 
     # ── Comandos informativos, perfil y accesos rápidos (/mediainfo, /ss) ────
@@ -1139,6 +1229,15 @@ def register_user_handlers(
             )
 
     async def _refresh_session_message(session: DraftSession, view: str = "main") -> None:
+        if view in {"main", "dl_menu"}:
+            session.url_menu_return_to = view
+
+        show_over_2gb, can_split_over_2gb = await _compute_over_2gb_flags(session)
+        effective_over_2gb: Literal["auto", "link", "split"] = (
+            "link" if (show_over_2gb and not can_split_over_2gb) else session.over_2gb_mode
+        )
+        session.over_2gb_mode = effective_over_2gb
+
         summary = format_draft_summary(
             filename=session.filename,
             file_size=session.file_size,
@@ -1150,6 +1249,11 @@ def register_user_handlers(
             source_is_url=bool(session.source_url),
             url_info=session.url_info,
             selected_dl_height=session.download_max_height,
+            selected_audio_lang=session.selected_audio_lang,
+            embed_subs=session.embed_subs,
+            over_2gb_mode=effective_over_2gb,
+            show_over_2gb=show_over_2gb,
+            can_split_over_2gb=can_split_over_2gb,
         )
         if view == "presets":
             kb = build_presets_keyboard(session.session_id, session.options.preset_key)
@@ -1163,11 +1267,23 @@ def register_user_handlers(
             kb = build_extras_keyboard(session.session_id, session.options)
         elif view == "tools":
             kb = build_tools_keyboard(session.session_id)
+        elif view == "aud_menu":
+            kb = build_url_audio_lang_keyboard(
+                session.session_id,
+                session.url_info,
+                session.selected_audio_lang,
+                back_view=session.url_menu_return_to or "dl_menu",
+            )
         elif view == "dl_menu":
             kb = build_url_quality_keyboard(
                 session.session_id,
                 session.url_info,
                 session.download_max_height,
+                selected_audio_lang=session.selected_audio_lang,
+                embed_subs=session.embed_subs,
+                over_2gb_mode=effective_over_2gb,
+                show_over_2gb=show_over_2gb,
+                can_split_over_2gb=can_split_over_2gb,
             )
         else:
             kb = build_main_config_keyboard(
@@ -1176,6 +1292,11 @@ def register_user_handlers(
                 source_is_url=bool(session.source_url),
                 url_info=session.url_info,
                 selected_dl_height=session.download_max_height,
+                selected_audio_lang=session.selected_audio_lang,
+                embed_subs=session.embed_subs,
+                over_2gb_mode=effective_over_2gb,
+                show_over_2gb=show_over_2gb,
+                can_split_over_2gb=can_split_over_2gb,
             )
 
         with contextlib.suppress(Exception):
@@ -1204,7 +1325,7 @@ def register_user_handlers(
             await query.answer()
             return
 
-        if action in {"main", "presets", "advanced", "target", "tracks", "extras", "tools", "dl_menu"}:
+        if action in {"main", "presets", "advanced", "target", "tracks", "extras", "tools", "dl_menu", "aud_menu"}:
             await query.answer()
             await _refresh_session_message(session, view=action)
             return
@@ -1225,6 +1346,94 @@ def register_user_handlers(
                             break
                 await query.answer(f"Calidad descarga: {label}")
             await _refresh_session_message(session, view="dl_menu")
+            return
+
+        if action == "set_aud_lang" and len(parts) >= 4:
+            raw_lang = ":".join(parts[3:])
+            session.selected_audio_lang = None if raw_lang == "auto" else raw_lang
+            await query.answer(
+                "🔊 Audio URL: Auto / Original"
+                if not session.selected_audio_lang
+                else f"🔊 Audio URL: {session.selected_audio_lang}"
+            )
+            await _refresh_session_message(session, view=session.url_menu_return_to or "dl_menu")
+            return
+
+        if action == "toggle_url_subs":
+            session.embed_subs = not session.embed_subs
+            await query.answer(
+                "💬 Subtítulos MKV: ON (Reproductor MX)"
+                if session.embed_subs
+                else "💬 Subtítulos MKV: OFF (WebM)"
+            )
+            await _refresh_session_message(session, view=session.url_menu_return_to or "dl_menu")
+            return
+
+        if action == "over2gb_info":
+            await query.answer(
+                "El espacio libre en disco no alcanza para guardar el archivo y dividirlo en partes (<1.9 GB). Se entregará por Enlace (>2 GB).",
+                show_alert=True,
+            )
+            return
+
+        if action == "cycle_over2gb":
+            show_over_2gb, can_split = await _compute_over_2gb_flags(session)
+            if not show_over_2gb or not can_split:
+                session.over_2gb_mode = "link"
+                await query.answer(
+                    "Disco justo: solo está disponible el envío por Enlace (>2 GB).",
+                    show_alert=True,
+                )
+            else:
+                order: tuple[Literal["auto", "split", "link"], ...] = ("auto", "split", "link")
+                idx = order.index(session.over_2gb_mode) if session.over_2gb_mode in order else 0
+                nxt = order[(idx + 1) % len(order)]
+                session.over_2gb_mode = nxt
+                labels = {
+                    "auto": "Al terminar: Preguntar Partes vs Enlace",
+                    "split": "Si >2 GB: Partes Telegram (<1.9 GB)",
+                    "link": "Si >2 GB: Enlace directo",
+                }
+                await query.answer(labels[nxt])
+            await _refresh_session_message(session, view=session.url_menu_return_to or "main")
+            return
+
+        if action == "url_audio" and len(parts) >= 4 and parts[3] in {"opus", "mp3"}:
+            if not session.source_url:
+                await query.answer("Solo disponible para enlaces URL.", show_alert=True)
+                return
+            fmt_audio: ActionKind = "extract_opus" if parts[3] == "opus" else "extract_mp3"
+            sessions.pop(sid, None)
+            awaiting_input.pop(session.user_id, None)
+            job_id = secrets.token_hex(4)
+            job = CompressionJob(
+                job_id=job_id,
+                user_id=session.user_id,
+                user_label=session.user_label,
+                chat_id=session.chat_id,
+                status_message=session.config_message,
+                filename=session.filename,
+                options=session.options.clone(),
+                source_url=session.source_url,
+                expected_size=60 * 1024 * 1024,
+                action_kind=fmt_audio,
+                audio_lang=session.selected_audio_lang,
+                source_is_direct=bool(session.url_info and session.url_info.is_direct),
+            )
+            pos = await queue_mgr.enqueue(job)
+            await query.answer(f"Audio {parts[3].upper()} encolado (#{pos})")
+            lang_line = (
+                f"\n├ **Idioma:** `{session.selected_audio_lang}`"
+                if session.selected_audio_lang
+                else ""
+            )
+            await session.config_message.edit_text(
+                f"🎵 **Solo Audio ({parts[3].upper()}) · En Cola (#{pos})**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{session.filename[:56]}`{lang_line}\n"
+                f"└ **Trabajo:** `{job_id}`",
+                reply_markup=build_job_cancel_keyboard(job_id),
+            )
             return
 
         if action == "set_preset" and len(parts) >= 4:
@@ -1504,6 +1713,7 @@ def register_user_handlers(
             )
             tool_titles = {
                 "mediainfo": "🔎 MediaInfo Técnico",
+                "split_parts": "✂️ Dividir (<1.9 GB)",
                 "screenshots_grid": "🖼 Cuadrícula 3×3",
                 "screenshots_hd": "📸 4 Capturas HD",
                 "remux_mp4": "🔄 Remux a MP4",
@@ -1543,6 +1753,9 @@ def register_user_handlers(
                 session_id=session.session_id,
                 keep_cached_source=True,
                 action_kind=tool_kind,
+                audio_lang=session.selected_audio_lang,
+                source_is_direct=bool(session.url_info and session.url_info.is_direct),
+                over_2gb_mode=session.over_2gb_mode,
                 on_media_probed=_on_probed,
             )
             pos = await queue_mgr.enqueue(job)
@@ -1570,6 +1783,11 @@ def register_user_handlers(
                 keep_cached_source=False,
                 action_kind="download_only",
                 expect_video=bool(session.url_info and session.url_info.formats),
+                audio_lang=session.selected_audio_lang,
+                embed_subs=session.embed_subs,
+                sub_langs=_resolve_sub_langs(session.url_info),
+                source_is_direct=bool(session.url_info and session.url_info.is_direct),
+                over_2gb_mode=session.over_2gb_mode,
             )
             pos = await queue_mgr.enqueue(job)
             await query.answer(f"Descarga directa encolada (#{pos})")
@@ -1578,10 +1796,12 @@ def register_user_handlers(
                 if session.download_max_height
                 else ""
             )
+            subs_note = " · `Subs MKV`" if session.embed_subs else ""
+            lang_note = f" · `Audio {session.selected_audio_lang}`" if session.selected_audio_lang else ""
             await session.config_message.edit_text(
                 f"⬇️ **Descarga Directa · En Cola (#{pos})**\n"
                 f"`{DIVIDER}`\n"
-                f"├ **Archivo:** `{session.filename[:56]}`{res_note}\n"
+                f"├ **Archivo:** `{session.filename[:56]}`{res_note}{lang_note}{subs_note}\n"
                 f"└ **Trabajo:** `{job_id}`",
                 reply_markup=build_job_cancel_keyboard(job_id),
             )
@@ -1619,6 +1839,8 @@ def register_user_handlers(
                 expected_size=session.file_size or (500 * 1024 * 1024),
                 session_id=session.session_id,
                 keep_cached_source=True,
+                audio_lang=session.selected_audio_lang,
+                source_is_direct=bool(session.url_info and session.url_info.is_direct),
             )
             pos = await queue_mgr.enqueue(job)
             await query.answer(f"Muestra 15s encolada (#{pos})")
@@ -1653,6 +1875,9 @@ def register_user_handlers(
                 expected_size=session.file_size or (500 * 1024 * 1024),
                 session_id=session.session_id if has_cache else None,
                 keep_cached_source=False,
+                audio_lang=session.selected_audio_lang,
+                source_is_direct=bool(session.url_info and session.url_info.is_direct),
+                over_2gb_mode=session.over_2gb_mode,
             )
             pos = await queue_mgr.enqueue(job)
             await query.answer(f"Encolado (#{pos})")
@@ -1663,6 +1888,72 @@ def register_user_handlers(
                 f"├ **Archivo:** `{session.filename[:56]}`\n"
                 f"├ **Códec:** `{session.options.codec_display_label()}` · `{queue_mgr.threads_per_job()}` hilos\n"
                 f"└ **Trabajo:** `{job_id}`{cache_line}",
+                reply_markup=build_job_cancel_keyboard(job_id),
+            )
+
+    # ── Elección interactiva >2 GB (Partes Telegram vs Enlace) ────────────────
+
+    @app.on_callback_query(filters.regex(r"^over2gb:(split|link|cancel):"))
+    async def cb_over2gb_choice(_client: Client, query: CallbackQuery) -> None:
+        parts = query.data.split(":", 2)
+        if len(parts) < 3:
+            await query.answer()
+            return
+        choice, tok = parts[1], parts[2]
+        pending = queue_mgr.get_pending_over2gb(tok)
+        if not pending:
+            await query.answer(
+                "Esta elección expiró o ya fue procesada.",
+                show_alert=True,
+            )
+            return
+        if query.from_user.id != pending.user_id and query.from_user.id != config.owner_id:
+            await query.answer("Solo el dueño de este trabajo puede decidir la entrega.", show_alert=True)
+            return
+
+        pending = queue_mgr.pop_pending_over2gb(tok)
+        if not pending:
+            await query.answer("Ya procesado.")
+            return
+
+        if choice == "cancel":
+            await asyncio.to_thread(shutil.rmtree, pending.pending_dir, True)
+            await query.answer("Cancelado y disco liberado")
+            with contextlib.suppress(Exception):
+                await pending.status_message.edit_text("✖ Entrega >2 GB cancelada y temporales liberados.")
+            return
+
+        action_kind: ActionKind = "deliver_split" if choice == "split" else "deliver_link"
+        job_id = secrets.token_hex(4)
+        job = CompressionJob(
+            job_id=job_id,
+            user_id=pending.user_id,
+            user_label=pending.user_label or _format_user_label(query.from_user),
+            chat_id=pending.chat_id,
+            status_message=pending.status_message,
+            filename=pending.filename,
+            options=pending.options,
+            source_url=pending.source_url,
+            expected_size=pending.output_size,
+            action_kind=action_kind,
+            precomputed_file=pending.output_path,
+            precomputed_dir=pending.pending_dir,
+            precomputed_input_size=pending.input_size,
+            precomputed_media=pending.out_media,
+            precomputed_reduction_pct=pending.reduction_pct,
+            precomputed_elapsed=pending.elapsed_total,
+            precomputed_notes=pending.encode_notes,
+            precomputed_record_stats=pending.record_stats,
+        )
+        pos = await queue_mgr.enqueue(job)
+        label = "Partes Telegram (<1.9 GB)" if choice == "split" else "Enlace (>2 GB)"
+        await query.answer(f"{label} encolado (#{pos})")
+        with contextlib.suppress(Exception):
+            await pending.status_message.edit_text(
+                f"⏳ **{label} · En Cola (#{pos})**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{pending.output_path.name[:56]}`\n"
+                f"└ **Trabajo:** `{job_id}`",
                 reply_markup=build_job_cancel_keyboard(job_id),
             )
 

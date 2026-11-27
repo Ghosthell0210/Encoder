@@ -39,12 +39,18 @@ from core.ffmpeg_engine import (
     extract_thumbnail,
 )
 from core.job_log_capture import JobIssueCollector, start_job_capture, stop_job_capture
-from core.media_probe import MediaInfo, format_mediainfo_report, probe_media
+from core.media_probe import (
+    MediaInfo,
+    format_mediainfo_report,
+    probe_audio_duration,
+    probe_media,
+)
 from core.media_tools import (
     extract_audio,
     generate_hd_screenshots,
     generate_screenshot_grid,
     remux_video,
+    split_video_for_telegram,
 )
 from core.resource_monitor import (
     JobResourceMetrics,
@@ -56,6 +62,7 @@ from core.ui_helpers import (
     ProgressUpdater,
     build_job_cancel_keyboard,
     build_large_file_link_keyboard,
+    build_over2gb_choice_keyboard,
     human_bytes,
     human_duration,
     progress_bar,
@@ -76,6 +83,9 @@ ActionKind = Literal[
     "remux_mkv",
     "extract_opus",
     "extract_mp3",
+    "split_parts",
+    "deliver_split",
+    "deliver_link",
 ]
 
 
@@ -90,6 +100,30 @@ class RecompressSource:
     filename: str
     base_options: CompressionOptions
     user_label: str = ""
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass(slots=True)
+class PendingOver2GBDelivery:
+    token: str
+    user_id: int
+    chat_id: int
+    status_message: Message
+    pending_dir: Path
+    output_path: Path
+    input_size: int
+    output_size: int
+    out_media: MediaInfo
+    reduction_pct: float
+    elapsed_total: float
+    filename: str
+    options: CompressionOptions
+    source_chat_id: int | None
+    source_message_id: int | None
+    source_url: str | None
+    user_label: str = ""
+    encode_notes: list[str] = field(default_factory=list)
+    record_stats: bool = True
     created_at: float = field(default_factory=time.time)
 
 
@@ -119,6 +153,19 @@ class CompressionJob:
     user_label: str = ""
     action_kind: ActionKind = "compress"
     expect_video: bool = False
+    audio_lang: str | None = None
+    embed_subs: bool = False
+    sub_langs: str | None = None
+    source_is_direct: bool = False
+    over_2gb_mode: Literal["auto", "link", "split"] = "auto"
+    precomputed_file: Path | None = None
+    precomputed_dir: Path | None = None
+    precomputed_input_size: int = 0
+    precomputed_media: MediaInfo | None = None
+    precomputed_reduction_pct: float = 0.0
+    precomputed_elapsed: float = 0.0
+    precomputed_notes: list[str] = field(default_factory=list)
+    precomputed_record_stats: bool = True
     on_media_probed: Callable[[MediaInfo], Awaitable[None]] | None = None
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -139,6 +186,9 @@ class CompressionJob:
             "remux_mkv": "Remux MKV",
             "extract_opus": "Audio Opus",
             "extract_mp3": "Audio MP3",
+            "split_parts": "Dividir Partes",
+            "deliver_split": "Partes Telegram",
+            "deliver_link": "Enlace >2 GB",
         }
         if self.action_kind in mapping:
             return mapping[self.action_kind]
@@ -172,6 +222,7 @@ class QueueManager:
         self._active: dict[str, CompressionJob] = {}
         self._all_jobs: dict[str, CompressionJob] = {}
         self._recompress_sources: dict[str, RecompressSource] = {}
+        self._pending_over2gb: dict[str, PendingOver2GBDelivery] = {}
         self._session_cache: dict[str, Path] = {}
         self._session_cache_ts: dict[str, float] = {}
         self._cache_locks: dict[str, asyncio.Lock] = {}
@@ -256,6 +307,16 @@ class QueueManager:
                 for tok in [k for k, v in list(self._recompress_sources.items()) if now - v.created_at > 86400]:
                     self._recompress_sources.pop(tok, None)
 
+                # Limpiar entregas >2 GB pendientes sin respuesta > 2h
+                for tok in [k for k, v in list(self._pending_over2gb.items()) if now - v.created_at > 7200]:
+                    pending_item = self._pending_over2gb.pop(tok, None)
+                    if pending_item:
+                        await asyncio.to_thread(shutil.rmtree, pending_item.pending_dir, True)
+                        with contextlib.suppress(Exception):
+                            await pending_item.status_message.edit_text(
+                                f"⌛ **Elección >2 GB expirada** (`{pending_item.filename[:48]}`). Temporales liberados."
+                            )
+
                 if not self._active and not self._pending:
                     gc.collect()
             except asyncio.CancelledError:
@@ -283,6 +344,12 @@ class QueueManager:
         for k in expired:
             self._recompress_sources.pop(k, None)
         return self._recompress_sources.get(token)
+
+    def get_pending_over2gb(self, token: str) -> PendingOver2GBDelivery | None:
+        return self._pending_over2gb.get(token)
+
+    def pop_pending_over2gb(self, token: str) -> PendingOver2GBDelivery | None:
+        return self._pending_over2gb.pop(token, None)
 
     def _session_in_use(self, session_id: str, exclude_job_id: str | None = None) -> bool:
         for j in self._all_jobs.values():
@@ -321,6 +388,32 @@ class QueueManager:
         available_in_budget = max_bot_bytes - used_by_bot - reserve_bytes
         available_os = usage.free - reserve_bytes
         return max(0, min(available_in_budget, available_os))
+
+    async def effective_tg_limit_bytes(self, user_id: int) -> int:
+        if self.user_session.is_connected and self.user_session.is_premium:
+            dump_id_raw = await self.db.get_setting("dump_chat_id", str(self.config.dump_chat_id or 0))
+            dump_chat_id = int(dump_id_raw) if dump_id_raw.lstrip("-").isdigit() else 0
+            if dump_chat_id != 0 or user_id == self.config.owner_id:
+                return TELEGRAM_PREMIUM_MAX_UPLOAD_BYTES
+        return TELEGRAM_MAX_UPLOAD_BYTES
+
+    def can_split_for_bytes(
+        self,
+        file_size: int,
+        is_existing: bool = True,
+        needs_merge: bool = False,
+        is_compress: bool = False,
+    ) -> bool:
+        """Comprueba si el disco libre real soporta segmentar sin pérdida un archivo >2 GB."""
+        if file_size <= 0:
+            return False
+        avail = self._effective_free_bytes()
+        if is_existing:
+            needed = int(file_size * 1.05) + (150 * 1024 * 1024)
+        else:
+            factor = 2.20 if (is_compress or needs_merge) else 2.10
+            needed = int(file_size * factor) + (150 * 1024 * 1024)
+        return avail >= needed
 
     def check_disk_budget(
         self,
@@ -387,6 +480,7 @@ class QueueManager:
     def purge_inactive_temp(self) -> int:
         active_ids = set(self._active.keys())
         active_sessions = {j.session_id for j in self._all_jobs.values() if j.session_id}
+        self._pending_over2gb.clear()
         removed = 0
         if self.config.work_dir.exists():
             for child in self.config.work_dir.iterdir():
@@ -507,7 +601,72 @@ class QueueManager:
             job.active_proc = proc
 
         try:
-            # 0. Guardia de disco no bloqueante
+            # 0a. Despacho directo si ya existe archivo generado pendiente de elección >2 GB
+            if job.action_kind in {"deliver_split", "deliver_link"} and job.precomputed_file is not None:
+                pre_path = job.precomputed_file
+                if not pre_path.exists():
+                    raise RuntimeError("El archivo temporal pendiente ya fue limpiado o expiró.")
+                input_size = job.precomputed_input_size or pre_path.stat().st_size
+                out_size = pre_path.stat().st_size
+                out_media = job.precomputed_media or await probe_media(pre_path)
+                metrics = await monitor.stop()
+                if job.action_kind == "deliver_split":
+                    can_split = await asyncio.to_thread(self.can_split_for_bytes, out_size, True)
+                    if can_split:
+                        await self._deliver_split_parts(
+                            job=job,
+                            job_dir=job_dir,
+                            source_path=pre_path,
+                            input_size=input_size,
+                            total_output_size=out_size,
+                            out_media=out_media,
+                            reduction_pct=job.precomputed_reduction_pct,
+                            elapsed_total=job.precomputed_elapsed,
+                            updater=updater,
+                            cancel_kb=cancel_kb,
+                            reg_proc=_reg_proc,
+                            delete_source_after=True,
+                            metrics=metrics,
+                            encode_notes=job.precomputed_notes,
+                            record_stats=job.precomputed_record_stats,
+                        )
+                    else:
+                        await updater.update(
+                            "⚠️ **Espacio justo para dividir en partes**\nSubiendo por **Enlace (>2 GB)** directamente...",
+                            reply_markup=cancel_kb,
+                            force=True,
+                        )
+                        await self._deliver_via_link(
+                            job=job,
+                            output_path=pre_path,
+                            input_size=input_size,
+                            output_size=out_size,
+                            out_media=out_media,
+                            reduction_pct=job.precomputed_reduction_pct,
+                            elapsed_total=job.precomputed_elapsed,
+                            updater=updater,
+                            cancel_kb=cancel_kb,
+                            metrics=metrics,
+                            encode_notes=job.precomputed_notes,
+                        )
+                else:
+                    await self._deliver_via_link(
+                        job=job,
+                        output_path=pre_path,
+                        input_size=input_size,
+                        output_size=out_size,
+                        out_media=out_media,
+                        reduction_pct=job.precomputed_reduction_pct,
+                        elapsed_total=job.precomputed_elapsed,
+                        updater=updater,
+                        cancel_kb=cancel_kb,
+                        metrics=metrics,
+                        encode_notes=job.precomputed_notes,
+                    )
+                outcome = "Completado con avisos" if collector.has_issues else "Completado"
+                return
+
+            # 0b. Guardia de disco no bloqueante
             already_cached = self.has_cached_source(job.session_id)
             light_tool = job.action_kind in {
                 "download_only",
@@ -516,12 +675,13 @@ class QueueManager:
                 "screenshots_hd",
                 "extract_opus",
                 "extract_mp3",
+                "split_parts",
             }
             needs_merge = (
-                job.action_kind == "download_only"
+                (job.action_kind in {"download_only", "split_parts"})
                 and bool(job.source_url)
                 and job.expect_video
-            )
+            ) or (job.over_2gb_mode == "split" and not already_cached)
             ok_disk, disk_msg = await asyncio.to_thread(
                 self.check_disk_budget,
                 job.expected_size,
@@ -544,6 +704,43 @@ class QueueManager:
                 raise JobCancelledError("Trabajo cancelado.")
 
             input_size = input_path.stat().st_size
+
+            # ── Audio directo descargado por URL (yt-dlp -x) ──────────────────
+            audio_exts = {".opus", ".mp3", ".m4a", ".ogg", ".oga", ".aac", ".flac", ".wav"}
+            if job.action_kind in {"extract_opus", "extract_mp3"} and input_path.suffix.lower() in audio_exts:
+                target_fmt: Literal["opus", "mp3"] = "opus" if job.action_kind == "extract_opus" else "mp3"
+                audio_dur = await probe_audio_duration(input_path)
+                metrics = await monitor.stop()
+                elapsed = time.time() - (job.started_at or time.time())
+                audio_size = input_path.stat().st_size
+                await updater.update(
+                    f"📦 **Subiendo Audio ({target_fmt.upper()})**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Archivo:** `{input_path.name[:56]}`\n"
+                    f"└ **Peso:** `{human_bytes(audio_size)}` · Enviando a Telegram...",
+                    reply_markup=cancel_kb,
+                    force=True,
+                )
+                await self.client.send_audio(
+                    chat_id=job.chat_id,
+                    audio=str(input_path),
+                    duration=int(round(audio_dur)),
+                    title=input_path.stem[:64],
+                    file_name=input_path.name,
+                )
+                with contextlib.suppress(Exception):
+                    await job.status_message.delete()
+                lang_note = f"\n├ **Idioma:** `{job.audio_lang}`" if job.audio_lang else ""
+                await self.client.send_message(
+                    job.chat_id,
+                    f"🎵 **Audio Directo ({target_fmt.upper()})**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Archivo:** `{input_path.name[:68]}`{lang_note}\n"
+                    f"├ **Peso:** `{human_bytes(audio_size)}` · **Duración:** `{human_duration(audio_dur)}`\n"
+                    f"└ **Tiempo:** `{human_duration(elapsed)}`",
+                )
+                outcome = "Completado con avisos" if collector.has_issues else "Completado"
+                return
 
             # ── Descarga directa sin recomprimir (Leech) ──────────────────────
             if job.action_kind == "download_only":
@@ -588,18 +785,10 @@ class QueueManager:
                 job.options.send_as_document = True
                 elapsed_total = time.time() - (job.started_at or time.time())
                 metrics = await monitor.stop()
-                is_audio_only = input_path.suffix.lower() in {
-                    ".m4a",
-                    ".mp3",
-                    ".opus",
-                    ".aac",
-                    ".ogg",
-                    ".oga",
-                    ".wav",
-                    ".flac",
-                }
+                is_audio_only = input_path.suffix.lower() in audio_exts
+                subs_tag = f" · `{len(media.subtitle_tracks)} subs`" if media.subtitle_tracks else ""
                 media_line = (
-                    f"├ **Video:** `{media.width}×{media.height}` · `{media.video_codec.upper()}` · `{human_duration(media.duration)}` (`Documento`)\n"
+                    f"├ **Video:** `{media.width}×{media.height}` · `{media.video_codec.upper()}` · `{human_duration(media.duration)}`{subs_tag} (`Documento`)\n"
                     if is_video_file
                     else (
                         "├ **Tipo:** `Audio directo (Documento)`\n"
@@ -630,6 +819,7 @@ class QueueManager:
                     metrics=metrics,
                     custom_summary=dl_summary,
                     record_stats=False,
+                    reg_proc=_reg_proc,
                 )
                 outcome = "Completado con avisos" if collector.has_issues else "Completado"
                 return
@@ -649,6 +839,51 @@ class QueueManager:
             if job.on_media_probed is not None:
                 with contextlib.suppress(Exception):
                     await job.on_media_probed(media)
+
+            # ── Herramienta: Dividir en partes <1.9 GB sin pérdida ────────────
+            if job.action_kind == "split_parts":
+                metrics = await monitor.stop()
+                if input_size <= TELEGRAM_MAX_UPLOAD_BYTES:
+                    await updater.update(
+                        f"ℹ️ **No necesita división**\n"
+                        f"`{DIVIDER}`\n"
+                        f"└ `{input_path.name[:56]}` pesa `{human_bytes(input_size)}` (ya cabe en 1 solo envío de Telegram).",
+                        force=True,
+                    )
+                    outcome = "Completado"
+                    return
+                can_split = await asyncio.to_thread(self.can_split_for_bytes, input_size, True)
+                if not can_split:
+                    avail = await asyncio.to_thread(self._effective_free_bytes)
+                    need_b = int(input_size * 1.05) + (150 * 1024 * 1024)
+                    outcome = "Sin espacio"
+                    await updater.update(
+                        f"⚠️ **Espacio insuficiente para dividir**\n"
+                        f"`{DIVIDER}`\n"
+                        f"├ **Archivo:** `{human_bytes(input_size)}`\n"
+                        f"├ **Disponible real:** `{human_bytes(avail)}`\n"
+                        f"└ **Necesario:** `{human_bytes(need_b)}` · Usa Link >2 GB o ejecuta `/purge`.",
+                        force=True,
+                    )
+                    return
+                await self._deliver_split_parts(
+                    job=job,
+                    job_dir=job_dir,
+                    source_path=input_path,
+                    input_size=input_size,
+                    total_output_size=input_size,
+                    out_media=media,
+                    reduction_pct=0.0,
+                    elapsed_total=time.time() - (job.started_at or time.time()),
+                    updater=updater,
+                    cancel_kb=cancel_kb,
+                    reg_proc=_reg_proc,
+                    delete_source_after=(not job.keep_cached_source),
+                    metrics=metrics,
+                    record_stats=False,
+                )
+                outcome = "Completado con avisos" if collector.has_issues else "Completado"
+                return
 
             # ── Despacho de Herramientas Rápidas ──────────────────────────────
             if job.action_kind == "mediainfo":
@@ -967,6 +1202,7 @@ class QueueManager:
                 cancel_kb=cancel_kb,
                 metrics=metrics,
                 encode_notes=encode_notes,
+                reg_proc=_reg_proc,
             )
             outcome = "Completado con avisos" if collector.has_issues else "Completado"
 
@@ -993,6 +1229,8 @@ class QueueManager:
             if outcome != "Cancelado":
                 await self._send_auto_log_to_owner(job, collector, outcome, fatal_error)
             await asyncio.to_thread(shutil.rmtree, job_dir, True)
+            if job.precomputed_dir is not None:
+                await asyncio.to_thread(shutil.rmtree, job.precomputed_dir, True)
             if job.session_id and not job.keep_cached_source:
                 await asyncio.to_thread(self.release_session_cache, job.session_id, job.job_id)
             if input_size >= 200 * 1024 * 1024 or job.options.codec == "libsvtav1":
@@ -1014,6 +1252,7 @@ class QueueManager:
         custom_summary: str | None = None,
         record_stats: bool = True,
         encode_notes: list[str] | None = None,
+        reg_proc: Callable[[asyncio.subprocess.Process | None], None] | None = None,
     ) -> None:
         dump_id_raw = await self.db.get_setting("dump_chat_id", str(self.config.dump_chat_id or 0))
         dump_chat_id = int(dump_id_raw) if dump_id_raw.lstrip("-").isdigit() else 0
@@ -1041,7 +1280,9 @@ class QueueManager:
                 metrics=metrics,
                 encode_notes=encode_notes,
             )
-        elif can_use_premium:
+            return
+
+        if can_use_premium:
             await self._deliver_via_premium_account(
                 job=job,
                 job_dir=job_dir,
@@ -1059,20 +1300,221 @@ class QueueManager:
                 metrics=metrics,
                 encode_notes=encode_notes,
             )
-        else:
-            await self._deliver_via_link(
+            return
+
+        can_split = await asyncio.to_thread(self.can_split_for_bytes, output_size, True)
+
+        if job.over_2gb_mode == "split" and can_split:
+            await self._deliver_split_parts(
                 job=job,
-                output_path=output_path,
+                job_dir=job_dir,
+                source_path=output_path,
                 input_size=input_size,
-                output_size=output_size,
+                total_output_size=output_size,
                 out_media=out_media,
                 reduction_pct=reduction_pct,
                 elapsed_total=elapsed_total,
                 updater=updater,
                 cancel_kb=cancel_kb,
+                reg_proc=reg_proc or (lambda _p: None),
+                delete_source_after=(not job.keep_cached_source or output_path.parent != (self.config.work_dir / "_cache" / (job.session_id or ""))),
                 metrics=metrics,
                 encode_notes=encode_notes,
+                record_stats=record_stats,
             )
+            return
+
+        if job.over_2gb_mode == "auto" and can_split:
+            tok = secrets.token_hex(6)
+            pending_dir = self.config.work_dir / f"_over2gb_{tok}"
+            pending_dir.mkdir(parents=True, exist_ok=True)
+            staged_path = pending_dir / output_path.name
+            is_shared_cache = bool(
+                job.session_id
+                and str(output_path.resolve()).startswith(str((self.config.work_dir / "_cache").resolve()))
+            )
+            if is_shared_cache:
+                await asyncio.to_thread(shutil.copy2, output_path, staged_path)
+            else:
+                await asyncio.to_thread(shutil.move, str(output_path), str(staged_path))
+
+            avail_now = await asyncio.to_thread(self._effective_free_bytes)
+            est_parts = max(2, (output_size + (1820 * 1024 * 1024 - 1)) // (1820 * 1024 * 1024))
+            self._pending_over2gb[tok] = PendingOver2GBDelivery(
+                token=tok,
+                user_id=job.user_id,
+                chat_id=job.chat_id,
+                status_message=job.status_message,
+                pending_dir=pending_dir,
+                output_path=staged_path,
+                input_size=input_size,
+                output_size=output_size,
+                out_media=out_media,
+                reduction_pct=reduction_pct,
+                elapsed_total=elapsed_total,
+                filename=job.filename,
+                options=job.options.clone(),
+                source_chat_id=job.source_message.chat.id if job.source_message else None,
+                source_message_id=job.source_message.id if job.source_message else None,
+                source_url=job.source_url,
+                user_label=job.user_label,
+                encode_notes=list(encode_notes or []),
+                record_stats=record_stats,
+            )
+            await updater.update(
+                f"📦 **Archivo >2 GB Listo (`{human_bytes(output_size)}`)**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{staged_path.name[:56]}`\n"
+                f"├ **Partes estimadas:** `~{est_parts}` partes de `<1.90 GB` (sin pérdida)\n"
+                f"└ **Disco disponible:** `{human_bytes(avail_now)}` · Elige cómo recibirlo:",
+                reply_markup=build_over2gb_choice_keyboard(tok),
+                force=True,
+            )
+            return
+
+        await self._deliver_via_link(
+            job=job,
+            output_path=output_path,
+            input_size=input_size,
+            output_size=output_size,
+            out_media=out_media,
+            reduction_pct=reduction_pct,
+            elapsed_total=elapsed_total,
+            updater=updater,
+            cancel_kb=cancel_kb,
+            metrics=metrics,
+            encode_notes=encode_notes,
+        )
+
+    async def _deliver_split_parts(
+        self,
+        job: CompressionJob,
+        job_dir: Path,
+        source_path: Path,
+        input_size: int,
+        total_output_size: int,
+        out_media: MediaInfo,
+        reduction_pct: float,
+        elapsed_total: float,
+        updater: ProgressUpdater,
+        cancel_kb: Any,
+        reg_proc: Callable[[asyncio.subprocess.Process | None], None],
+        delete_source_after: bool = True,
+        metrics: JobResourceMetrics | None = None,
+        encode_notes: list[str] | None = None,
+        record_stats: bool = True,
+    ) -> None:
+        job.phase = "Dividiendo en partes (<1.9 GB)"
+        job.progress_pct = 0.0
+        await updater.update(
+            f"✂️ **Dividiendo Video (<1.90 GB) sin pérdida**\n"
+            f"`{DIVIDER}`\n"
+            f"├ **Archivo:** `{source_path.name[:56]}`\n"
+            f"└ **Peso total:** `{human_bytes(total_output_size)}` · Segmentando con `-c copy`...",
+            reply_markup=cancel_kb,
+            force=True,
+        )
+
+        parts = await split_video_for_telegram(
+            source_path=source_path,
+            duration=out_media.duration,
+            out_dir=job_dir / "parts",
+            cancel_event=job.cancel_event,
+            register_proc=reg_proc,
+            max_part_bytes=TELEGRAM_MAX_UPLOAD_BYTES,
+            target_part_bytes=1820 * 1024 * 1024,
+            custom_name=job.options.custom_output_name,
+            delete_source_after=delete_source_after,
+        )
+
+        total_parts = len(parts)
+        for idx, part_path in enumerate(parts, start=1):
+            if job.cancel_event.is_set():
+                raise JobCancelledError("Subida cancelada.")
+            part_size = part_path.stat().st_size
+            part_media = await probe_media(part_path)
+            thumb_path = await self._prepare_thumbnail(
+                job.user_id, part_path, part_media.duration, job_dir / f"thumb_{idx}"
+            )
+            job.phase = f"Subiendo Parte {idx}/{total_parts}"
+            up_start = time.monotonic()
+
+            async def _part_progress(current: int, total: int, _idx: int = idx, _start: float = up_start) -> None:
+                if job.cancel_event.is_set():
+                    raise JobCancelledError("Subida cancelada.")
+                elapsed = max(0.5, time.monotonic() - _start)
+                speed_bps = current / elapsed
+                pct = (current / max(total, 1)) * 100.0
+                job.progress_pct = pct
+                job.progress_detail = f"P{_idx}/{total_parts} · {human_bytes(speed_bps)}/s"
+                eta = (total - current) / max(speed_bps, 1.0)
+                await updater.update(
+                    f"⬆️ **Subiendo Parte `{_idx}/{total_parts}`**\n"
+                    f"`{progress_bar(pct)}`\n"
+                    f"├ **Archivo:** `{part_path.name[:50]}`\n"
+                    f"├ **Subido:** `{human_bytes(current)}` / `{human_bytes(total)}`\n"
+                    f"└ **Velocidad:** `{human_bytes(speed_bps)}/s` · **ETA:** `{human_duration(eta)}`",
+                    reply_markup=cancel_kb,
+                )
+
+            await updater.update(
+                f"📦 **Subiendo Parte `{idx}/{total_parts}`**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{part_path.name[:56]}`\n"
+                f"└ **Peso:** `{human_bytes(part_size)}` · Duración `{human_duration(part_media.duration)}`",
+                reply_markup=cancel_kb,
+                force=True,
+            )
+
+            await fast_send_video_or_doc(
+                client=self.client,
+                chat_id=job.chat_id,
+                file_path=part_path,
+                duration=int(round(part_media.duration)),
+                width=part_media.width,
+                height=part_media.height,
+                thumb_path=thumb_path,
+                caption=f"📦 Parte {idx}/{total_parts} · {human_bytes(part_size)} · {human_duration(part_media.duration)}",
+                send_as_doc=True,
+                cancel_event=job.cancel_event,
+                on_progress=_part_progress,
+                workers=self.config.fast_transfer_workers,
+            )
+            with contextlib.suppress(OSError):
+                part_path.unlink()
+
+        if record_stats:
+            await self.db.record_job_completion(input_size, total_output_size, delivered_via_link=False)
+        with contextlib.suppress(Exception):
+            await job.status_message.delete()
+
+        notes_line = (
+            f"├ **Motor Pro:** `{' · '.join(encode_notes)}`\n"
+            if encode_notes
+            else ""
+        )
+        usage_line = (
+            f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
+            if metrics is not None
+            else ""
+        )
+        sign = "-" if reduction_pct >= 0 else "+"
+        weight_line = (
+            f"├ **Peso:** `{human_bytes(total_output_size)}`\n"
+            if input_size == total_output_size
+            else f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(total_output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
+        )
+        await self.client.send_message(
+            job.chat_id,
+            f"📱 **Entrega en `{total_parts}` Partes Completada**\n"
+            f"`{DIVIDER}`\n"
+            f"├ **Archivo base:** `{source_path.name[:64]}`\n"
+            f"{weight_line}"
+            f"├ **Video:** `{out_media.width}×{out_media.height}` · `{human_duration(out_media.duration)}` (`Documento · Reproductor MX`)\n"
+            f"{notes_line}"
+            f"{usage_line}"
+            f"└ **Tiempo total:** `{human_duration(elapsed_total)}`",
+        )
 
     async def _deliver_via_premium_account(
         self,
@@ -1201,6 +1643,15 @@ class QueueManager:
         updater: ProgressUpdater,
         cancel_kb: Any,
     ) -> Path:
+        # Extracción directa de audio desde URL sin caché previo: bajar solo audio sin contaminar caché de video
+        if (
+            job.action_kind in {"extract_opus", "extract_mp3"}
+            and job.source_url
+            and not job.source_is_direct
+            and not self.has_cached_source(job.session_id)
+        ):
+            return await self._perform_download(job, job_dir / "in", updater, cancel_kb)
+
         if job.session_id:
             lock = self._cache_locks.setdefault(job.session_id, asyncio.Lock())
             async with lock:
@@ -1246,7 +1697,15 @@ class QueueManager:
             job.progress_detail = f"{human_bytes(speed_bps)}/s"
             eta = ((total - current) / max(speed_bps, 1.0)) if total > current else 0.0
             bar_str = progress_bar(pct) if total > 0 else f"Descargados {human_bytes(current)}"
-            dl_title = "⬇️ **Descargando Archivo (Leech)**" if job.action_kind == "download_only" else "⬇️ **Descargando Video**"
+            dl_title = (
+                "🎵 **Descargando Audio Directo**"
+                if job.action_kind in {"extract_opus", "extract_mp3"} and job.source_url and not job.source_is_direct
+                else (
+                    "⬇️ **Descargando Archivo (Leech)**"
+                    if job.action_kind == "download_only"
+                    else "⬇️ **Descargando Video**"
+                )
+            )
             await updater.update(
                 f"{dl_title}\n"
                 f"`{bar_str}`\n"
@@ -1268,9 +1727,9 @@ class QueueManager:
             elif stage == "remuxing":
                 job.phase = "Ensamblando video"
                 await updater.update(
-                    f"🔄 **Ensamblando Video Descargado**\n"
+                    f"🔄 **Ensamblando Archivo Final**\n"
                     f"`{DIVIDER}`\n"
-                    f"└ Empaquetando segmentos en el archivo final...",
+                    f"└ Empaquetando audio/subtítulos en el contenedor...",
                     reply_markup=cancel_kb,
                     force=True,
                 )
@@ -1280,13 +1739,20 @@ class QueueManager:
             max_allow_merge = int(effective_free * 0.48)
             max_allow_single = (
                 int(effective_free * 0.85)
-                if job.action_kind == "download_only"
+                if job.action_kind in {"download_only", "extract_opus", "extract_mp3"}
                 else max_allow_merge
             )
             if max_allow_merge < 50 * 1024 * 1024:
                 raise RuntimeError(
                     f"Espacio libre insuficiente para descargar ({human_bytes(effective_free)} disponibles). Ejecuta /purge."
                 )
+
+            audio_only_fmt: Literal["opus", "mp3"] | None = None
+            if job.action_kind == "extract_opus" and not job.source_is_direct:
+                audio_only_fmt = "opus"
+            elif job.action_kind == "extract_mp3" and not job.source_is_direct:
+                audio_only_fmt = "mp3"
+
             return await download_from_url(
                 url=job.source_url,
                 dest_dir=dest_dir,
@@ -1296,8 +1762,12 @@ class QueueManager:
                 max_height=job.download_max_height,
                 gofile_token=self.config.gofile_token,
                 max_ytdlp_bytes=max_allow_merge,
-                expect_video=job.expect_video or (job.action_kind != "download_only"),
+                expect_video=False if audio_only_fmt else (job.expect_video or (job.action_kind != "download_only")),
                 on_stage=_dl_stage,
+                audio_lang=job.audio_lang,
+                embed_subs=job.embed_subs and job.action_kind == "download_only",
+                sub_langs=job.sub_langs,
+                audio_only_format=audio_only_fmt,
             )
 
         assert job.source_message is not None

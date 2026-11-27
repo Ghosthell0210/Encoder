@@ -108,6 +108,33 @@ def _infer_bit_depth(stream: dict) -> int:
     return 8
 
 
+async def probe_audio_duration(file_path: Path) -> float:
+    """Lee únicamente la duración de un archivo multimedia o audio mediante ffprobe."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(file_path),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return 0.0
+    try:
+        val = float(stdout.decode("utf-8", errors="replace").strip())
+        return max(0.0, val)
+    except ValueError:
+        return 0.0
+
+
 async def probe_media(file_path: Path) -> MediaInfo:
     """Ejecuta ffprobe sin shell para leer metadatos técnicos completos del video."""
     cmd = [
