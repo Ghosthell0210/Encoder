@@ -24,7 +24,7 @@ from hydrogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefa
 from config import BotConfig
 from core.console_commands import console_command_loop
 from core.database import Database
-from core.ffmpeg_bootstrap import ensure_curl_cffi, ensure_ffmpeg, ensure_ytdlp
+from core.ffmpeg_bootstrap import ensure_curl_cffi, ensure_ffmpeg, ensure_ytdlp, has_libtorrent
 from core.ffmpeg_engine import is_encoder_available
 from core.job_log_capture import install_job_log_handler
 from core.logger_setup import setup_logging
@@ -45,6 +45,8 @@ USER_BOT_COMMANDS: list[BotCommand] = [
     BotCommand("start", "Inicio rápido y menú principal"),
     BotCommand("help", "Guía de uso y lista de comandos"),
     BotCommand("leech", "Modo Leech o /leech <url> (bajar sin comprimir)"),
+    BotCommand("ls", "Explorar archivos del servidor y descomprimir"),
+    BotCommand("extract", "Descomprimir archivo o enlace .zip/.rar/.7z en /ls"),
     BotCommand("auto", "Activar o desactivar Modo Lotes automático"),
     BotCommand("mediainfo", "Ficha técnica MediaInfo (responde a un video)"),
     BotCommand("ss", "Cuadrícula 3×3 de capturas (responde a un video)"),
@@ -109,6 +111,7 @@ def _clean_startup_temps(config: BotConfig) -> None:
     shutil.rmtree(config.work_dir, ignore_errors=True)
     config.work_dir.mkdir(parents=True, exist_ok=True)
     config.links_dir.mkdir(parents=True, exist_ok=True)
+    config.workspace_dir.mkdir(parents=True, exist_ok=True)
 
 
 async def main() -> None:
@@ -123,6 +126,10 @@ async def main() -> None:
     logger.info("Soporte yt-dlp (YouTube/TikTok/redes): %s", "DISPONIBLE" if ytdlp_cmd else "NO disponible")
     curl_ok = await asyncio.to_thread(ensure_curl_cffi)
     logger.info("Soporte curl-cffi (anti-Cloudflare): %s", "DISPONIBLE" if curl_ok else "NO disponible")
+    logger.info(
+        "Soporte Magnet/Torrent (libtorrent): %s",
+        "DISPONIBLE" if has_libtorrent() else "se instalará bajo demanda",
+    )
     av1_ok = await is_encoder_available("libsvtav1")
     logger.info("Soporte AV1 (libsvtav1): %s", "DISPONIBLE" if av1_ok else "NO encontrado en este FFmpeg")
     _check_tgcrypto()

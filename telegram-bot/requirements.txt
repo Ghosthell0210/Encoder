@@ -6,3 +6,4 @@ python-dotenv>=1.0.1
 psutil>=6.0.0
 yt-dlp>=2024.12.1
 curl-cffi>=0.7.0
+libtorrent>=2.0.9; sys_platform == "linux"

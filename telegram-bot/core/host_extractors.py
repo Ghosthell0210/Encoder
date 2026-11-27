@@ -6,11 +6,16 @@ Soporta:
   - GoFile (gofile.io)
   - Buzzheavier (buzzheavier.com / bzzhr.co)
   - Google Drive público (drive.google.com / drive.usercontent.google.com)
+  - Dropbox (dropbox.com / dl.dropboxusercontent.com)
+  - Krakenfiles (krakenfiles.com)
+  - 1Fichier (1fichier.com)
+  - Qiwi (qiwi.gg)
+  - Bunkr (bunkr.* archivos individuales)
 
 Usa impersonación TLS de Chrome vía `curl-cffi` cuando está disponible (con
 instalación automática sin root) para evitar bloqueos 403 por huella TLS de
 Cloudflare, y reporta errores legibles cuando existe Captcha/Turnstile JS activo,
-contraseña o archivo privado/eliminado.
+contraseña, cooldown o archivo privado/eliminado.
 """
 
 from __future__ import annotations
@@ -22,11 +27,12 @@ import html as html_lib
 import json
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
 
@@ -56,6 +62,10 @@ class ResolvedHostDownload:
     headers: dict[str, str] = field(default_factory=dict)
     cookies: dict[str, str] = field(default_factory=dict)
     use_curl_cffi: bool = False
+    resolved_at: float = field(default_factory=time.time)
+
+
+_BUNKR_HOST_RE = re.compile(r"(?:^|\.)bunkr+\.[a-z]{2,}$", re.IGNORECASE)
 
 
 def identify_file_host(url: str) -> str | None:
@@ -79,6 +89,18 @@ def identify_file_host(url: str) -> str | None:
         return "gdrive"
     if host == "docs.google.com" and "/file/" in urlparse(url).path.lower():
         return "gdrive"
+    if host in {"dropbox.com", "dl.dropboxusercontent.com"} or host.endswith(
+        (".dropbox.com", ".dropboxusercontent.com")
+    ):
+        return "dropbox"
+    if host == "krakenfiles.com" or host.endswith(".krakenfiles.com"):
+        return "krakenfiles"
+    if host == "1fichier.com" or host.endswith(".1fichier.com"):
+        return "1fichier"
+    if host == "qiwi.gg" or host.endswith(".qiwi.gg"):
+        return "qiwi"
+    if _BUNKR_HOST_RE.search(host):
+        return "bunkr"
     return None
 
 
@@ -263,18 +285,128 @@ def _extract_mediafire_filename(page_html: str, direct_url: str) -> str | None:
     return _filename_from_cd(None, direct_url)
 
 
+async def _probe_mediafire_direct(
+    url: str,
+    validate_url: UrlValidator,
+) -> ResolvedHostDownload:
+    """Inspecciona un enlace downloadXXXX.mediafire.com para validar si sirve archivo o HTML/redirección."""
+    await validate_url(url)
+    parsed = urlparse(url)
+    fallback_name = _clean_filename(Path(unquote(parsed.path)).name)
+    req_headers = {"User-Agent": CHROME_UA, "Referer": "https://www.mediafire.com/"}
+
+    if await _ensure_impersonation_ready():
+        try:
+            async with _create_curl_session() as session:
+                async with session.stream(
+                    "GET",
+                    url,
+                    headers=req_headers,
+                    allow_redirects=True,
+                ) as resp:
+                    final_url = str(resp.url)
+                    await validate_url(final_url)
+                    status = resp.status_code
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+                    if status < 400 and "text/html" not in ctype:
+                        cl_raw = resp.headers.get("Content-Length")
+                        fsize = int(cl_raw) if cl_raw and cl_raw.isdigit() and int(cl_raw) > 0 else None
+                        fname = _filename_from_cd(resp.headers.get("Content-Disposition"), final_url)
+                        return ResolvedHostDownload(
+                            provider="MediaFire",
+                            direct_url=final_url,
+                            filename=fname or fallback_name,
+                            file_size=fsize,
+                            headers={"Referer": "https://www.mediafire.com/"},
+                            cookies=dict(session.cookies.items()) if hasattr(session, "cookies") else {},
+                            use_curl_cffi=True,
+                        )
+
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.aiter_content():
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if total >= 128 * 1024:
+                            break
+                    html_snippet = b"".join(chunks).decode("utf-8", errors="replace")
+                    cookies = dict(session.cookies.items()) if hasattr(session, "cookies") else {}
+        except HostExtractionError:
+            raise
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            logger.debug("Error inspeccionando downloadXXXX MediaFire (%s): %s", url[:60], exc)
+            html_snippet = ""
+            final_url = url
+            status = 0
+            cookies = {}
+    else:
+        status, final_url, html_snippet, cookies, _ = await _fetch_text_with_session(
+            url, validate_url, headers={"Referer": "https://www.mediafire.com/"}
+        )
+
+    if html_snippet:
+        # Si redirigió a la ficha mediafire.com/file/... intentar extraer el enlace nuevo para esta IP
+        recovered = _extract_mediafire_url(html_snippet)
+        if recovered and not recovered.startswith(url.split("?", 1)[0]):
+            await validate_url(recovered)
+            dl_headers = {"Referer": final_url}
+            fname_head, fsize = await _probe_direct_metadata(
+                recovered, validate_url, headers=dl_headers, cookies=cookies, use_curl_cffi=True
+            )
+            return ResolvedHostDownload(
+                provider="MediaFire",
+                direct_url=recovered,
+                filename=fname_head or _extract_mediafire_filename(html_snippet, recovered) or fallback_name,
+                file_size=fsize,
+                headers=dl_headers,
+                cookies=cookies,
+                use_curl_cffi=True,
+            )
+
+        cf_err = _detect_cf_challenge(status, html_snippet)
+        if cf_err:
+            raise HostExtractionError(
+                "El enlace temporal 'downloadXXXX.mediafire.com' está atado a otra IP, expiró o activó Cloudflare. "
+                "Envía el enlace normal de la página (https://www.mediafire.com/file/...)."
+            )
+
+        low = html_snippet.lower()
+        if status == 404 or "invalid or deleted file" in low or "file removed" in low:
+            raise HostExtractionError("El archivo no existe o fue eliminado de MediaFire.")
+        if 'name="downloadp"' in low or "password protected" in low:
+            raise HostExtractionError("Este archivo de MediaFire está protegido con contraseña.")
+
+        raise HostExtractionError(
+            "El enlace directo temporal de MediaFire ('downloadXXXX.mediafire.com') devolvió una página HTML en lugar del archivo "
+            "(caducado o bloqueado para otra IP). Envía el enlace normal de la ficha (https://www.mediafire.com/file/...)."
+        )
+
+    if status in {403, 503}:
+        raise HostExtractionError(
+            f"MediaFire bloqueó el enlace directo temporal (HTTP {status}). "
+            "Envía el enlace de la ficha (https://www.mediafire.com/file/...)."
+        )
+    if status >= 400:
+        raise HostExtractionError(f"MediaFire devolvió error HTTP {status}.")
+
+    return ResolvedHostDownload(
+        provider="MediaFire",
+        direct_url=final_url,
+        filename=fallback_name,
+        file_size=None,
+        headers={"Referer": "https://www.mediafire.com/"},
+        cookies=cookies,
+        use_curl_cffi=True,
+    )
+
+
 async def _resolve_mediafire(url: str, validate_url: UrlValidator) -> ResolvedHostDownload:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     if host.startswith("download") and "." in Path(unquote(parsed.path)).name:
-        fname, fsize = await _probe_direct_metadata(url, validate_url, use_curl_cffi=True)
-        return ResolvedHostDownload(
-            provider="MediaFire",
-            direct_url=url,
-            filename=fname or _clean_filename(Path(unquote(parsed.path)).name),
-            file_size=fsize,
-            use_curl_cffi=True,
-        )
+        return await _probe_mediafire_direct(url, validate_url)
 
     if "/folder/" in parsed.path.lower():
         raise HostExtractionError(
@@ -748,6 +880,439 @@ async def _resolve_gdrive(url: str, validate_url: UrlValidator) -> ResolvedHostD
     )
 
 
+async def _resolve_dropbox(url: str, validate_url: UrlValidator) -> ResolvedHostDownload:
+    parsed = urlparse(url)
+    if "/sh/" in parsed.path.lower() or "/scl/fo/" in parsed.path.lower():
+        # Dropbox entrega carpetas como .zip si lleva dl=1, pero avisar si es link sin archivo
+        pass
+
+    q_items = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() not in {"dl", "raw"}]
+    q_items.append(("dl", "1"))
+    direct_url = urlunparse(parsed._replace(query=urlencode(q_items)))
+    await validate_url(direct_url)
+
+    use_curl = await _ensure_impersonation_ready()
+    req_headers = {"User-Agent": CHROME_UA}
+    status = 0
+    final_url = direct_url
+    ctype = ""
+    cd = None
+    cl_raw = None
+    cookies: dict[str, str] = {}
+    html_snippet = ""
+
+    if use_curl:
+        async with _create_curl_session() as session:
+            async with session.stream("GET", direct_url, headers=req_headers, allow_redirects=True) as resp:
+                final_url = str(resp.url)
+                await validate_url(final_url)
+                status = resp.status_code
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                cd = resp.headers.get("Content-Disposition")
+                cl_raw = resp.headers.get("Content-Length")
+                cookies = dict(session.cookies.items()) if hasattr(session, "cookies") else {}
+                if "text/html" in ctype or status >= 400:
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.aiter_content():
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if total >= 128 * 1024:
+                            break
+                    html_snippet = b"".join(chunks).decode("utf-8", errors="replace")
+    else:
+        status, final_url, html_snippet, cookies, _ = await _fetch_text_with_session(direct_url, validate_url)
+
+    if status < 400 and "text/html" not in ctype:
+        size = int(cl_raw) if cl_raw and cl_raw.isdigit() and int(cl_raw) > 0 else None
+        fname = _filename_from_cd(cd, final_url)
+        return ResolvedHostDownload(
+            provider="Dropbox",
+            direct_url=final_url,
+            filename=fname,
+            file_size=size,
+            cookies=cookies,
+            use_curl_cffi=use_curl,
+        )
+
+    cf_err = _detect_cf_challenge(status, html_snippet)
+    if cf_err:
+        raise HostExtractionError(cf_err)
+    low = html_snippet.lower()
+    if status == 404 or "error (404)" in low or "file isn’t here anymore" in low or "file isn't here anymore" in low or "deleted" in low:
+        raise HostExtractionError("El archivo de Dropbox no existe o fue eliminado.")
+    if "password" in low or "sign in" in low or "iniciar sesión" in low or "request access" in low:
+        raise HostExtractionError("Este enlace de Dropbox es privado o requiere contraseña/sesión.")
+    if "disabled" in low or "too much traffic" in low:
+        raise HostExtractionError("Dropbox deshabilitó temporalmente este enlace por exceso de tráfico.")
+    raise HostExtractionError(f"Dropbox no entregó la descarga directa (HTTP {status or 'HTML'}).")
+
+
+async def _resolve_krakenfiles(url: str, validate_url: UrlValidator) -> ResolvedHostDownload:
+    status, final_url, body, cookies, used_curl = await _fetch_text_with_session(url, validate_url)
+    cf_err = _detect_cf_challenge(status, body)
+    if cf_err:
+        raise HostExtractionError(cf_err)
+
+    low = body.lower()
+    if status == 404 or "page not found" in low or "file not found" in low:
+        raise HostExtractionError("El archivo no existe o fue eliminado de Krakenfiles.")
+    if status >= 400:
+        raise HostExtractionError(f"Krakenfiles devolvió error HTTP {status}.")
+
+    m_tok = re.search(
+        r'<input[^>]+name=["\']token["\'][^>]+value=["\']([^"\']+)["\']',
+        body,
+        re.IGNORECASE,
+    ) or re.search(
+        r'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']token["\']',
+        body,
+        re.IGNORECASE,
+    )
+    m_act = re.search(
+        r'<form[^>]+id=["\']dl-form["\'][^>]+action=["\']([^"\']+)["\']',
+        body,
+        re.IGNORECASE,
+    ) or re.search(
+        r'action=["\']([^"\']*?/download/[^"\']+)["\']',
+        body,
+        re.IGNORECASE,
+    )
+    if not m_tok or not m_act:
+        raise HostExtractionError("No se encontró el formulario de descarga en Krakenfiles.")
+
+    token = html_lib.unescape(m_tok.group(1).strip())
+    post_url = urljoin(final_url, html_lib.unescape(m_act.group(1).strip()))
+    await validate_url(post_url)
+
+    post_headers = {
+        "User-Agent": CHROME_UA,
+        "Referer": final_url,
+        "Origin": "https://krakenfiles.com",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    resp_text = ""
+    post_status = 0
+    if used_curl and await _ensure_impersonation_ready():
+        async with _create_curl_session() as session:
+            resp = await session.post(
+                post_url,
+                data={"token": token},
+                headers=post_headers,
+                cookies=cookies or None,
+                allow_redirects=True,
+            )
+            post_status = resp.status_code
+            resp_text = resp.text or ""
+            if hasattr(session, "cookies"):
+                cookies.update(dict(session.cookies.items()))
+    else:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout, headers=post_headers, cookies=cookies) as session:
+            async with session.post(post_url, data={"token": token}, allow_redirects=True) as resp:
+                post_status = resp.status
+                resp_text = await resp.text(errors="replace")
+
+    if post_status >= 400:
+        cf_post = _detect_cf_challenge(post_status, resp_text)
+        if cf_post:
+            raise HostExtractionError(cf_post)
+        raise HostExtractionError(f"Krakenfiles rechazó la descarga (HTTP {post_status}).")
+
+    try:
+        payload = json.loads(resp_text)
+    except json.JSONDecodeError as exc:
+        raise HostExtractionError("Krakenfiles devolvió una respuesta inválida al generar el enlace.") from exc
+
+    raw_dl = str(payload.get("url") or "").strip()
+    if not raw_dl:
+        raise HostExtractionError("Krakenfiles no entregó la URL directa del archivo.")
+    if raw_dl.startswith("//"):
+        raw_dl = "https:" + raw_dl
+    direct_url = urljoin(final_url, raw_dl)
+    await validate_url(direct_url)
+
+    fname_page: str | None = None
+    m_name = re.search(r'<div[^>]+class=["\'][^"\']*coin-name[^"\']*["\'][^>]*>.*?<h5[^>]*>([^<]+)</h5>', body, re.IGNORECASE | re.DOTALL)
+    if m_name:
+        fname_page = _clean_filename(m_name.group(1))
+
+    dl_headers = {"Referer": final_url}
+    fname_head, fsize = await _probe_direct_metadata(
+        direct_url, validate_url, headers=dl_headers, cookies=cookies, use_curl_cffi=used_curl
+    )
+    return ResolvedHostDownload(
+        provider="Krakenfiles",
+        direct_url=direct_url,
+        filename=fname_head or fname_page or _filename_from_cd(None, direct_url),
+        file_size=fsize,
+        headers=dl_headers,
+        cookies=cookies,
+        use_curl_cffi=used_curl,
+    )
+
+
+def _check_1fichier_errors(status: int, html_text: str) -> None:
+    cf_err = _detect_cf_challenge(status, html_text)
+    if cf_err:
+        raise HostExtractionError(cf_err)
+    low = html_text.lower()
+    if status == 404 or "file could not be found" in low or "requested file has been deleted" in low or "fichier demandé n'existe pas" in low:
+        raise HostExtractionError("El archivo no existe o fue eliminado de 1Fichier.")
+    if 'name="pass"' in low or "password" in low and "protected" in low:
+        raise HostExtractionError("Este archivo de 1Fichier está protegido con contraseña.")
+    m_wait = re.search(r"you must wait\s+(\d+\s*(?:minutes?|seconds?|hours?))", html_text, re.IGNORECASE) or re.search(
+        r"vous devez attendre\s+(\d+\s*(?:minutes?|secondes?|heures?))", html_text, re.IGNORECASE
+    )
+    if m_wait or "free download is not possible" in low or "without waiting" in low and "warning" in low:
+        wait_txt = f" ({m_wait.group(1)})" if m_wait else ""
+        raise HostExtractionError(
+            f"1Fichier aplicó tiempo de espera por descarga gratuita compartida en esta IP{wait_txt}. Intenta más tarde o usa otro servidor."
+        )
+
+
+async def _resolve_1fichier(url: str, validate_url: UrlValidator) -> ResolvedHostDownload:
+    status, final_url, body, cookies, used_curl = await _fetch_text_with_session(url, validate_url)
+    _check_1fichier_errors(status, body)
+    if status >= 400:
+        raise HostExtractionError(f"1Fichier devolvió error HTTP {status}.")
+
+    # ¿Ya trae enlace directo en la página?
+    m_direct = re.search(
+        r'<a[^>]+class=["\'][^"\']*ok[^"\']*btn-general[^"\']*["\'][^>]+href=["\'](https?://[^"\']+)["\']',
+        body,
+        re.IGNORECASE,
+    )
+    dl_html = body
+    post_url = final_url
+    if not m_direct:
+        form_data: dict[str, str] = {"dl_no_ssl": "on", "dlinline": "on"}
+        m_adz = re.search(r'name=["\']adz["\'][^>]+value=["\']([^"\']*)["\']', body, re.IGNORECASE)
+        if m_adz:
+            form_data["adz"] = html_lib.unescape(m_adz.group(1))
+        m_act = re.search(r'<form[^>]+class=["\'][^"\']*alc[^"\']*["\'][^>]+action=["\']([^"\']+)["\']', body, re.IGNORECASE)
+        if m_act:
+            post_url = urljoin(final_url, html_lib.unescape(m_act.group(1)))
+            await validate_url(post_url)
+
+        post_headers = {"User-Agent": CHROME_UA, "Referer": final_url, "Origin": "https://1fichier.com"}
+        post_status = 0
+        if used_curl and await _ensure_impersonation_ready():
+            async with _create_curl_session() as session:
+                resp = await session.post(
+                    post_url,
+                    data=form_data,
+                    headers=post_headers,
+                    cookies=cookies or None,
+                    allow_redirects=True,
+                )
+                post_status = resp.status_code
+                dl_html = resp.text or ""
+                if hasattr(session, "cookies"):
+                    cookies.update(dict(session.cookies.items()))
+        else:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout, headers=post_headers, cookies=cookies) as session:
+                async with session.post(post_url, data=form_data, allow_redirects=True) as resp:
+                    post_status = resp.status
+                    dl_html = await resp.text(errors="replace")
+
+        _check_1fichier_errors(post_status, dl_html)
+        m_direct = re.search(
+            r'<a[^>]+class=["\'][^"\']*ok[^"\']*btn-general[^"\']*["\'][^>]+href=["\'](https?://[^"\']+)["\']',
+            dl_html,
+            re.IGNORECASE,
+        ) or re.search(
+            r'<a[^>]+href=["\'](https?://[a-z0-9.-]+\.1fichier\.com/c[^"\']+)["\']',
+            dl_html,
+            re.IGNORECASE,
+        )
+
+    if not m_direct:
+        raise HostExtractionError(
+            "1Fichier no entregó el enlace de descarga directa (posible captcha o bloqueo temporal de IP)."
+        )
+
+    direct_url = html_lib.unescape(m_direct.group(1).strip())
+    await validate_url(direct_url)
+    dl_headers = {"Referer": post_url}
+    fname_head, fsize = await _probe_direct_metadata(
+        direct_url, validate_url, headers=dl_headers, cookies=cookies, use_curl_cffi=used_curl
+    )
+    return ResolvedHostDownload(
+        provider="1Fichier",
+        direct_url=direct_url,
+        filename=fname_head or _filename_from_cd(None, direct_url),
+        file_size=fsize,
+        headers=dl_headers,
+        cookies=cookies,
+        use_curl_cffi=used_curl,
+    )
+
+
+async def _resolve_qiwi(url: str, validate_url: UrlValidator) -> ResolvedHostDownload:
+    status, final_url, body, cookies, used_curl = await _fetch_text_with_session(url, validate_url)
+    cf_err = _detect_cf_challenge(status, body)
+    if cf_err:
+        raise HostExtractionError(cf_err)
+    low = body.lower()
+    if status == 404 or "file not found" in low or "404" in re.findall(r"<title>\s*404", low):
+        raise HostExtractionError("El archivo no existe o fue eliminado de Qiwi.")
+    if status >= 400:
+        raise HostExtractionError(f"Qiwi devolvió error HTTP {status}.")
+
+    direct_url: str | None = None
+    for pat in (
+        r'(https?://spyderrock\.com/[A-Za-z0-9._-]+)',
+        r'<a[^>]+href=["\'](https?://[^"\']+)["\'][^>]*download',
+        r'<source[^>]+src=["\'](https?://[^"\']+)["\']',
+    ):
+        m = re.search(pat, body, re.IGNORECASE)
+        if m:
+            direct_url = html_lib.unescape(m.group(1).strip())
+            break
+
+    if not direct_url:
+        slug = Path(urlparse(final_url).path).name.strip()
+        if slug:
+            m_ext = re.search(r'<h1[^>]*>([^<]+)</h1>', body, re.IGNORECASE)
+            ext_guess = Path(m_ext.group(1).strip()).suffix if m_ext else ""
+            if ext_guess:
+                direct_url = f"https://spyderrock.com/{slug}{ext_guess}"
+
+    if not direct_url:
+        raise HostExtractionError("No se pudo extraer el enlace directo desde la página de Qiwi.")
+
+    await validate_url(direct_url)
+    m_title = re.search(r'<h1[^>]*>([^<]+)</h1>', body, re.IGNORECASE) or re.search(
+        r'<title>\s*([^<]+?)\s*(?:-|\|)?\s*qiwi\.gg\s*</title>', body, re.IGNORECASE
+    )
+    fname_page = _clean_filename(m_title.group(1)) if m_title else None
+
+    dl_headers = {"Referer": final_url}
+    fname_head, fsize = await _probe_direct_metadata(
+        direct_url, validate_url, headers=dl_headers, cookies=cookies, use_curl_cffi=used_curl
+    )
+    return ResolvedHostDownload(
+        provider="Qiwi",
+        direct_url=direct_url,
+        filename=fname_head or fname_page or _filename_from_cd(None, direct_url),
+        file_size=fsize,
+        headers=dl_headers,
+        cookies=cookies,
+        use_curl_cffi=used_curl,
+    )
+
+
+def _decrypt_bunkr_vs_url(encrypted_b64: str, timestamp: int | float) -> str | None:
+    try:
+        raw = base64.b64decode(encrypted_b64)
+        key = f"SECRET_KEY_{int(timestamp) // 3600}".encode("utf-8")
+        out = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+        decoded = out.decode("utf-8", errors="strict").strip()
+        if decoded.startswith(("http://", "https://")):
+            return decoded
+    except Exception:
+        return None
+    return None
+
+
+async def _resolve_bunkr(url: str, validate_url: UrlValidator) -> ResolvedHostDownload:
+    parsed = urlparse(url)
+    if parsed.path.lower().startswith("/a/"):
+        raise HostExtractionError(
+            "Los álbumes completos de Bunkr (/a/...) no están soportados; envía el enlace individual del archivo."
+        )
+
+    status, final_url, body, cookies, used_curl = await _fetch_text_with_session(url, validate_url)
+    cf_err = _detect_cf_challenge(status, body)
+    if cf_err:
+        raise HostExtractionError(cf_err)
+    if status == 404 or "file not found" in body.lower():
+        raise HostExtractionError("El archivo no existe o fue eliminado de Bunkr.")
+    if status >= 400:
+        raise HostExtractionError(f"Bunkr devolvió error HTTP {status}.")
+
+    direct_url: str | None = None
+    # 1. Intentar enlace directo en HTML / video source
+    for pat in (
+        r'<a[^>]+id=["\']czmDownloadz["\'][^>]+href=["\'](https?://[^"\']+)["\']',
+        r'<a[^>]+href=["\'](https?://(?:get\.bunkr[^"\']+|[^"\']*bunkr[^"\']*/file/[^"\']+))["\']',
+        r'<source[^>]+src=["\'](https?://[^"\']+)["\']',
+    ):
+        m = re.search(pat, body, re.IGNORECASE)
+        if m:
+            direct_url = html_lib.unescape(m.group(1).strip())
+            break
+
+    # 2. Fallback moderno: endpoint /api/vs con cifrado XOR por hora
+    if not direct_url:
+        slug_match = re.search(r"/(?:f|v|i|d)/([A-Za-z0-9_-]+)", urlparse(final_url).path)
+        if slug_match:
+            slug = slug_match.group(1)
+            api_url = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}/api/vs"
+            await validate_url(api_url)
+            api_headers = {
+                "User-Agent": CHROME_UA,
+                "Referer": final_url,
+                "Content-Type": "application/json",
+            }
+            api_text = ""
+            if used_curl and await _ensure_impersonation_ready():
+                async with _create_curl_session() as session:
+                    resp = await session.post(
+                        api_url,
+                        json={"slug": slug},
+                        headers=api_headers,
+                        cookies=cookies or None,
+                    )
+                    if resp.status_code < 400:
+                        api_text = resp.text or ""
+            else:
+                timeout = aiohttp.ClientTimeout(total=15)
+                async with aiohttp.ClientSession(timeout=timeout, headers=api_headers, cookies=cookies) as session:
+                    async with session.post(api_url, json={"slug": slug}) as resp:
+                        if resp.status < 400:
+                            api_text = await resp.text(errors="replace")
+            if api_text:
+                with contextlib.suppress(Exception):
+                    vs_data = json.loads(api_text)
+                    enc_url = str(vs_data.get("url") or "")
+                    ts_val = vs_data.get("timestamp")
+                    if enc_url and isinstance(ts_val, (int, float)):
+                        direct_url = _decrypt_bunkr_vs_url(enc_url, ts_val)
+                    elif enc_url.startswith(("http://", "https://")):
+                        direct_url = enc_url
+
+    if not direct_url:
+        raise HostExtractionError(
+            "No se pudo extraer el enlace directo desde Bunkr (usa el enlace individual /f/... o /v/...)."
+        )
+
+    await validate_url(direct_url)
+    m_name = re.search(r'<h1[^>]*>([^<]+)</h1>', body, re.IGNORECASE) or re.search(
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+        body,
+        re.IGNORECASE,
+    )
+    fname_page = _clean_filename(m_name.group(1)) if m_name else None
+
+    dl_headers = {"Referer": final_url}
+    fname_head, fsize = await _probe_direct_metadata(
+        direct_url, validate_url, headers=dl_headers, cookies=cookies, use_curl_cffi=used_curl
+    )
+    return ResolvedHostDownload(
+        provider="Bunkr",
+        direct_url=direct_url,
+        filename=fname_head or fname_page or _filename_from_cd(None, direct_url),
+        file_size=fsize,
+        headers=dl_headers,
+        cookies=cookies,
+        use_curl_cffi=used_curl,
+    )
+
+
 async def resolve_host_download(
     url: str,
     validate_url: UrlValidator,
@@ -769,4 +1334,14 @@ async def resolve_host_download(
         return await _resolve_buzzheavier(url, validate_url)
     if host_kind == "gdrive":
         return await _resolve_gdrive(url, validate_url)
+    if host_kind == "dropbox":
+        return await _resolve_dropbox(url, validate_url)
+    if host_kind == "krakenfiles":
+        return await _resolve_krakenfiles(url, validate_url)
+    if host_kind == "1fichier":
+        return await _resolve_1fichier(url, validate_url)
+    if host_kind == "qiwi":
+        return await _resolve_qiwi(url, validate_url)
+    if host_kind == "bunkr":
+        return await _resolve_bunkr(url, validate_url)
     return None

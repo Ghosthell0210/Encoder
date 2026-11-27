@@ -27,6 +27,19 @@ logger = logging.getLogger("hydrocompress.ffmpeg_bootstrap")
 YTDLP_BIN_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
 _YTDLP_LOCK = threading.Lock()
 _CURL_CFFI_LOCK = threading.Lock()
+_7ZZ_LOCK = threading.Lock()
+_LIBTORRENT_LOCK = threading.Lock()
+
+SEVENZIP_URLS: dict[str, list[str]] = {
+    "x86_64": [
+        "https://www.7-zip.org/a/7z2409-linux-x64.tar.xz",
+        "https://www.7-zip.org/a/7z2408-linux-x64.tar.xz",
+    ],
+    "aarch64": [
+        "https://www.7-zip.org/a/7z2409-linux-arm64.tar.xz",
+        "https://www.7-zip.org/a/7z2408-linux-arm64.tar.xz",
+    ],
+}
 
 # Compilados estáticos GPL con libx264, libx265, libass, aac y ffprobe
 STATIC_URLS: dict[str, list[str]] = {
@@ -291,3 +304,127 @@ def ensure_curl_cffi() -> bool:
             "No se pudo auto-instalar curl-cffi; el bypass TLS anti-Cloudflare quedará limitado."
         )
         return False
+
+
+def _detect_7zz(bin_dir: Path) -> str | None:
+    _prepend_bin_to_path(bin_dir)
+    for name in ("7zz", "7zzs", "7z"):
+        local = bin_dir / name
+        if local.is_file():
+            return str(local.resolve())
+        exe = shutil.which(name)
+        if exe:
+            return exe
+    return None
+
+
+def ensure_7zz(bin_dir: Path | None = None) -> str | None:
+    """Garantiza 7zz estático en ./bin sin requerir root (soporta RAR4/RAR5, 7z, ZIP, TAR)."""
+    target_bin = bin_dir or Path("bin")
+    exe = _detect_7zz(target_bin)
+    if exe:
+        return exe
+
+    if platform.system().lower() != "linux":
+        return None
+
+    with _7ZZ_LOCK:
+        exe = _detect_7zz(target_bin)
+        if exe:
+            return exe
+
+        try:
+            arch = _arch_key()
+        except RuntimeError:
+            return None
+
+        target_bin.mkdir(parents=True, exist_ok=True)
+        archive_path = target_bin / "7zz_static.tar.xz"
+        final_bin = target_bin / "7zz"
+
+        for url in SEVENZIP_URLS.get(arch, ()):
+            try:
+                logger.info("Descargando 7-Zip estático (RAR/7z) desde: %s", url)
+                req = urllib.request.Request(url, headers={"User-Agent": "HydroCompress-Bot/1.0"})
+                with urllib.request.urlopen(req, timeout=120) as resp, archive_path.open("wb") as out:
+                    shutil.copyfileobj(resp, out)
+
+                extracted_ok = False
+                with tarfile.open(archive_path, mode="r:*") as tar:
+                    members = [m for m in tar.getmembers() if m.isfile()]
+                    # Preferir compilado completamente estático 7zzs sobre 7zz
+                    members.sort(key=lambda m: 0 if Path(m.name).name == "7zzs" else 1)
+                    for member in members:
+                        base = Path(member.name).name
+                        if base in {"7zzs", "7zz"}:
+                            src_fp = tar.extractfile(member)
+                            if src_fp is None:
+                                continue
+                            tmp_bin = target_bin / "7zz.tmp"
+                            with src_fp, tmp_bin.open("wb") as out:
+                                shutil.copyfileobj(src_fp, out)
+                            tmp_bin.chmod(tmp_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                            tmp_bin.replace(final_bin)
+                            extracted_ok = True
+                            break
+                if extracted_ok:
+                    _prepend_bin_to_path(target_bin)
+                    logger.info("7zz estático instalado automáticamente sin root en: %s", final_bin)
+                    return str(final_bin.resolve())
+            except Exception as exc:
+                logger.warning("Fallo instalando 7zz desde %s: %s", url, exc)
+            finally:
+                archive_path.unlink(missing_ok=True)
+
+        return None
+
+
+def has_libtorrent() -> bool:
+    """Indica si libtorrent está disponible para descargas magnet / .torrent."""
+    return importlib.util.find_spec("libtorrent") is not None
+
+
+def ensure_libtorrent() -> bool:
+    """Instala automáticamente libtorrent vía pip sin root si falta en el entorno."""
+    if has_libtorrent():
+        return True
+
+    with _LIBTORRENT_LOCK:
+        if has_libtorrent():
+            return True
+
+        logger.info("libtorrent no encontrado; instalando automáticamente para magnet/torrent...")
+        pip_attempts = [
+            [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "libtorrent"],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--quiet",
+                "--upgrade",
+                "--break-system-packages",
+                "libtorrent",
+            ],
+            [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "--user", "libtorrent"],
+        ]
+        for pip_cmd in pip_attempts:
+            try:
+                res = subprocess.run(
+                    pip_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=180,
+                    check=False,
+                )
+                if res.returncode == 0:
+                    importlib.invalidate_caches()
+                    if has_libtorrent():
+                        logger.info("libtorrent instalado automáticamente vía pip.")
+                        return True
+            except Exception as exc:
+                logger.debug("Intento pip para libtorrent falló: %s", exc)
+
+        logger.warning("No se pudo auto-instalar libtorrent; magnet/torrent requerirá instalar libtorrent.")
+        return False
+

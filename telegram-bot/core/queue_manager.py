@@ -22,12 +22,20 @@ from pathlib import Path
 from typing import Any, Literal
 
 from hydrogram import Client
-from hydrogram.types import InputMediaPhoto, Message
+from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 
 from config import (
     TELEGRAM_MAX_UPLOAD_BYTES,
     TELEGRAM_PREMIUM_MAX_UPLOAD_BYTES,
     BotConfig,
+)
+from core.archive_tools import (
+    ArchivePasswordRequiredError,
+    ArchiveWrongPasswordError,
+    extract_archive,
+    is_video_file,
+    strip_archive_suffix,
+    unique_dest_dir,
 )
 from core.database import Database
 from core.fast_transfer import fast_download_media, fast_send_video_or_doc
@@ -38,7 +46,9 @@ from core.ffmpeg_engine import (
     compress_video,
     extract_thumbnail,
 )
+from core.host_extractors import ResolvedHostDownload
 from core.job_log_capture import JobIssueCollector, start_job_capture, stop_job_capture
+from core.logger_setup import read_last_log_lines  # noqa: F401
 from core.media_probe import (
     MediaInfo,
     format_mediainfo_report,
@@ -56,6 +66,12 @@ from core.resource_monitor import (
     JobResourceMetrics,
     JobResourceMonitor,
     fast_dir_bytes,
+)
+from core.torrent_downloader import (
+    TorrentDownloadResult,
+    download_torrent_or_magnet,
+    is_magnet_link,
+    is_torrent_url,
 )
 from core.ui_helpers import (
     DIVIDER,
@@ -86,6 +102,8 @@ ActionKind = Literal[
     "split_parts",
     "deliver_split",
     "deliver_link",
+    "save_to_workspace",
+    "extract_to_workspace",
 ]
 
 
@@ -158,6 +176,10 @@ class CompressionJob:
     sub_langs: str | None = None
     source_is_direct: bool = False
     over_2gb_mode: Literal["auto", "link", "split"] = "auto"
+    resolved_host: ResolvedHostDownload | None = None
+    local_source_path: Path | None = None
+    is_torrent: bool = False
+    archive_password: str | None = None
     precomputed_file: Path | None = None
     precomputed_dir: Path | None = None
     precomputed_input_size: int = 0
@@ -178,7 +200,7 @@ class CompressionJob:
     @property
     def action_badge(self) -> str:
         mapping = {
-            "download_only": "Descarga Directa",
+            "download_only": "Leech Torrent" if self.is_torrent else "Descarga Directa",
             "mediainfo": "MediaInfo",
             "screenshots_grid": "Cuadrícula 3×3",
             "screenshots_hd": "4 Capturas HD",
@@ -189,6 +211,8 @@ class CompressionJob:
             "split_parts": "Dividir Partes",
             "deliver_split": "Partes Telegram",
             "deliver_link": "Enlace >2 GB",
+            "save_to_workspace": "Guardar en /ls",
+            "extract_to_workspace": "Descomprimir en /ls",
         }
         if self.action_kind in mapping:
             return mapping[self.action_kind]
@@ -384,7 +408,11 @@ class QueueManager:
         usage = shutil.disk_usage(self.config.work_dir)
         reserve_bytes = int(self.config.disk_reserve_gb * (1024**3))
         max_bot_bytes = int(self.config.max_disk_gb * (1024**3))
-        used_by_bot = fast_dir_bytes(self.config.work_dir) + fast_dir_bytes(self.config.links_dir)
+        used_by_bot = (
+            fast_dir_bytes(self.config.work_dir)
+            + fast_dir_bytes(self.config.links_dir)
+            + fast_dir_bytes(self.config.workspace_dir)
+        )
         available_in_budget = max_bot_bytes - used_by_bot - reserve_bytes
         available_os = usage.free - reserve_bytes
         return max(0, min(available_in_budget, available_os))
@@ -667,7 +695,7 @@ class QueueManager:
                 return
 
             # 0b. Guardia de disco no bloqueante
-            already_cached = self.has_cached_source(job.session_id)
+            already_cached = self.has_cached_source(job.session_id) or (job.local_source_path is not None)
             light_tool = job.action_kind in {
                 "download_only",
                 "mediainfo",
@@ -676,10 +704,13 @@ class QueueManager:
                 "extract_opus",
                 "extract_mp3",
                 "split_parts",
+                "save_to_workspace",
+                "extract_to_workspace",
             }
             needs_merge = (
                 (job.action_kind in {"download_only", "split_parts"})
                 and bool(job.source_url)
+                and not job.is_torrent
                 and job.expect_video
             ) or (job.over_2gb_mode == "split" and not already_cached)
             ok_disk, disk_msg = await asyncio.to_thread(
@@ -694,16 +725,104 @@ class QueueManager:
                 await updater.update(f"⚠️ **Espacio insuficiente en disco**\n{disk_msg}", force=True)
                 return
 
-            # 1. Descarga de origen (o reutilización desde caché local)
+            # 0c. Flujo especial BitTorrent / Magnet P2P
+            if job.is_torrent:
+                await self._process_torrent_job(
+                    job=job,
+                    job_dir=job_dir,
+                    updater=updater,
+                    cancel_kb=cancel_kb,
+                    monitor=monitor,
+                    reg_proc=_reg_proc,
+                )
+                outcome = "Completado con avisos" if collector.has_issues else "Completado"
+                return
+
+            # 1. Descarga de origen (o reutilización desde caché/workspace local)
             job.phase = "Descargando"
             job.progress_pct = 0.0
             input_path = await self._download_source(job, job_dir, updater, cancel_kb)
-            monitor.add_watch_path(input_path.parent)
+            if job.local_source_path is None:
+                monitor.add_watch_path(input_path.parent)
 
             if job.cancel_event.is_set():
                 raise JobCancelledError("Trabajo cancelado.")
 
             input_size = input_path.stat().st_size
+
+            # ── Guardar o Descomprimir en Workspace (/ls) ─────────────────────
+            if job.action_kind == "save_to_workspace":
+                job.phase = "Guardando en /ls"
+                dest_path = self._unique_workspace_file(input_path.name)
+                if job.local_source_path is not None:
+                    await asyncio.to_thread(shutil.copy2, input_path, dest_path)
+                else:
+                    await asyncio.to_thread(shutil.move, str(input_path), str(dest_path))
+                metrics = await monitor.stop()
+                elapsed = time.time() - (job.started_at or time.time())
+                rel = dest_path.relative_to(self.config.workspace_dir.resolve()).as_posix()
+                ls_kb = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("📂 Abrir /ls", callback_data="ls:openroot")]]
+                )
+                await updater.update(
+                    f"📁 **Guardado en Workspace (`/ls`)**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Archivo:** `{dest_path.name[:60]}`\n"
+                    f"├ **Ruta:** `/ls` (`{rel[:60]}`)\n"
+                    f"├ **Peso:** `{human_bytes(dest_path.stat().st_size)}`\n"
+                    f"└ **Tiempo:** `{human_duration(elapsed)}`",
+                    reply_markup=ls_kb,
+                    force=True,
+                )
+                return
+
+            if job.action_kind == "extract_to_workspace":
+                job.phase = "Descomprimiendo"
+                await updater.update(
+                    f"📦 **Descomprimiendo Archivo**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Archivo:** `{input_path.name[:56]}`\n"
+                    f"└ **Peso:** `{human_bytes(input_size)}` · Extrayendo en `/ls`...",
+                    reply_markup=cancel_kb,
+                    force=True,
+                )
+                free_b = await asyncio.to_thread(self._effective_free_bytes)
+                extract_dest = unique_dest_dir(
+                    self.config.workspace_dir.resolve(),
+                    strip_archive_suffix(input_path.name),
+                )
+                try:
+                    ext_res = await extract_archive(
+                        archive_path=input_path,
+                        dest_dir=extract_dest,
+                        max_free_bytes=free_b,
+                        bin_dir=self.config.bin_dir,
+                        password=job.archive_password,
+                        cancel_event=job.cancel_event,
+                    )
+                except (ArchivePasswordRequiredError, ArchiveWrongPasswordError) as exc:
+                    raise RuntimeError(
+                        f"{exc} Abre `/ls` y usa `🔑 Con contraseña` sobre `{input_path.name[:40]}`."
+                    ) from exc
+
+                metrics = await monitor.stop()
+                elapsed = time.time() - (job.started_at or time.time())
+                rel_folder = ext_res.dest_dir.relative_to(self.config.workspace_dir.resolve()).as_posix()
+                vid_count = sum(1 for p in ext_res.extracted_files if is_video_file(p))
+                ls_kb = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("📂 Explorar en /ls", callback_data="ls:openroot")]]
+                )
+                await updater.update(
+                    f"✅ **Archivo Descomprimido en `/ls`**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Carpeta:** `{rel_folder[:60]}`\n"
+                    f"├ **Extraídos:** `{len(ext_res.extracted_files)}` archivos (`{vid_count}` videos)\n"
+                    f"├ **Tamaño total:** `{human_bytes(ext_res.total_bytes)}`\n"
+                    f"└ **Tiempo:** `{human_duration(elapsed)}` · Usa `/ls` para comprimir o enviar.",
+                    reply_markup=ls_kb,
+                    force=True,
+                )
+                return
 
             # ── Audio directo descargado por URL (yt-dlp -x) ──────────────────
             audio_exts = {".opus", ".mp3", ".m4a", ".ogg", ".oga", ".aac", ".flac", ".wav"}
@@ -878,7 +997,7 @@ class QueueManager:
                     updater=updater,
                     cancel_kb=cancel_kb,
                     reg_proc=_reg_proc,
-                    delete_source_after=(not job.keep_cached_source),
+                    delete_source_after=(not job.keep_cached_source and job.local_source_path is None),
                     metrics=metrics,
                     record_stats=False,
                 )
@@ -1302,7 +1421,14 @@ class QueueManager:
             )
             return
 
-        can_split = await asyncio.to_thread(self.can_split_for_bytes, output_size, True)
+        is_splittable_video = (
+            out_media.width > 0 and out_media.height > 0 and out_media.duration > 0
+        )
+        can_split = (
+            await asyncio.to_thread(self.can_split_for_bytes, output_size, True)
+            if is_splittable_video
+            else False
+        )
 
         if job.over_2gb_mode == "split" and can_split:
             await self._deliver_split_parts(
@@ -1317,7 +1443,10 @@ class QueueManager:
                 updater=updater,
                 cancel_kb=cancel_kb,
                 reg_proc=reg_proc or (lambda _p: None),
-                delete_source_after=(not job.keep_cached_source or output_path.parent != (self.config.work_dir / "_cache" / (job.session_id or ""))),
+                delete_source_after=(
+                    job.local_source_path is None
+                    and (not job.keep_cached_source or output_path.parent != (self.config.work_dir / "_cache" / (job.session_id or "")))
+                ),
                 metrics=metrics,
                 encode_notes=encode_notes,
                 record_stats=record_stats,
@@ -1330,8 +1459,11 @@ class QueueManager:
             pending_dir.mkdir(parents=True, exist_ok=True)
             staged_path = pending_dir / output_path.name
             is_shared_cache = bool(
-                job.session_id
-                and str(output_path.resolve()).startswith(str((self.config.work_dir / "_cache").resolve()))
+                job.local_source_path is not None
+                or (
+                    job.session_id
+                    and str(output_path.resolve()).startswith(str((self.config.work_dir / "_cache").resolve()))
+                )
             )
             if is_shared_cache:
                 await asyncio.to_thread(shutil.copy2, output_path, staged_path)
@@ -1636,6 +1768,220 @@ class QueueManager:
         if record_stats:
             await self.db.record_job_completion(input_size, output_size, delivered_via_link=False)
 
+    def _unique_workspace_file(self, filename: str) -> Path:
+        root = self.config.workspace_dir.resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        clean = "".join(c if c.isalnum() or c in " -_.()[]" else "_" for c in (filename or "archivo.bin")).strip(" .") or "archivo.bin"
+        candidate = root / clean[:100]
+        if not candidate.exists():
+            return candidate
+        stem = candidate.stem[:84]
+        suffix = candidate.suffix
+        for idx in range(1, 100):
+            alt = root / f"{stem}_{idx}{suffix}"
+            if not alt.exists():
+                return alt
+        return root / f"{stem}_{secrets.token_hex(3)}{suffix}"
+
+    async def _process_torrent_job(
+        self,
+        job: CompressionJob,
+        job_dir: Path,
+        updater: ProgressUpdater,
+        cancel_kb: Any,
+        monitor: JobResourceMonitor,
+        reg_proc: Callable[[asyncio.subprocess.Process | None], None],
+    ) -> None:
+        bt_source: str | Path
+        in_dir = job_dir / "in"
+        in_dir.mkdir(parents=True, exist_ok=True)
+
+        if job.source_message is not None:
+            job.phase = "Descargando .torrent"
+            bt_source = await fast_download_media(
+                client=self.client,
+                message=job.source_message,
+                dest_path=in_dir / (Path(job.filename).name or "source.torrent"),
+                cancel_event=job.cancel_event,
+                workers=self.config.fast_transfer_workers,
+            )
+        elif job.source_url and not is_magnet_link(job.source_url):
+            job.phase = "Descargando .torrent"
+            bt_source = await download_from_url(
+                url=job.source_url,
+                dest_dir=in_dir,
+                max_allowed_bytes=32 * 1024 * 1024,
+                cancel_event=job.cancel_event,
+                gofile_token=self.config.gofile_token,
+                expect_video=False,
+                pre_resolved_host=job.resolved_host,
+            )
+        else:
+            bt_source = job.source_url or ""
+
+        torrent_out = job_dir / "bt_data"
+        monitor.add_watch_path(torrent_out)
+        dl_start = time.monotonic()
+
+        async def _bt_stage(stage: str, name: str, total_b: int) -> None:
+            if stage == "metadata":
+                job.phase = "Metadatos P2P"
+                await updater.update(
+                    f"🧲 **Conectando a Red P2P (Magnet)**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Nombre:** `{name[:56]}`\n"
+                    f"└ Buscando pares y metadatos...",
+                    reply_markup=cancel_kb,
+                    force=True,
+                )
+            elif stage == "downloading":
+                job.phase = "Descargando Torrent"
+                await updater.update(
+                    f"🧲 **Descargando Torrent**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Nombre:** `{name[:56]}`\n"
+                    f"└ **Tamaño:** `{human_bytes(total_b) if total_b else 'Desconocido'}`",
+                    reply_markup=cancel_kb,
+                    force=True,
+                )
+
+        async def _bt_progress(done: int, wanted: int, rate: float, peers: int, seeds: int) -> None:
+            pct = (done / wanted * 100.0) if wanted > 0 else 0.0
+            job.progress_pct = pct
+            job.progress_detail = f"{human_bytes(rate)}/s · P:{peers}/S:{seeds}"
+            eta = ((wanted - done) / max(rate, 1.0)) if wanted > done and rate > 0 else 0.0
+            await updater.update(
+                f"🧲 **Descargando Torrent**\n"
+                f"`{progress_bar(pct)}`\n"
+                f"├ **Progreso:** `{human_bytes(done)}` / `{human_bytes(wanted) if wanted else '?'}`\n"
+                f"├ **Velocidad:** `{human_bytes(rate)}/s` · **ETA:** `{human_duration(eta)}`\n"
+                f"└ **Pares:** `{peers}` · **Semillas:** `{seeds}`",
+                reply_markup=cancel_kb,
+            )
+
+        res: TorrentDownloadResult = await download_torrent_or_magnet(
+            source=bt_source,
+            dest_dir=torrent_out,
+            get_free_bytes=self._effective_free_bytes,
+            cancel_event=job.cancel_event,
+            on_progress=_bt_progress,
+            on_stage=_bt_stage,
+        )
+
+        elapsed_total = time.time() - (job.started_at or time.time())
+        metrics = await monitor.stop()
+
+        if len(res.files) > 1:
+            if len(res.files) > 6:
+                ws_folder = unique_dest_dir(self.config.workspace_dir.resolve(), res.name)
+                await asyncio.to_thread(shutil.move, str(res.root_dir), str(ws_folder))
+                rel = ws_folder.relative_to(self.config.workspace_dir.resolve()).as_posix()
+                ls_kb = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("📂 Explorar en /ls", callback_data="ls:openroot")]]
+                )
+                await updater.update(
+                    f"🧲 **Torrent Multi-Archivo Guardado en `/ls`**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Carpeta:** `{rel[:60]}`\n"
+                    f"├ **Archivos:** `{len(res.files)}` (`{human_bytes(res.total_bytes)}`)\n"
+                    f"└ **Tiempo:** `{human_duration(elapsed_total)}` · Usa `/ls` para descomprimir, comprimir o enviar.",
+                    reply_markup=ls_kb,
+                    force=True,
+                )
+                return
+
+            total_f = len(res.files)
+            for idx, fpath in enumerate(res.files, start=1):
+                if job.cancel_event.is_set():
+                    raise JobCancelledError("Trabajo cancelado.")
+                fsize = fpath.stat().st_size
+                try:
+                    fmedia = await probe_media(fpath)
+                except Exception:
+                    fmedia = MediaInfo(
+                        path=fpath,
+                        file_size=fsize,
+                        duration=0.0,
+                        width=0,
+                        height=0,
+                        video_codec="",
+                        fps=0.0,
+                        bitrate_kbps=0,
+                    )
+                job.options.send_as_document = True
+                summary_i = (
+                    f"🧲 **Torrent ({idx}/{total_f})**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Archivo:** `{fpath.name[:68]}`\n"
+                    f"├ **Peso:** `{human_bytes(fsize)}`\n"
+                    f"└ **Torrent:** `{res.name[:56]}`"
+                )
+                await self._deliver_output(
+                    job=job,
+                    job_dir=job_dir / f"bt_part_{idx}",
+                    output_path=fpath,
+                    input_size=fsize,
+                    output_size=fsize,
+                    out_media=fmedia,
+                    reduction_pct=0.0,
+                    elapsed_total=elapsed_total,
+                    updater=updater,
+                    cancel_kb=cancel_kb,
+                    metrics=metrics,
+                    custom_summary=summary_i,
+                    record_stats=False,
+                    reg_proc=reg_proc,
+                )
+            return
+
+        single_file = res.files[0]
+        single_size = single_file.stat().st_size
+        try:
+            media = await probe_media(single_file)
+        except Exception:
+            media = MediaInfo(
+                path=single_file,
+                file_size=single_size,
+                duration=0.0,
+                width=0,
+                height=0,
+                video_codec="",
+                fps=0.0,
+                bitrate_kbps=0,
+            )
+        job.options.send_as_document = True
+        is_vid = media.width > 0 and media.height > 0 and single_file.suffix.lower() in {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"}
+        media_line = (
+            f"├ **Video:** `{media.width}×{media.height}` · `{media.video_codec.upper()}` · `{human_duration(media.duration)}` (`Documento`)\n"
+            if is_vid
+            else "├ **Tipo:** `Archivo Torrent (Documento)`\n"
+        )
+        bt_summary = (
+            f"🧲 **Leech Torrent Completado**\n"
+            f"`{DIVIDER}`\n"
+            f"├ **Archivo:** `{single_file.name[:72]}`\n"
+            f"├ **Peso:** `{human_bytes(single_size)}`\n"
+            f"{media_line}"
+            f"├ **Consumo pico:** RAM `{human_bytes(metrics.peak_ram_bytes)}` · CPU `{metrics.peak_cpu_pct:.0f}%` · Disco `{human_bytes(metrics.peak_disk_bytes)}`\n"
+            f"└ **Tiempo total:** `{human_duration(elapsed_total)}`"
+        )
+        await self._deliver_output(
+            job=job,
+            job_dir=job_dir,
+            output_path=single_file,
+            input_size=single_size,
+            output_size=single_size,
+            out_media=media,
+            reduction_pct=0.0,
+            elapsed_total=elapsed_total,
+            updater=updater,
+            cancel_kb=cancel_kb,
+            metrics=metrics,
+            custom_summary=bt_summary,
+            record_stats=False,
+            reg_proc=reg_proc,
+        )
+
     async def _download_source(
         self,
         job: CompressionJob,
@@ -1643,6 +1989,11 @@ class QueueManager:
         updater: ProgressUpdater,
         cancel_kb: Any,
     ) -> Path:
+        if job.local_source_path is not None:
+            if not job.local_source_path.exists():
+                raise RuntimeError(f"El archivo `{job.local_source_path.name}` ya no existe en /ls.")
+            return job.local_source_path
+
         # Extracción directa de audio desde URL sin caché previo: bajar solo audio sin contaminar caché de video
         if (
             job.action_kind in {"extract_opus", "extract_mp3"}
@@ -1762,12 +2113,13 @@ class QueueManager:
                 max_height=job.download_max_height,
                 gofile_token=self.config.gofile_token,
                 max_ytdlp_bytes=max_allow_merge,
-                expect_video=False if audio_only_fmt else (job.expect_video or (job.action_kind != "download_only")),
+                expect_video=False if audio_only_fmt else (job.expect_video or (job.action_kind not in {"download_only", "save_to_workspace", "extract_to_workspace"})),
                 on_stage=_dl_stage,
                 audio_lang=job.audio_lang,
                 embed_subs=job.embed_subs and job.action_kind == "download_only",
                 sub_langs=job.sub_langs,
                 audio_only_format=audio_only_fmt,
+                pre_resolved_host=job.resolved_host,
             )
 
         assert job.source_message is not None
@@ -1964,21 +2316,24 @@ class QueueManager:
             on_progress=_link_progress,
         )
 
-        recomp_token = secrets.token_hex(6)
-        recomp_opts = job.options.clone()
-        recomp_opts.target_mb = 1900.0
-        recomp_opts.sample_duration = None
-        self._recompress_sources[recomp_token] = RecompressSource(
-            token=recomp_token,
-            user_id=job.user_id,
-            chat_id=job.chat_id,
-            source_chat_id=job.source_message.chat.id if job.source_message else None,
-            source_message_id=job.source_message.id if job.source_message else None,
-            source_url=job.source_url,
-            filename=job.filename,
-            base_options=recomp_opts,
-            user_label=job.user_label,
-        )
+        is_video_out = out_media.width > 0 and out_media.height > 0 and out_media.duration > 0
+        recomp_token = ""
+        if is_video_out:
+            recomp_token = secrets.token_hex(6)
+            recomp_opts = job.options.clone()
+            recomp_opts.target_mb = 1900.0
+            recomp_opts.sample_duration = None
+            self._recompress_sources[recomp_token] = RecompressSource(
+                token=recomp_token,
+                user_id=job.user_id,
+                chat_id=job.chat_id,
+                source_chat_id=job.source_message.chat.id if job.source_message else None,
+                source_message_id=job.source_message.id if job.source_message else None,
+                source_url=job.source_url,
+                filename=job.filename,
+                base_options=recomp_opts,
+                user_label=job.user_label,
+            )
 
         sign = "-" if reduction_pct >= 0 else "+"
         notes_line = (
@@ -1991,12 +2346,23 @@ class QueueManager:
             if metrics is not None
             else ""
         )
+        weight_line = (
+            f"├ **Peso:** `{human_bytes(output_size)}`\n"
+            if input_size == output_size
+            else f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
+        )
+        media_line = (
+            f"├ **Video:** `{out_media.width}×{out_media.height}` · `{job.options.codec_display_label()}` · `{human_duration(out_media.duration)}`\n"
+            if is_video_out
+            else "├ **Tipo:** `Archivo directo (>2 GB)`\n"
+        )
+        title_str = "🔗 **Video Listo (Enlace >2 GB)**" if is_video_out else "🔗 **Archivo Listo (Enlace >2 GB)**"
         text = (
-            f"🔗 **Video Listo (Enlace >2 GB)**\n"
+            f"{title_str}\n"
             f"`{DIVIDER}`\n"
             f"├ **Archivo:** `{output_path.name[:64]}`\n"
-            f"├ **Peso:** `{human_bytes(input_size)}` → `{human_bytes(output_size)}` (`{sign}{abs(reduction_pct):.1f}%`)\n"
-            f"├ **Video:** `{out_media.width}×{out_media.height}` · `{job.options.codec_display_label()}` · `{human_duration(out_media.duration)}`\n"
+            f"{weight_line}"
+            f"{media_line}"
             f"├ **Proveedor:** `{result.provider}`\n"
             f"{notes_line}"
             f"{usage_line}"
@@ -2005,9 +2371,13 @@ class QueueManager:
             f"ℹ️ *{result.expires_note}*"
         )
 
-        await self.db.record_job_completion(input_size, output_size, delivered_via_link=True)
+        if is_video_out:
+            await self.db.record_job_completion(input_size, output_size, delivered_via_link=True)
+            kb = build_large_file_link_keyboard(result.url, recomp_token)
+        else:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬇ Descargar Archivo (>2 GB)", url=result.url)]])
         await updater.update(
             text,
-            reply_markup=build_large_file_link_keyboard(result.url, recomp_token),
+            reply_markup=kb,
             force=True,
         )

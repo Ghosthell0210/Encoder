@@ -10,6 +10,7 @@ import startSh from '../../telegram-bot/start.sh?raw';
 import readmeMd from '../../telegram-bot/README.md?raw';
 
 import coreInitPy from '../../telegram-bot/core/__init__.py?raw';
+import archiveToolsPy from '../../telegram-bot/core/archive_tools.py?raw';
 import consoleCommandsPy from '../../telegram-bot/core/console_commands.py?raw';
 import databasePy from '../../telegram-bot/core/database.py?raw';
 import fastTransferPy from '../../telegram-bot/core/fast_transfer.py?raw';
@@ -21,6 +22,7 @@ import mediaProbePy from '../../telegram-bot/core/media_probe.py?raw';
 import mediaToolsPy from '../../telegram-bot/core/media_tools.py?raw';
 import ffmpegEnginePy from '../../telegram-bot/core/ffmpeg_engine.py?raw';
 import hostExtractorsPy from '../../telegram-bot/core/host_extractors.py?raw';
+import torrentDownloaderPy from '../../telegram-bot/core/torrent_downloader.py?raw';
 import uploaderPy from '../../telegram-bot/core/uploader.py?raw';
 import userSessionPy from '../../telegram-bot/core/user_session.py?raw';
 import uiHelpersPy from '../../telegram-bot/core/ui_helpers.py?raw';
@@ -204,15 +206,27 @@ export const BOT_FILES: BotFileItem[] = [
     resourceMonitorPy,
   ),
   makeFile(
+    'core/archive_tools.py',
+    'core/',
+    'Explorador seguro /ls y extractor rootless (.zip, .rar, .7z, .tar.*) con 7zz estático y protección anti-zip-bomb',
+    archiveToolsPy,
+  ),
+  makeFile(
     'core/host_extractors.py',
     'core/',
-    'Extractores nativos MediaFire, Pixeldrain, GoFile, Buzzheavier y Google Drive con bypass TLS curl-cffi',
+    'Extractores nativos MediaFire, Pixeldrain, GoFile, Buzzheavier, Google Drive, Dropbox, Krakenfiles, 1Fichier, Qiwi y Bunkr',
     hostExtractorsPy,
+  ),
+  makeFile(
+    'core/torrent_downloader.py',
+    'core/',
+    'Descargador directo de enlaces magnet:? y archivos .torrent sin seeding (libtorrent) con chequeo de espacio',
+    torrentDownloaderPy,
   ),
   makeFile(
     'core/uploader.py',
     'core/',
-    'Descarga universal (hosts nativos, yt-dlp con impersonación TLS y HTTP streaming) y subida >2 GB',
+    'Descarga universal (hosts nativos, yt-dlp TLS, torrents/magnets y HTTP streaming) y subida >2 GB',
     uploaderPy,
   ),
   makeFile(

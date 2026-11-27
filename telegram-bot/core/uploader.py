@@ -39,6 +39,7 @@ from core.ffmpeg_engine import JobCancelledError
 from core.host_extractors import (
     CHROME_UA,
     HostExtractionError,
+    ResolvedHostDownload,
     identify_file_host,
     resolve_host_download,
 )
@@ -88,6 +89,9 @@ class UrlProbeInfo:
     audio_languages: list[UrlAudioOption] = field(default_factory=list)
     has_subtitles: bool = False
     subtitle_langs: list[str] = field(default_factory=list)
+    resolved_host: ResolvedHostDownload | None = None
+    content_type: str = ""
+    is_non_video: bool = False
 
 
 @dataclass(slots=True)
@@ -221,10 +225,58 @@ def _extract_filename_from_response(
 
 
 _DIRECT_MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".3gp"}
+_DIRECT_NON_VIDEO_EXTS = {
+    ".rar",
+    ".zip",
+    ".7z",
+    ".tar",
+    ".gz",
+    ".tgz",
+    ".bz2",
+    ".tbz2",
+    ".xz",
+    ".txz",
+    ".pdf",
+    ".iso",
+    ".apk",
+    ".exe",
+    ".msi",
+    ".dmg",
+    ".bin",
+    ".epub",
+    ".cbz",
+    ".cbr",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".mp3",
+    ".opus",
+    ".m4a",
+    ".ogg",
+    ".flac",
+    ".wav",
+    ".aac",
+    ".torrent",
+}
+_DIRECT_ALL_EXTS = _DIRECT_MEDIA_EXTS | _DIRECT_NON_VIDEO_EXTS
 _YTDLP_PROGRESS_RE = re.compile(
     r"\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?\s*([\d.]+)\s*([KMG]i?B)",
     re.IGNORECASE,
 )
+
+
+def is_non_video_filename(filename: str) -> bool:
+    """Devuelve True si el nombre corresponde claramente a un archivo no-video."""
+    low = (filename or "").lower()
+    if low.endswith((".tar.gz", ".tar.bz2", ".tar.xz")):
+        return True
+    ext = Path(low).suffix
+    if not ext:
+        return False
+    return ext not in _DIRECT_MEDIA_EXTS
 
 
 def _size_to_bytes(val: float, unit: str) -> int:
@@ -292,8 +344,8 @@ async def _validate_external_url(url: str) -> str:
     return clean
 
 
-async def _probe_direct_head(url: str) -> tuple[bool, int | None, str]:
-    """Detecta si el enlace apunta directo a un video HTTP y extrae Content-Length/nombre."""
+async def _probe_direct_head(url: str) -> tuple[bool, int | None, str, str]:
+    """Detecta si el enlace apunta directo a un archivo HTTP y extrae Content-Length/nombre/Content-Type."""
     path = unquote(urlparse(url).path)
     path_name = Path(path).name or "video_enlace.mp4"
     path_ext = Path(path).suffix.lower()
@@ -304,15 +356,15 @@ async def _probe_direct_head(url: str) -> tuple[bool, int | None, str]:
             async with session.head(url, allow_redirects=True) as resp:
                 await _validate_external_url(str(resp.url))
                 if resp.status >= 400:
-                    return (path_ext in _DIRECT_MEDIA_EXTS), None, path_name
+                    return (path_ext in _DIRECT_ALL_EXTS), None, path_name, ""
                 ctype = (resp.headers.get("Content-Type") or "").lower()
                 cd = (resp.headers.get("Content-Disposition") or "").lower()
                 cl_raw = resp.headers.get("Content-Length")
                 cl_val = int(cl_raw) if cl_raw and cl_raw.isdigit() and int(cl_raw) > 0 else None
                 fname = _extract_filename_from_response(str(resp.url), resp.headers)
                 is_direct = (
-                    path_ext in _DIRECT_MEDIA_EXTS
-                    or ctype.startswith(("video/", "audio/", "application/x-matroska"))
+                    path_ext in _DIRECT_ALL_EXTS
+                    or ctype.startswith(("video/", "audio/", "application/x-matroska", "application/x-bittorrent"))
                     or ("attachment" in cd and not ctype.startswith("text/"))
                     or (
                         not ctype.startswith("text/")
@@ -321,23 +373,27 @@ async def _probe_direct_head(url: str) -> tuple[bool, int | None, str]:
                                 "application/octet-stream",
                                 "application/zip",
                                 "application/x-rar",
+                                "application/vnd.rar",
                                 "application/x-7z-compressed",
+                                "application/x-tar",
+                                "application/gzip",
                                 "application/pdf",
+                                "application/vnd.android.package-archive",
                             )
                         )
-                        and (cl_val is not None and cl_val > 65536 or "attachment" in cd or "." in Path(fname).name)
+                        and (cl_val is not None and cl_val > 8192 or "attachment" in cd or "." in Path(fname).name)
                     )
                 )
-                return is_direct, cl_val, fname
+                return is_direct, cl_val, fname, ctype
     except RuntimeError:
         raise
     except Exception:
-        return (path_ext in _DIRECT_MEDIA_EXTS), None, path_name
+        return (path_ext in _DIRECT_ALL_EXTS), None, path_name, ""
 
 
 async def _probe_direct_media(url: str) -> bool:
-    """Detecta rápidamente si el enlace apunta directo a un archivo de video descargable por HTTP."""
-    is_direct, _, _ = await _probe_direct_head(url)
+    """Detecta rápidamente si el enlace apunta directo a un archivo descargable por HTTP."""
+    is_direct, _, _, _ = await _probe_direct_head(url)
     return is_direct
 
 
@@ -510,9 +566,11 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
                 is_direct=True,
                 direct_bytes=resolved.file_size,
                 formats=[],
+                resolved_host=resolved,
+                is_non_video=is_non_video_filename(clean_name),
             )
 
-    is_direct, direct_bytes, direct_name = await _probe_direct_head(safe_url)
+    is_direct, direct_bytes, direct_name, ctype = await _probe_direct_head(safe_url)
     if is_direct:
         clean_name = "".join(
             c if c.isalnum() or c in " -_.()[]" else "_" for c in direct_name
@@ -527,6 +585,8 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
             is_direct=True,
             direct_bytes=direct_bytes,
             formats=[],
+            content_type=ctype,
+            is_non_video=is_non_video_filename(clean_name),
         )
 
     base_cmd = await asyncio.to_thread(ensure_ytdlp, Path("bin"))
@@ -751,17 +811,28 @@ async def probe_url_info(url: str, gofile_token: str = "") -> UrlProbeInfo:
     )
 
 
-def _check_unexpected_html_stream(ctype: str, first_chunk: bytes) -> None:
+def _check_unexpected_html_stream(ctype: str, first_chunk: bytes, final_url: str = "") -> None:
     if "text/html" not in ctype:
         return
     preview = first_chunk[:4096].decode("utf-8", errors="replace").lower()
+    is_mf_direct = bool(re.search(r"download\d*\.mediafire\.com", final_url, re.IGNORECASE))
     if any(m in preview for m in ("cf-turnstile", "challenges.cloudflare.com", "just a moment", "captcha")):
+        if is_mf_direct:
+            raise HostExtractionError(
+                "El enlace temporal 'downloadXXXX.mediafire.com' está atado a otra IP, expiró o activó Cloudflare. "
+                "Envía el enlace normal de la ficha (https://www.mediafire.com/file/...)."
+            )
         raise HostExtractionError(
             "El servidor activó un desafío JavaScript / Captcha de Cloudflare que no puede "
             "resolverse automáticamente; genera un enlace directo o usa otro servidor."
         )
     if "password" in preview or "contraseña" in preview:
         raise HostExtractionError("El servidor solicita contraseña para descargar este archivo.")
+    if is_mf_direct:
+        raise HostExtractionError(
+            "El enlace temporal 'downloadXXXX.mediafire.com' devolvió HTML (caducado o bloqueado por IP). "
+            "Envía el enlace normal de la página (https://www.mediafire.com/file/...)."
+        )
     raise HostExtractionError(
         "El servidor devolvió una página HTML en lugar del archivo (posible enlace expirado, cuota o bloqueo anti-bot)."
     )
@@ -788,7 +859,8 @@ async def _stream_with_curl_cffi(
             cookies=cookies or None,
             allow_redirects=True,
         ) as resp:
-            await _validate_external_url(str(resp.url))
+            final_url = str(resp.url)
+            await _validate_external_url(final_url)
             if resp.status_code >= 400:
                 if resp.status_code in {403, 503}:
                     raise HostExtractionError(
@@ -805,7 +877,7 @@ async def _stream_with_curl_cffi(
 
             ctype = (resp.headers.get("Content-Type") or "").lower()
             filename = _extract_filename_from_response(
-                str(resp.url), resp.headers, fallback_name=forced_filename
+                final_url, resp.headers, fallback_name=forced_filename
             )
             dest_path = (dest_root / filename).resolve()
             if not str(dest_path).startswith(str(dest_root) + os.sep):
@@ -823,7 +895,7 @@ async def _stream_with_curl_cffi(
                             continue
                         if not first_checked:
                             first_checked = True
-                            _check_unexpected_html_stream(ctype, chunk)
+                            _check_unexpected_html_stream(ctype, chunk, final_url=final_url)
                         fp.write(chunk)
                         downloaded += len(chunk)
                         if downloaded > max_allowed_bytes:
@@ -920,7 +992,7 @@ async def _download_http_direct(
                                 continue
                             if not first_checked:
                                 first_checked = True
-                                _check_unexpected_html_stream(ctype, chunk)
+                                _check_unexpected_html_stream(ctype, chunk, final_url=str(resp.url))
                             fp.write(chunk)
                             downloaded += len(chunk)
                             if downloaded > max_allowed_bytes:
@@ -1355,12 +1427,37 @@ async def download_from_url(
     embed_subs: bool = False,
     sub_langs: str | None = None,
     audio_only_format: Literal["opus", "mp3"] | None = None,
+    pre_resolved_host: ResolvedHostDownload | None = None,
 ) -> Path:
     """Descarga un archivo/video desde servidor nativo, HTTP directo o yt-dlp."""
     safe_url = await _validate_external_url(url)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     if identify_file_host(safe_url) is not None:
+        fresh_enough = (
+            pre_resolved_host is not None
+            and (time.time() - pre_resolved_host.resolved_at) <= 180.0
+        )
+        if fresh_enough and pre_resolved_host is not None:
+            try:
+                return await _download_http_direct(
+                    url=pre_resolved_host.direct_url,
+                    dest_dir=dest_dir,
+                    max_allowed_bytes=max_allowed_bytes,
+                    cancel_event=cancel_event,
+                    on_progress=on_progress,
+                    headers=pre_resolved_host.headers,
+                    cookies=pre_resolved_host.cookies,
+                    prefer_curl_cffi=pre_resolved_host.use_curl_cffi,
+                    forced_filename=pre_resolved_host.filename,
+                )
+            except (HostExtractionError, RuntimeError) as exc:
+                age = time.time() - pre_resolved_host.resolved_at
+                # Solo re-resolver si la caché tiene >15s (evitar doble golpe inmediato ante un bloqueo definitivo)
+                if age < 15.0 or isinstance(exc, JobCancelledError):
+                    raise
+                logger.info("Resolución previa expiró (%.0fs), re-resolviendo enlace: %s", age, exc)
+
         resolved = await resolve_host_download(
             safe_url,
             _validate_external_url,

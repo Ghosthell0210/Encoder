@@ -17,19 +17,30 @@ from typing import Literal
 from urllib.parse import urlparse
 
 from hydrogram import Client, filters
-from hydrogram.types import CallbackQuery, Message, User
+from hydrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
 
 from config import BotConfig
+from core.archive_tools import (
+    WorkspaceEntry,
+    is_archive_file,
+    list_workspace_dir,
+    resolve_workspace_path,
+)
 from core.database import Database
 from core.ffmpeg_engine import CompressionOptions, parse_timestamp
-from core.media_probe import MediaInfo
+from core.host_extractors import HostExtractionError, ResolvedHostDownload, identify_file_host
+from core.media_probe import MediaInfo, probe_media
 from core.queue_manager import ActionKind, ActiveSessionInfo, CompressionJob, QueueManager
+from core.torrent_downloader import is_magnet_link, is_torrent_url
 from core.ui_helpers import (
     DIVIDER,
     build_advanced_keyboard,
+    build_archive_action_keyboard,
     build_back_home_keyboard,
     build_extras_keyboard,
     build_job_cancel_keyboard,
+    build_ls_item_keyboard,
+    build_ls_keyboard,
     build_main_config_keyboard,
     build_presets_keyboard,
     build_start_keyboard,
@@ -42,15 +53,14 @@ from core.ui_helpers import (
     human_bytes,
     human_duration,
 )
-from core.host_extractors import HostExtractionError
-from core.uploader import UrlProbeInfo, probe_url_info
+from core.uploader import UrlProbeInfo, is_non_video_filename, probe_url_info
 from core.user_session import UserSessionManager
 
 logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".flv", ".ts", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
-URL_REGEX = re.compile(r"^https?://\S+$", re.IGNORECASE)
+URL_REGEX = re.compile(r"^(?:https?://\S+|magnet:\?xt=urn:[a-z0-9]+:[a-z0-9]{16,}\S*)$", re.IGNORECASE)
 VALID_TOOL_KINDS: set[str] = {
     "mediainfo",
     "split_parts",
@@ -78,6 +88,7 @@ class DraftSession:
     options: CompressionOptions
     source_message: Message | None = None
     source_url: str | None = None
+    local_source_path: Path | None = None
     url_info: UrlProbeInfo | None = None
     download_max_height: int | None = None
     selected_audio_lang: str | None = None
@@ -85,6 +96,33 @@ class DraftSession:
     over_2gb_mode: Literal["auto", "link", "split"] = "auto"
     url_menu_return_to: str = "main"
     media: MediaInfo | None = None
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass(slots=True)
+class ArchiveDraft:
+    token: str
+    user_id: int
+    user_label: str
+    chat_id: int
+    filename: str
+    file_size: int
+    source_message: Message | None = None
+    source_url: str | None = None
+    resolved_host: ResolvedHostDownload | None = None
+    prompt_message: Message | None = None
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass(slots=True)
+class LsViewState:
+    token: str
+    user_id: int
+    chat_id: int
+    rel_path: str
+    entries: list[WorkspaceEntry]
+    page: int = 0
+    message: Message | None = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -114,6 +152,25 @@ def _is_subtitle_document(message: Message) -> bool:
         return False
     name = (doc.file_name or "").lower()
     return Path(name).suffix in SUBTITLE_EXTENSIONS
+
+
+def _is_torrent_document(message: Message) -> bool:
+    doc = message.document
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    name = (doc.file_name or "").lower()
+    return mime == "application/x-bittorrent" or name.endswith(".torrent")
+
+
+def _is_archive_document(message: Message) -> bool:
+    doc = message.document
+    if not doc:
+        return False
+    name = doc.file_name or ""
+    if not name:
+        return False
+    return is_archive_file(Path(name))
 
 
 def _extract_video_meta(message: Message) -> tuple[str, int | None, float | None, int | None, int | None] | None:
@@ -160,7 +217,9 @@ def register_user_handlers(
     user_session: UserSessionManager,
 ) -> None:
     sessions: dict[str, DraftSession] = {}
-    # user_id -> (session_id, mode)
+    archive_drafts: dict[str, ArchiveDraft] = {}
+    ls_views: dict[str, LsViewState] = {}
+    # user_id -> (session_or_token, mode)
     awaiting_input: dict[int, tuple[str, str]] = {}
 
     def _cleanup_old_sessions() -> None:
@@ -169,6 +228,10 @@ def register_user_handlers(
         for sid in expired:
             sessions.pop(sid, None)
             queue_mgr.release_session_cache(sid)
+        for tok in [k for k, d in archive_drafts.items() if now - d.created_at > 3600]:
+            archive_drafts.pop(tok, None)
+        for tok in [k for k, v in ls_views.items() if now - v.created_at > 7200]:
+            ls_views.pop(tok, None)
 
     def _export_open_sessions() -> list[ActiveSessionInfo]:
         _cleanup_old_sessions()
@@ -246,12 +309,19 @@ def register_user_handlers(
             "",
             "🎬 **Compresión, Leech y Herramientas**",
             "├ `/start` — Menú principal interactivo",
-            "├ `/leech [url]` — Bajar enlace/archivo sin comprimir o activar **Modo Leech**",
+            "├ `/leech [url|magnet]` — Bajar sin comprimir (o activar **Modo Leech**)",
+            "├ `/ls [carpeta]` — Explorar archivos del servidor, **descomprimir** (`.rar`/`.zip`/`.7z`/`.tar`), comprimir o enviar",
+            "├ `/extract [url] [clave]` — Descargar y descomprimir directo en `/ls` (o responde a un `.rar`/`.zip`)",
             "├ `/auto` — Activar/desactivar **Modo Lotes** automático",
             "├ `/mediainfo` — Ficha técnica completa (responde a un video)",
             "├ `/ss` — Cuadrícula 3×3 de capturas (responde a un video)",
             "├ `/queue` — Ver cola y trabajos activos",
             "└ `/stats` — Total comprimido y espacio ahorrado",
+            "",
+            "🌐 **Fuentes soportadas en enlaces**",
+            "├ **Servidores:** MediaFire, Pixeldrain, GoFile, Buzzheavier, Google Drive, Dropbox, Krakenfiles, 1Fichier, Qiwi, Bunkr",
+            "├ **Redes/Video (`yt-dlp`):** YouTube, Twitch, TikTok, Instagram, X, Facebook, Vimeo, etc.",
+            "└ **P2P y Directos:** `magnet:?`, archivos/URLs `.torrent`, enlaces HTTP directos (`.mp4`, `.rar`, `.zip`, `.pdf`)",
             "",
             "🎨 **Personalización**",
             "├ `/setthumb` — Fijar miniatura (responde a una foto)",
@@ -271,14 +341,14 @@ def register_user_handlers(
                     "├ `/logs [n|errors|file]` — Ver o bajar `bot.log`",
                     "├ `/update` — Actualizar desde GitHub y reiniciar",
                     "├ `/users` · `/adduser <id>` · `/deluser <id>`",
-                    "├ `/purge` · `/cancelall` — Limpiar / detener cola",
+                    "├ `/purge` · `/cancelall` — Limpiar temporales / detener cola",
                     "└ `/login` · `/logout` · `/setdump <id>`",
                 ]
             )
         lines.extend(
             [
                 "",
-                "💡 *En cada video tienes **AV1 (Rápido / Equilibrado / Máx)**, **Audio Opus**, **FPS**, **Metadatos**, **Remux MKV↔MP4**, **Extraer Audio**, **Screenshots** y **Muestra 15s** con caché compartido.*",
+                "💡 *En cada video tienes **AV1 / H.265 / H.264**, **Audio Opus**, **FPS**, **Metadatos**, **Remux MKV↔MP4**, **Extraer Audio**, **Screenshots** y **Muestra 15s** con caché compartido.*",
             ]
         )
         return "\n".join(lines)
@@ -400,7 +470,8 @@ def register_user_handlers(
         filename: str,
         file_size: int | None,
         opts: CompressionOptions,
-        source_url: str,
+        source_url: str | None = None,
+        source_message: Message | None = None,
         download_max_height: int | None = None,
         status_message: Message | None = None,
         expect_video: bool = False,
@@ -409,10 +480,12 @@ def register_user_handlers(
         sub_langs: str | None = None,
         source_is_direct: bool = False,
         over_2gb_mode: Literal["auto", "link", "split"] = "auto",
+        resolved_host: ResolvedHostDownload | None = None,
+        is_torrent: bool = False,
     ) -> None:
         job_id = secrets.token_hex(4)
         status_msg = status_message or await message.reply_text(
-            f"⬇️ **Leech · Encolando `{job_id}`...**",
+            f"{'🧲 **Torrent' if is_torrent else '⬇️ **Leech'} · Encolando `{job_id}`...**",
             quote=True,
         )
         job = CompressionJob(
@@ -423,6 +496,7 @@ def register_user_handlers(
             status_message=status_msg,
             filename=filename,
             options=opts,
+            source_message=source_message,
             source_url=source_url,
             download_max_height=download_max_height,
             expected_size=file_size or (500 * 1024 * 1024),
@@ -433,18 +507,69 @@ def register_user_handlers(
             sub_langs=sub_langs,
             source_is_direct=source_is_direct,
             over_2gb_mode=over_2gb_mode,
+            resolved_host=resolved_host,
+            is_torrent=is_torrent,
         )
         pos = await queue_mgr.enqueue(job)
         res_note = f" (`{download_max_height}p`)" if download_max_height else ""
         size_note = f" · ~`{human_bytes(file_size)}`" if file_size else ""
         subs_note = " · `Subs MKV`" if embed_subs else ""
         lang_note = f" · `Audio {audio_lang}`" if audio_lang else ""
+        title_badge = "🧲 **Torrent · En Cola (#{pos})**" if is_torrent else "⬇️ **Leech · En Cola (#{pos})**"
         with contextlib.suppress(Exception):
             await status_msg.edit_text(
-                f"⬇️ **Leech · En Cola (#{pos})**\n"
+                f"{title_badge.format(pos=pos)}\n"
                 f"`{DIVIDER}`\n"
                 f"├ **Archivo:** `{filename[:56]}`{res_note}{size_note}\n"
-                f"├ **Modo:** `Sin recomprimir`{lang_note}{subs_note}\n"
+                f"├ **Modo:** `{'Descarga P2P' if is_torrent else 'Sin recomprimir'}`{lang_note}{subs_note}\n"
+                f"└ **Trabajo:** `{job_id}`",
+                reply_markup=build_job_cancel_keyboard(job_id),
+            )
+
+    async def _enqueue_workspace_job(
+        message: Message,
+        user_id: int,
+        user_label: str,
+        filename: str,
+        file_size: int | None,
+        action_kind: Literal["save_to_workspace", "extract_to_workspace"],
+        source_message: Message | None = None,
+        source_url: str | None = None,
+        local_source_path: Path | None = None,
+        resolved_host: ResolvedHostDownload | None = None,
+        archive_password: str | None = None,
+        status_message: Message | None = None,
+    ) -> None:
+        opts, _ = await _load_user_options(user_id)
+        job_id = secrets.token_hex(4)
+        verb = "Descomprimir en /ls" if action_kind == "extract_to_workspace" else "Guardar en /ls"
+        status_msg = status_message or await message.reply_text(
+            f"📦 **{verb} · Encolando `{job_id}`...**",
+            quote=True,
+        )
+        job = CompressionJob(
+            job_id=job_id,
+            user_id=user_id,
+            user_label=user_label,
+            chat_id=message.chat.id,
+            status_message=status_msg,
+            filename=filename,
+            options=opts,
+            source_message=source_message,
+            source_url=source_url,
+            local_source_path=local_source_path,
+            resolved_host=resolved_host,
+            expected_size=file_size or (300 * 1024 * 1024),
+            action_kind=action_kind,
+            archive_password=archive_password,
+            source_is_direct=True,
+        )
+        pos = await queue_mgr.enqueue(job)
+        with contextlib.suppress(Exception):
+            await status_msg.edit_text(
+                f"📦 **{verb} · En Cola (#{pos})**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{filename[:56]}`\n"
                 f"└ **Trabajo:** `{job_id}`",
                 reply_markup=build_job_cancel_keyboard(job_id),
             )
@@ -457,18 +582,35 @@ def register_user_handlers(
         force_leech: bool = False,
     ) -> None:
         _cleanup_old_sessions()
-        parsed = urlparse(url_text)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            if force_leech:
-                await message.reply_text("❌ Enlace inválido. Envía una URL que empiece por `http://` o `https://`.")
-            return
-
-        raw_name = Path(parsed.path).name or "video_enlace.mp4"
         opts, auto_mode = await _load_user_options(user_id)
         leech_mode = await _is_leech_mode(user_id)
         is_leech = force_leech or leech_mode
 
-        if auto_mode and not is_leech:
+        # 0. Enlace magnet:? o .torrent directo -> cola P2P inmediata
+        if is_magnet_link(url_text) or is_torrent_url(url_text):
+            bt_name = "Descarga Magnet" if is_magnet_link(url_text) else (Path(urlparse(url_text).path).name or "archivo.torrent")
+            await _enqueue_leech_job(
+                message=message,
+                user_id=user_id,
+                user_label=user_label,
+                filename=bt_name,
+                file_size=None,
+                opts=opts,
+                source_url=url_text,
+                is_torrent=True,
+            )
+            return
+
+        parsed = urlparse(url_text)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            if force_leech:
+                await message.reply_text("❌ Enlace inválido. Envía una URL `http://`, `https://` o `magnet:?`.")
+            return
+
+        raw_name = Path(parsed.path).name or "video_enlace.mp4"
+        maybe_non_video = is_non_video_filename(raw_name) or (identify_file_host(url_text) is not None)
+
+        if auto_mode and not is_leech and not maybe_non_video:
             await _enqueue_auto_job(
                 message=message,
                 user_id=user_id,
@@ -485,7 +627,7 @@ def register_user_handlers(
             (
                 "⬇️ **Analizando enlace (Leech)...**\nConsultando archivo, resoluciones y peso..."
                 if is_leech
-                else "🔎 **Analizando enlace...**\nConsultando resoluciones y pesos disponibles..."
+                else "🔎 **Analizando enlace...**\nConsultando archivo, resoluciones y pesos disponibles..."
             ),
             quote=True,
         )
@@ -541,18 +683,62 @@ def register_user_handlers(
             elif url_info.direct_bytes:
                 file_size = url_info.direct_bytes
 
+        # Si el servidor respondió Content-Type .torrent -> Leech P2P
+        if url_info is not None and (
+            "bittorrent" in (url_info.content_type or "").lower()
+            or final_name.lower().endswith(".torrent")
+        ):
+            await _enqueue_leech_job(
+                message=message,
+                user_id=user_id,
+                user_label=user_label,
+                filename=final_name,
+                file_size=file_size,
+                opts=opts,
+                source_url=url_text,
+                status_message=probe_msg,
+                resolved_host=url_info.resolved_host,
+                is_torrent=True,
+            )
+            return
+
+        # Archivo no-video directo (.rar, .zip, .7z, .pdf, .iso, etc.) -> Auto-Leech sin menú de video
+        is_non_video_direct = bool(
+            url_info is not None and (url_info.is_non_video or (url_info.is_direct and is_non_video_filename(final_name)))
+        )
+        if is_non_video_direct:
+            is_leech = True
+        elif auto_mode and not is_leech:
+            await _enqueue_auto_job(
+                message=message,
+                user_id=user_id,
+                user_label=user_label,
+                filename=final_name,
+                file_size=file_size,
+                opts=opts,
+                source_url=url_text,
+                download_max_height=sel_height or opts.max_height,
+            )
+            with contextlib.suppress(Exception):
+                await probe_msg.delete()
+            return
+
         tg_limit = await queue_mgr.effective_tg_limit_bytes(user_id)
         est_for_2gb = file_size or (url_info.direct_bytes if url_info else None) or 0
         show_over_2gb = est_for_2gb > tg_limit
         can_split_over_2gb = (
-            await asyncio.to_thread(
-                queue_mgr.can_split_for_bytes,
-                est_for_2gb,
-                False,
-                bool(url_info and url_info.formats),
+            False
+            if is_non_video_direct
+            else (
+                await asyncio.to_thread(
+                    queue_mgr.can_split_for_bytes,
+                    est_for_2gb,
+                    False,
+                    bool(url_info and url_info.formats),
+                )
+                if show_over_2gb
+                else True
             )
-            if show_over_2gb
-            else True
         )
         initial_over_2gb: Literal["auto", "link", "split"] = (
             "link" if (show_over_2gb and not can_split_over_2gb) else "auto"
@@ -569,7 +755,7 @@ def register_user_handlers(
                     or (show_over_2gb and can_split_over_2gb)
                 )
             )
-            if not has_choices or auto_mode:
+            if not has_choices or auto_mode or is_non_video_direct:
                 await _enqueue_leech_job(
                     message=message,
                     user_id=user_id,
@@ -583,6 +769,7 @@ def register_user_handlers(
                     expect_video=bool(url_info and url_info.formats),
                     source_is_direct=bool(url_info and url_info.is_direct),
                     over_2gb_mode=initial_over_2gb,
+                    resolved_host=url_info.resolved_host if url_info else None,
                 )
                 return
 
@@ -779,12 +966,16 @@ def register_user_handlers(
         target_url: str | None = None
 
         if len(parts) >= 2 and parts[1].strip():
-            match = re.search(r"https?://\S+", parts[1].strip(), re.IGNORECASE)
+            match = re.search(
+                r"(?:https?://\S+|magnet:\?xt=urn:[a-z0-9]+:[a-z0-9]{16,}\S*)",
+                parts[1].strip(),
+                re.IGNORECASE,
+            )
             if not match:
                 await message.reply_text(
                     "⬇️ **Uso de `/leech`**\n"
                     f"`{DIVIDER}`\n"
-                    "├ `/leech https://...` — Descarga directa sin recomprimir (muestra selector de calidad si hay varias)\n"
+                    "├ `/leech https://...` o `/leech magnet:?...` — Descarga directa sin recomprimir\n"
                     "├ Responde `/leech` a un enlace enviado antes\n"
                     "└ `/leech` (solo) — Activa o desactiva el **Modo Leech** para tus próximos enlaces"
                 )
@@ -796,7 +987,11 @@ def register_user_handlers(
                 or message.reply_to_message.caption
                 or ""
             ).strip()
-            match = re.search(r"https?://\S+", reply_txt, re.IGNORECASE)
+            match = re.search(
+                r"(?:https?://\S+|magnet:\?xt=urn:[a-z0-9]+:[a-z0-9]{16,}\S*)",
+                reply_txt,
+                re.IGNORECASE,
+            )
             if match:
                 target_url = match.group(0)
 
@@ -1010,6 +1205,53 @@ def register_user_handlers(
             )
             return
 
+        # 0b. Archivo .torrent enviado al chat -> Descarga P2P directa
+        if _is_torrent_document(message):
+            if not await _check_access(message):
+                return
+            t_name = message.document.file_name or f"archivo_{message.id}.torrent"
+            await _enqueue_leech_job(
+                message=message,
+                user_id=user_id,
+                user_label=user_label,
+                filename=t_name,
+                file_size=message.document.file_size,
+                opts=(await _load_user_options(user_id))[0],
+                source_message=message,
+                is_torrent=True,
+            )
+            return
+
+        # 0c. Archivo comprimido (.zip, .rar, .7z, .tar.*) -> Guardar / Descomprimir en /ls
+        if _is_archive_document(message) and not _is_video_document(message):
+            if not await _check_access(message):
+                return
+            _cleanup_old_sessions()
+            doc = message.document
+            a_name = doc.file_name or f"archivo_{message.id}.zip"
+            a_size = int(doc.file_size or 0)
+            tok = secrets.token_hex(5)
+            prompt_msg = await message.reply_text(
+                f"📦 **Archivo Comprimido Detectado**\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Nombre:** `{a_name[:60]}`\n"
+                f"└ **Peso:** `{human_bytes(a_size)}`\n\n"
+                "Elige si quieres guardarlo o descomprimirlo en el workspace (`/ls`):",
+                reply_markup=build_archive_action_keyboard(tok),
+                quote=True,
+            )
+            archive_drafts[tok] = ArchiveDraft(
+                token=tok,
+                user_id=user_id,
+                user_label=user_label,
+                chat_id=message.chat.id,
+                filename=a_name,
+                file_size=a_size,
+                source_message=message,
+                prompt_message=prompt_msg,
+            )
+            return
+
         meta = _extract_video_meta(message)
         if not meta:
             return
@@ -1073,6 +1315,9 @@ def register_user_handlers(
                 "id",
                 "auto",
                 "leech",
+                "ls",
+                "extract",
+                "unzip",
                 "mediainfo",
                 "ss",
                 "setwatermark",
@@ -1127,9 +1372,66 @@ def register_user_handlers(
                 await message.reply_text(f"⚠️ {exc}")
             return
 
-        # 1. Inputs interactivos del panel inline
+        # 1. Inputs interactivos del panel inline (/ls contraseña, comprimido contraseña, o DraftSession)
         if user_id in awaiting_input:
             sid, mode = awaiting_input.pop(user_id)
+
+            if mode == "arc_pw":
+                draft = archive_drafts.pop(sid, None)
+                if not draft:
+                    await message.reply_text("⚠️ Esa solicitud expiró. Reenvía el archivo comprimido.")
+                    return
+                if text.lower() in {"cancelar", "cancel"}:
+                    with contextlib.suppress(Exception):
+                        await message.delete()
+                    return
+                with contextlib.suppress(Exception):
+                    await message.delete()
+                await _enqueue_workspace_job(
+                    message=message,
+                    user_id=user_id,
+                    user_label=user_label,
+                    filename=draft.filename,
+                    file_size=draft.file_size,
+                    action_kind="extract_to_workspace",
+                    source_message=draft.source_message,
+                    source_url=draft.source_url,
+                    resolved_host=draft.resolved_host,
+                    archive_password=text,
+                    status_message=draft.prompt_message,
+                )
+                return
+
+            if mode.startswith("ls_pw:"):
+                ls_state = ls_views.get(sid)
+                if not ls_state:
+                    await message.reply_text("⚠️ Esa vista de `/ls` expiró. Ejecuta `/ls` de nuevo.")
+                    return
+                if text.lower() in {"cancelar", "cancel"}:
+                    with contextlib.suppress(Exception):
+                        await message.delete()
+                    return
+                try:
+                    idx = int(mode.split(":", 1)[1])
+                    entry = ls_state.entries[idx]
+                    target_path = resolve_workspace_path(config.workspace_dir, entry.rel_path)
+                except (ValueError, IndexError):
+                    await message.reply_text("⚠️ No se encontró ese archivo en `/ls`.")
+                    return
+                with contextlib.suppress(Exception):
+                    await message.delete()
+                await _enqueue_workspace_job(
+                    message=message,
+                    user_id=user_id,
+                    user_label=user_label,
+                    filename=entry.name,
+                    file_size=entry.size_bytes,
+                    action_kind="extract_to_workspace",
+                    local_source_path=target_path,
+                    archive_password=text,
+                )
+                return
+
             session = sessions.get(sid)
             if not session:
                 await message.reply_text("⚠️ Esa sesión expiró. Reenvía el video para configurarlo de nuevo.")
@@ -1748,6 +2050,7 @@ def register_user_handlers(
                 options=session.options.clone(),
                 source_message=session.source_message,
                 source_url=session.source_url,
+                local_source_path=session.local_source_path,
                 download_max_height=session.download_max_height,
                 expected_size=session.file_size or (500 * 1024 * 1024),
                 session_id=session.session_id,
@@ -1756,6 +2059,7 @@ def register_user_handlers(
                 audio_lang=session.selected_audio_lang,
                 source_is_direct=bool(session.url_info and session.url_info.is_direct),
                 over_2gb_mode=session.over_2gb_mode,
+                resolved_host=session.url_info.resolved_host if session.url_info else None,
                 on_media_probed=_on_probed,
             )
             pos = await queue_mgr.enqueue(job)
@@ -1777,6 +2081,7 @@ def register_user_handlers(
                 options=session.options,
                 source_message=session.source_message,
                 source_url=session.source_url,
+                local_source_path=session.local_source_path,
                 download_max_height=session.download_max_height,
                 expected_size=session.file_size or (500 * 1024 * 1024),
                 session_id=session.session_id if has_cache else None,
@@ -1788,6 +2093,7 @@ def register_user_handlers(
                 sub_langs=_resolve_sub_langs(session.url_info),
                 source_is_direct=bool(session.url_info and session.url_info.is_direct),
                 over_2gb_mode=session.over_2gb_mode,
+                resolved_host=session.url_info.resolved_host if session.url_info else None,
             )
             pos = await queue_mgr.enqueue(job)
             await query.answer(f"Descarga directa encolada (#{pos})")
@@ -1835,12 +2141,14 @@ def register_user_handlers(
                 options=sample_opts,
                 source_message=session.source_message,
                 source_url=session.source_url,
+                local_source_path=session.local_source_path,
                 download_max_height=session.download_max_height,
                 expected_size=session.file_size or (500 * 1024 * 1024),
                 session_id=session.session_id,
                 keep_cached_source=True,
                 audio_lang=session.selected_audio_lang,
                 source_is_direct=bool(session.url_info and session.url_info.is_direct),
+                resolved_host=session.url_info.resolved_host if session.url_info else None,
             )
             pos = await queue_mgr.enqueue(job)
             await query.answer(f"Muestra 15s encolada (#{pos})")
@@ -1871,6 +2179,7 @@ def register_user_handlers(
                 options=session.options,
                 source_message=session.source_message,
                 source_url=session.source_url,
+                local_source_path=session.local_source_path,
                 download_max_height=session.download_max_height,
                 expected_size=session.file_size or (500 * 1024 * 1024),
                 session_id=session.session_id if has_cache else None,
@@ -1878,6 +2187,7 @@ def register_user_handlers(
                 audio_lang=session.selected_audio_lang,
                 source_is_direct=bool(session.url_info and session.url_info.is_direct),
                 over_2gb_mode=session.over_2gb_mode,
+                resolved_host=session.url_info.resolved_host if session.url_info else None,
             )
             pos = await queue_mgr.enqueue(job)
             await query.answer(f"Encolado (#{pos})")
@@ -2012,3 +2322,487 @@ def register_user_handlers(
         )
         pos = await queue_mgr.enqueue(job)
         await query.answer(f"Re-compresión encolada (#{pos})")
+
+    # ── Explorador de archivos /ls y descompresión en servidor ───────────────
+
+    async def _render_ls_view(state: LsViewState) -> tuple[str, InlineKeyboardMarkup]:
+        norm_rel, entries = await asyncio.to_thread(
+            list_workspace_dir, config.workspace_dir, state.rel_path
+        )
+        state.rel_path = norm_rel
+        state.entries = entries
+        page_size = 8
+        total_pages = max(1, (len(entries) + page_size - 1) // page_size)
+        state.page = max(0, min(state.page, total_pages - 1))
+        free_bytes = await asyncio.to_thread(queue_mgr._effective_free_bytes)
+        total_folder_bytes = sum(e.size_bytes for e in entries)
+
+        path_label = f"/{norm_rel}" if norm_rel else "/ (raíz)"
+        if entries:
+            body_lines = (
+                f"├ **Elementos:** `{len(entries)}` · **Tamaño aquí:** `{human_bytes(total_folder_bytes)}`\n"
+                f"└ **Disco libre seguro:** `{human_bytes(free_bytes)}`\n\n"
+                "Toca un elemento para abrirlo, descomprimirlo, comprimirlo o enviarlo:"
+            )
+        else:
+            body_lines = (
+                f"└ **Disco libre seguro:** `{human_bytes(free_bytes)}`\n\n"
+                "📭 *Esta carpeta está vacía.*\n"
+                "💡 Envía un archivo `.zip`/`.rar`/`.7z` al chat o usa `/extract <enlace>` para descomprimirlo aquí."
+            )
+
+        text = (
+            f"📂 **Explorador de Servidor (`/ls`)**\n"
+            f"`{DIVIDER}`\n"
+            f"├ **Ruta:** `{path_label}`\n"
+            f"{body_lines}"
+        )
+        kb = build_ls_keyboard(
+            tok=state.token,
+            entries=entries,
+            page=state.page,
+            total_pages=total_pages,
+            has_parent=bool(norm_rel),
+        )
+        return text, kb
+
+    async def _open_ls_message(
+        target: Message,
+        user_id: int,
+        rel_path: str = "",
+        edit_existing: bool = False,
+    ) -> None:
+        _cleanup_old_sessions()
+        tok = secrets.token_hex(5)
+        state = LsViewState(
+            token=tok,
+            user_id=user_id,
+            chat_id=target.chat.id,
+            rel_path=rel_path,
+            entries=[],
+            page=0,
+        )
+        ls_views[tok] = state
+        text, kb = await _render_ls_view(state)
+        if edit_existing:
+            with contextlib.suppress(Exception):
+                await target.edit_text(text, reply_markup=kb)
+                state.message = target
+                return
+        sent = await target.reply_text(text, reply_markup=kb, quote=True)
+        state.message = sent
+
+    @app.on_message(filters.private & filters.command("ls"))
+    async def cmd_ls(_client: Client, message: Message) -> None:
+        if not await _check_access(message):
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        rel_arg = parts[1].strip() if len(parts) >= 2 else ""
+        try:
+            resolve_workspace_path(config.workspace_dir, rel_arg)
+        except ValueError:
+            await message.reply_text("❌ Ruta inválida: no puedes salir del espacio de trabajo.")
+            return
+        await _open_ls_message(message, message.from_user.id, rel_path=rel_arg)
+
+    @app.on_message(filters.private & filters.command(["extract", "unzip"]))
+    async def cmd_extract(_client: Client, message: Message) -> None:
+        if not await _check_access(message):
+            return
+        user_id = message.from_user.id
+        user_label = _format_user_label(message.from_user)
+        raw_parts = (message.text or "").split()
+        args = raw_parts[1:]
+
+        # Caso 1: responde a un documento comprimido o a un mensaje con URL
+        reply = message.reply_to_message
+        if reply and not args:
+            if _is_archive_document(reply):
+                doc = reply.document
+                await _enqueue_workspace_job(
+                    message=message,
+                    user_id=user_id,
+                    user_label=user_label,
+                    filename=doc.file_name or f"archivo_{reply.id}.zip",
+                    file_size=doc.file_size,
+                    action_kind="extract_to_workspace",
+                    source_message=reply,
+                )
+                return
+            rtxt = (reply.text or reply.caption or "").strip()
+            m_url = re.search(r"https?://\S+", rtxt, re.IGNORECASE)
+            if m_url:
+                args = [m_url.group(0)]
+
+        if reply and args and not re.match(r"^https?://", args[0], re.IGNORECASE):
+            if _is_archive_document(reply):
+                doc = reply.document
+                await _enqueue_workspace_job(
+                    message=message,
+                    user_id=user_id,
+                    user_label=user_label,
+                    filename=doc.file_name or f"archivo_{reply.id}.zip",
+                    file_size=doc.file_size,
+                    action_kind="extract_to_workspace",
+                    source_message=reply,
+                    archive_password=args[0],
+                )
+                return
+
+        if not args or not re.match(r"^https?://\S+$", args[0], re.IGNORECASE):
+            await message.reply_text(
+                "📦 **Uso de `/extract`**\n"
+                f"`{DIVIDER}`\n"
+                "├ `/extract https://... [clave]` — Descarga un `.zip`/`.rar`/`.7z` y lo descomprime en `/ls`\n"
+                "└ Responde `/extract [clave]` a un archivo comprimido enviado en el chat"
+            )
+            return
+
+        target_url = args[0]
+        pw = args[1] if len(args) >= 2 else None
+        probe_msg = await message.reply_text("🔎 **Analizando archivo comprimido...**", quote=True)
+        try:
+            url_info = await probe_url_info(target_url, gofile_token=config.gofile_token)
+            fname = url_info.filename or Path(urlparse(target_url).path).name or "archivo.zip"
+            fsize = url_info.direct_bytes
+            rhost = url_info.resolved_host
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await probe_msg.edit_text(f"❌ {exc}")
+            return
+
+        await _enqueue_workspace_job(
+            message=message,
+            user_id=user_id,
+            user_label=user_label,
+            filename=fname,
+            file_size=fsize,
+            action_kind="extract_to_workspace",
+            source_url=target_url,
+            resolved_host=rhost,
+            archive_password=pw,
+            status_message=probe_msg,
+        )
+
+    @app.on_callback_query(filters.regex(r"^home:ls$"))
+    async def cb_home_ls(_client: Client, query: CallbackQuery) -> None:
+        user_id = query.from_user.id
+        if not await db.is_authorized(user_id, config.owner_id):
+            await query.answer("Acceso restringido.", show_alert=True)
+            return
+        await query.answer()
+        await _open_ls_message(query.message, user_id, rel_path="", edit_existing=False)
+
+    @app.on_callback_query(filters.regex(r"^arc:(extract|extractpw|save|discard):"))
+    async def cb_archive_draft(_client: Client, query: CallbackQuery) -> None:
+        parts = query.data.split(":", 2)
+        if len(parts) < 3:
+            await query.answer()
+            return
+        action, tok = parts[1], parts[2]
+        draft = archive_drafts.get(tok)
+        if not draft:
+            await query.answer("Esta opción expiró. Reenvía el archivo.", show_alert=True)
+            return
+        if query.from_user.id != draft.user_id and query.from_user.id != config.owner_id:
+            await query.answer("Solo quien envió el archivo puede gestionarlo.", show_alert=True)
+            return
+
+        if action == "discard":
+            archive_drafts.pop(tok, None)
+            await query.answer("Descartado")
+            with contextlib.suppress(Exception):
+                await query.message.edit_text("✖ Archivo comprimido descartado.")
+            return
+
+        if action == "extractpw":
+            awaiting_input[query.from_user.id] = (tok, "arc_pw")
+            await query.answer("Envía la contraseña por mensaje")
+            await query.message.reply_text(
+                f"🔑 **Contraseña para `{draft.filename[:48]}`**\n"
+                "Escribe la contraseña en el siguiente mensaje *(o `cancelar` para abortar)*."
+            )
+            return
+
+        archive_drafts.pop(tok, None)
+        kind: Literal["save_to_workspace", "extract_to_workspace"] = (
+            "extract_to_workspace" if action == "extract" else "save_to_workspace"
+        )
+        await query.answer("Encolando...")
+        await _enqueue_workspace_job(
+            message=query.message,
+            user_id=draft.user_id,
+            user_label=draft.user_label,
+            filename=draft.filename,
+            file_size=draft.file_size,
+            action_kind=kind,
+            source_message=draft.source_message,
+            source_url=draft.source_url,
+            resolved_host=draft.resolved_host,
+            status_message=query.message,
+        )
+
+    @app.on_callback_query(filters.regex(r"^ls:"))
+    async def cb_ls(_client: Client, query: CallbackQuery) -> None:
+        user_id = query.from_user.id
+        if not await db.is_authorized(user_id, config.owner_id):
+            await query.answer("Acceso restringido.", show_alert=True)
+            return
+
+        parts = query.data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+
+        if action == "openroot":
+            await query.answer()
+            await _open_ls_message(query.message, user_id, rel_path="", edit_existing=False)
+            return
+
+        if len(parts) < 3:
+            await query.answer()
+            return
+
+        tok = parts[2]
+        state = ls_views.get(tok)
+        if not state:
+            await query.answer("Esta vista de /ls expiró. Ejecuta /ls nuevamente.", show_alert=True)
+            return
+        if user_id != state.user_id and user_id != config.owner_id:
+            await query.answer("No puedes controlar la vista /ls de otro usuario.", show_alert=True)
+            return
+
+        if action == "noop":
+            await query.answer()
+            return
+
+        if action == "refresh":
+            await query.answer("Actualizado")
+            text, kb = await _render_ls_view(state)
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(text, reply_markup=kb)
+            return
+
+        if action == "up":
+            state.rel_path = state.rel_path.rsplit("/", 1)[0] if "/" in state.rel_path else ""
+            state.page = 0
+            await query.answer()
+            text, kb = await _render_ls_view(state)
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(text, reply_markup=kb)
+            return
+
+        if action == "page" and len(parts) >= 4:
+            with contextlib.suppress(ValueError):
+                state.page = max(0, int(parts[3]))
+            await query.answer()
+            text, kb = await _render_ls_view(state)
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(text, reply_markup=kb)
+            return
+
+        if action == "clearask":
+            await query.answer()
+            confirm_kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("✅ Sí, vaciar todo /ls", callback_data=f"ls:clearok:{tok}"),
+                        InlineKeyboardButton("✖ Cancelar", callback_data=f"ls:refresh:{tok}"),
+                    ]
+                ]
+            )
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(
+                    "⚠️ **¿Vaciar todo el Workspace (`/ls`)?**\n"
+                    "Se eliminarán permanentemente todos los archivos y carpetas extraídas dentro de `/ls`.",
+                    reply_markup=confirm_kb,
+                )
+            return
+
+        if action == "clearok":
+            ws_root = config.workspace_dir.resolve()
+            if ws_root.exists():
+                for child in list(ws_root.iterdir()):
+                    if child.is_dir():
+                        await asyncio.to_thread(shutil.rmtree, child, True)
+                    else:
+                        with contextlib.suppress(OSError):
+                            child.unlink()
+            state.rel_path = ""
+            state.page = 0
+            await query.answer("Workspace vaciado", show_alert=True)
+            text, kb = await _render_ls_view(state)
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(text, reply_markup=kb)
+            return
+
+        if len(parts) < 4:
+            await query.answer()
+            return
+        try:
+            idx = int(parts[3])
+            entry = state.entries[idx]
+            target_path = resolve_workspace_path(config.workspace_dir, entry.rel_path)
+        except (ValueError, IndexError):
+            await query.answer("Elemento no encontrado; refrescando /ls.", show_alert=True)
+            text, kb = await _render_ls_view(state)
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(text, reply_markup=kb)
+            return
+
+        if not target_path.exists():
+            await query.answer("Ese archivo ya no existe.", show_alert=True)
+            text, kb = await _render_ls_view(state)
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(text, reply_markup=kb)
+            return
+
+        if action == "open":
+            if entry.is_dir:
+                state.rel_path = entry.rel_path
+                state.page = 0
+                await query.answer()
+                text, kb = await _render_ls_view(state)
+                with contextlib.suppress(Exception):
+                    await query.message.edit_text(text, reply_markup=kb)
+                return
+
+            tg_limit = await queue_mgr.effective_tg_limit_bytes(user_id)
+            is_over = entry.size_bytes > tg_limit
+            can_split = (
+                await asyncio.to_thread(queue_mgr.can_split_for_bytes, entry.size_bytes, True)
+                if (is_over and entry.kind == "video")
+                else False
+            )
+            kind_labels = {
+                "archive": "Archivo Comprimido",
+                "video": "Video",
+                "audio": "Audio",
+                "other": "Archivo / Documento",
+            }
+            await query.answer()
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(
+                    f"📄 **Archivo en `/ls`**\n"
+                    f"`{DIVIDER}`\n"
+                    f"├ **Nombre:** `{entry.name[:64]}`\n"
+                    f"├ **Ruta:** `/{entry.rel_path[:60]}`\n"
+                    f"├ **Tipo:** `{kind_labels.get(entry.kind, 'Archivo')}`\n"
+                    f"└ **Peso:** `{human_bytes(entry.size_bytes)}`",
+                    reply_markup=build_ls_item_keyboard(
+                        tok=tok,
+                        idx=idx,
+                        entry=entry,
+                        is_over_2gb=is_over,
+                        can_split=can_split,
+                    ),
+                )
+            return
+
+        if action == "del":
+            if target_path.is_dir():
+                await asyncio.to_thread(shutil.rmtree, target_path, True)
+            else:
+                target_path.unlink(missing_ok=True)
+            await query.answer(f"Eliminado: {entry.name[:24]}")
+            text, kb = await _render_ls_view(state)
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(text, reply_markup=kb)
+            return
+
+        if action == "extract":
+            await query.answer("Descomprimiendo en cola...")
+            await _enqueue_workspace_job(
+                message=query.message,
+                user_id=user_id,
+                user_label=_format_user_label(query.from_user),
+                filename=entry.name,
+                file_size=entry.size_bytes,
+                action_kind="extract_to_workspace",
+                local_source_path=target_path,
+            )
+            return
+
+        if action == "extractpw":
+            awaiting_input[user_id] = (tok, f"ls_pw:{idx}")
+            await query.answer("Envía la contraseña por mensaje")
+            await query.message.reply_text(
+                f"🔑 **Contraseña para `{entry.name[:48]}`**\n"
+                "Escribe la contraseña en el siguiente mensaje *(o `cancelar` para abortar)*."
+            )
+            return
+
+        if action == "compress":
+            opts, _ = await _load_user_options(user_id)
+            media_info: MediaInfo | None = None
+            with contextlib.suppress(Exception):
+                media_info = await probe_media(target_path)
+            sid = secrets.token_hex(5)
+            summary = format_draft_summary(
+                filename=entry.name,
+                file_size=entry.size_bytes,
+                duration=media_info.duration if media_info else None,
+                width=media_info.width if media_info else None,
+                height=media_info.height if media_info else None,
+                opts=opts,
+                media=media_info,
+            )
+            cfg_msg = await query.message.reply_text(
+                summary,
+                reply_markup=build_main_config_keyboard(sid, opts),
+                quote=True,
+            )
+            sessions[sid] = DraftSession(
+                session_id=sid,
+                user_id=user_id,
+                user_label=_format_user_label(query.from_user),
+                chat_id=query.message.chat.id,
+                config_message=cfg_msg,
+                filename=entry.name,
+                file_size=entry.size_bytes,
+                duration=media_info.duration if media_info else None,
+                width=media_info.width if media_info else None,
+                height=media_info.height if media_info else None,
+                options=opts,
+                local_source_path=target_path,
+                media=media_info,
+            )
+            await query.answer("Panel de compresión abierto")
+            return
+
+        if action in {"mediainfo", "split", "send"}:
+            opts, _ = await _load_user_options(user_id)
+            kind_map: dict[str, ActionKind] = {
+                "mediainfo": "mediainfo",
+                "split": "split_parts",
+                "send": "download_only",
+            }
+            act_kind = kind_map[action]
+            job_id = secrets.token_hex(4)
+            title_map = {
+                "mediainfo": "🔎 **MediaInfo (`/ls`)**",
+                "split": "✂️ **Dividir Partes (<1.9 GB)**",
+                "send": "📤 **Enviando desde `/ls`**",
+            }
+            status_msg = await query.message.reply_text(
+                f"{title_map[action]} · En cola\n"
+                f"`{DIVIDER}`\n"
+                f"├ **Archivo:** `{entry.name[:56]}`\n"
+                f"└ **Trabajo:** `{job_id}`",
+                reply_markup=build_job_cancel_keyboard(job_id),
+            )
+            job = CompressionJob(
+                job_id=job_id,
+                user_id=user_id,
+                user_label=_format_user_label(query.from_user),
+                chat_id=query.message.chat.id,
+                status_message=status_msg,
+                filename=entry.name,
+                options=opts,
+                local_source_path=target_path,
+                expected_size=entry.size_bytes,
+                action_kind=act_kind,
+                source_is_direct=True,
+            )
+            pos = await queue_mgr.enqueue(job)
+            await query.answer(f"Encolado (#{pos})")
+            return
+

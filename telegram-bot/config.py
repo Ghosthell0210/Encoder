@@ -251,6 +251,7 @@ class BotConfig:
     base_dir: Path = Path(__file__).resolve().parent
     bin_dir: Path = Path("./bin")
     data_dir: Path = Path("./data")
+    workspace_dir: Path = Path("./data/workspace")
     work_dir: Path = Path("./temp_work")
     links_dir: Path = Path("./temp_links")
     db_path: Path = Path("./data/bot.db")
@@ -263,12 +264,14 @@ class BotConfig:
         base_dir = Path(__file__).resolve().parent
         bin_dir = (base_dir / "bin").resolve()
         data_dir = Path(_env_str("DATA_DIR", str(base_dir / "data"))).resolve()
+        workspace_dir = Path(_env_str("WORKSPACE_DIR", str(data_dir / "workspace"))).resolve()
         work_dir = Path(_env_str("WORK_DIR", str(base_dir / "temp_work"))).resolve()
         links_dir = Path(_env_str("LINKS_DIR", str(base_dir / "temp_links"))).resolve()
         db_path = data_dir / "bot.db"
 
         bin_dir.mkdir(parents=True, exist_ok=True)
         data_dir.mkdir(parents=True, exist_ok=True)
+        workspace_dir.mkdir(parents=True, exist_ok=True)
         work_dir.mkdir(parents=True, exist_ok=True)
         links_dir.mkdir(parents=True, exist_ok=True)
 
@@ -368,6 +371,7 @@ class BotConfig:
             base_dir=base_dir,
             bin_dir=bin_dir,
             data_dir=data_dir,
+            workspace_dir=workspace_dir,
             work_dir=work_dir,
             links_dir=links_dir,
             db_path=db_path,

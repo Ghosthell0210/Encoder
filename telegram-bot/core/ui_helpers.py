@@ -9,6 +9,7 @@ import time
 from hydrogram.errors import FloodWait, MessageNotModified
 from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from core.archive_tools import WorkspaceEntry
 from core.ffmpeg_engine import PRESETS, CompressionOptions
 from core.media_probe import MediaInfo
 from core.uploader import UrlFormatOption, UrlProbeInfo
@@ -110,6 +111,7 @@ def build_start_keyboard(
             InlineKeyboardButton("📊 Estadísticas", callback_data="home:stats"),
         ],
         [
+            InlineKeyboardButton("📂 Archivos (/ls)", callback_data="home:ls"),
             InlineKeyboardButton("📖 Comandos", callback_data="home:help"),
         ],
     ]
@@ -963,6 +965,130 @@ def build_live_keyboard(has_active_jobs: bool) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("🛑 Cancelar Cola", callback_data="live:cancelall")])
     rows.append([InlineKeyboardButton("🛡 Panel Admin", callback_data="home:admin")])
     return InlineKeyboardMarkup(rows)
+
+
+def build_ls_keyboard(
+    tok: str,
+    entries: list[WorkspaceEntry],
+    page: int,
+    total_pages: int,
+    has_parent: bool,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    icon_map = {
+        "dir": "📁",
+        "archive": "📦",
+        "video": "🎬",
+        "audio": "🎵",
+        "other": "📄",
+    }
+    page_size = 8
+    start = page * page_size
+    slice_items = entries[start : start + page_size]
+    for offset, entry in enumerate(slice_items):
+        idx = start + offset
+        icon = icon_map.get(entry.kind, "📄")
+        label_name = entry.name[:26] + ("…" if len(entry.name) > 26 else "")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{icon} {label_name} · {human_bytes(entry.size_bytes)}",
+                    callback_data=f"ls:open:{tok}:{idx}",
+                )
+            ]
+        )
+
+    if total_pages > 1:
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("◀ Ant", callback_data=f"ls:page:{tok}:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"ls:noop:{tok}"))
+        if page + 1 < total_pages:
+            nav_row.append(InlineKeyboardButton("Sig ▶", callback_data=f"ls:page:{tok}:{page + 1}"))
+        rows.append(nav_row)
+
+    ctrl_row: list[InlineKeyboardButton] = []
+    if has_parent:
+        ctrl_row.append(InlineKeyboardButton("⬅ Subir", callback_data=f"ls:up:{tok}"))
+    ctrl_row.append(InlineKeyboardButton("🔄 Actualizar", callback_data=f"ls:refresh:{tok}"))
+    if entries:
+        ctrl_row.append(InlineKeyboardButton("🧹 Vaciar", callback_data=f"ls:clearask:{tok}"))
+    rows.append(ctrl_row)
+    return InlineKeyboardMarkup(rows)
+
+
+def build_ls_item_keyboard(
+    tok: str,
+    idx: int,
+    entry: WorkspaceEntry,
+    is_over_2gb: bool = False,
+    can_split: bool = False,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if entry.kind == "archive":
+        rows.append(
+            [
+                InlineKeyboardButton("📦 Descomprimir aquí", callback_data=f"ls:extract:{tok}:{idx}"),
+                InlineKeyboardButton("🔑 Con contraseña", callback_data=f"ls:extractpw:{tok}:{idx}"),
+            ]
+        )
+    elif entry.kind == "video":
+        rows.append(
+            [
+                InlineKeyboardButton("🎬 Comprimir", callback_data=f"ls:compress:{tok}:{idx}"),
+                InlineKeyboardButton("ℹ️ MediaInfo", callback_data=f"ls:mediainfo:{tok}:{idx}"),
+            ]
+        )
+        if is_over_2gb and can_split:
+            rows.append(
+                [
+                    InlineKeyboardButton("✂️ Partes (<1.9 GB)", callback_data=f"ls:split:{tok}:{idx}"),
+                    InlineKeyboardButton("🔗 Subir Enlace", callback_data=f"ls:send:{tok}:{idx}"),
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🔗 Subir Enlace (>2 GB)" if is_over_2gb else "📤 Enviar a Telegram",
+                        callback_data=f"ls:send:{tok}:{idx}",
+                    )
+                ]
+            )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🔗 Subir Enlace (>2 GB)" if is_over_2gb else "📤 Enviar a Telegram",
+                    callback_data=f"ls:send:{tok}:{idx}",
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton("🗑 Borrar", callback_data=f"ls:del:{tok}:{idx}"),
+            InlineKeyboardButton("⬅ Volver a /ls", callback_data=f"ls:refresh:{tok}"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_archive_action_keyboard(tok: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📦 Guardar y Descomprimir en /ls", callback_data=f"arc:extract:{tok}"),
+            ],
+            [
+                InlineKeyboardButton("🔑 Descomprimir con Contraseña", callback_data=f"arc:extractpw:{tok}"),
+            ],
+            [
+                InlineKeyboardButton("📁 Solo Guardar en /ls", callback_data=f"arc:save:{tok}"),
+                InlineKeyboardButton("✖ Descartar", callback_data=f"arc:discard:{tok}"),
+            ],
+        ]
+    )
 
 
 def safe_caption(text: str, limit: int = 1020) -> str:
